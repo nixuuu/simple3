@@ -167,6 +167,12 @@ impl BucketStore {
 
         Ok((results, truncated))
     }
+
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self
+            .objects
+            .is_empty())
+    }
 }
 
 pub struct Storage {
@@ -217,6 +223,16 @@ impl Storage {
     pub fn get_bucket(&self, name: &str) -> Option<Arc<BucketStore>> {
         let map = self.buckets.read().unwrap();
         map.get(name).cloned()
+    }
+
+    pub fn delete_bucket(&self, name: &str) -> io::Result<bool> {
+        let mut map = self.buckets.write().unwrap();
+        if map.remove(name).is_none() {
+            return Ok(false);
+        }
+        let bucket_dir = self.data_dir.join(name);
+        fs::remove_dir_all(&bucket_dir)?;
+        Ok(true)
     }
 
     pub fn list_buckets(&self) -> Vec<String> {

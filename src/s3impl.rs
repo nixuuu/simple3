@@ -38,6 +38,28 @@ impl S3 for SimpleStorage {
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let bucket = &req.input.bucket;
+        let store = self
+            .inner
+            .get_bucket(bucket)
+            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+
+        if !store.is_empty().map_err(|e| s3_error!(e, InternalError))? {
+            return Err(s3_error!(BucketNotEmpty));
+        }
+        drop(store);
+
+        self.inner
+            .delete_bucket(bucket)
+            .map_err(|e| s3_error!(e, InternalError))?;
+
+        Ok(S3Response::new(DeleteBucketOutput::default()))
+    }
+
     async fn list_buckets(
         &self,
         _req: S3Request<ListBucketsInput>,
