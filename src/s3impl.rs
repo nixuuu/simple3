@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
 use md5::{Digest, Md5};
-use s3s::dto::*;
+use s3s::dto::{CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput, ListBucketsInput, ListBucketsOutput, Bucket, Timestamp, PutObjectInput, PutObjectOutput, ETag, GetObjectInput, GetObjectOutput, StreamingBlob, HeadObjectInput, HeadObjectOutput, DeleteObjectInput, DeleteObjectOutput, ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, CreateMultipartUploadInput, CreateMultipartUploadOutput, UploadPartInput, UploadPartOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, AbortMultipartUploadInput, AbortMultipartUploadOutput};
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::storage::Storage;
@@ -15,7 +15,7 @@ pub struct SimpleStorage {
 }
 
 impl SimpleStorage {
-    pub fn new(storage: Arc<Storage>) -> Self {
+    pub const fn new(storage: Arc<Storage>) -> Self {
         Self { inner: storage }
     }
 }
@@ -184,7 +184,7 @@ impl S3 for SimpleStorage {
 
         let output = GetObjectOutput {
             body: Some(body),
-            content_length: Some(meta.length as i64),
+            content_length: Some(meta.length.cast_signed()),
             content_type: meta.content_type,
             e_tag: Some(ETag::Strong(meta.etag)),
             last_modified: Some(last_modified),
@@ -218,7 +218,7 @@ impl S3 for SimpleStorage {
         };
 
         let output = HeadObjectOutput {
-            content_length: Some(meta.length as i64),
+            content_length: Some(meta.length.cast_signed()),
             content_type: meta.content_type,
             e_tag: Some(ETag::Strong(meta.etag)),
             last_modified: Some(last_modified),
@@ -255,7 +255,8 @@ impl S3 for SimpleStorage {
             .get_bucket(&input.bucket)
             .ok_or_else(|| s3_error!(NoSuchBucket))?;
 
-        let max_keys = input.max_keys.unwrap_or(1000) as usize;
+        #[allow(clippy::cast_sign_loss)] // max(0) guarantees non-negative
+        let max_keys = input.max_keys.unwrap_or(1000).max(0) as usize;
         let prefix = input.prefix.as_deref();
         let delimiter = input.delimiter.as_deref();
         let continuation = input.continuation_token.as_deref();
@@ -277,7 +278,7 @@ impl S3 for SimpleStorage {
                     Timestamp::from(UNIX_EPOCH + Duration::from_secs(meta.last_modified));
                 Object {
                     key: Some(key),
-                    size: Some(meta.length as i64),
+                    size: Some(meta.length.cast_signed()),
                     e_tag: Some(ETag::Strong(meta.etag)),
                     last_modified: Some(last_modified),
                     ..Default::default()
@@ -293,13 +294,15 @@ impl S3 for SimpleStorage {
                     .into_iter()
                     .map(|p| CommonPrefix {
                         prefix: Some(p),
-                        ..Default::default()
                     })
                     .collect(),
             )
         };
 
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let key_count = objects.len() as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let max_keys_i32 = max_keys as i32;
 
         let output = ListObjectsV2Output {
             contents: Some(objects),
@@ -307,7 +310,7 @@ impl S3 for SimpleStorage {
             delimiter: input.delimiter,
             is_truncated: Some(truncated),
             key_count: Some(key_count),
-            max_keys: Some(max_keys as i32),
+            max_keys: Some(max_keys_i32),
             name: Some(input.bucket),
             prefix: input.prefix,
             next_continuation_token: next_token,

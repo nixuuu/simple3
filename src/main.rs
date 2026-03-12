@@ -32,7 +32,7 @@ enum Command {
         /// Autovacuum interval in seconds (0 = disabled)
         #[arg(long, default_value_t = 300)]
         autovacuum_interval: u64,
-        /// Autovacuum threshold: compact when dead_bytes > threshold fraction of file size (0.0-1.0)
+        /// Autovacuum threshold: compact when `dead_bytes` > threshold fraction of file size (0.0-1.0)
         #[arg(long, default_value_t = 0.5)]
         autovacuum_threshold: f64,
     },
@@ -43,7 +43,7 @@ enum Command {
     },
 }
 
-fn run_autovacuum(storage: Arc<Storage>, threshold: f64) {
+fn run_autovacuum(storage: &Arc<Storage>, threshold: f64) {
     let buckets = storage.list_buckets();
     for name in &buckets {
         let Some(store) = storage.get_bucket(name) else {
@@ -59,6 +59,7 @@ fn run_autovacuum(storage: Arc<Storage>, threshold: f64) {
         if file_size == 0 {
             continue;
         }
+        #[allow(clippy::cast_precision_loss)]
         let ratio = dead as f64 / file_size as f64;
         if ratio >= threshold {
             tracing::info!(
@@ -84,14 +85,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Compact { bucket }) => {
             let storage = Storage::open(&cli.data_dir)?;
-            let buckets = match bucket {
-                Some(name) => vec![name],
-                None => storage.list_buckets(),
-            };
+            let buckets = bucket.map_or_else(|| storage.list_buckets(), |name| vec![name]);
             for name in &buckets {
                 let store = storage
                     .get_bucket(name)
-                    .ok_or_else(|| anyhow::anyhow!("bucket '{}' not found", name))?;
+                    .ok_or_else(|| anyhow::anyhow!("bucket '{name}' not found"))?;
                 let dead = store.dead_bytes();
                 if dead == 0 {
                     println!("{name}: no dead bytes, skipping");
@@ -128,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
                         let threshold = autovacuum_threshold;
                         // Run compaction on blocking thread (it does file I/O)
                         if let Err(e) =
-                            tokio::task::spawn_blocking(move || run_autovacuum(st, threshold)).await
+                            tokio::task::spawn_blocking(move || run_autovacuum(&st, threshold)).await
                         {
                             tracing::error!("autovacuum task panicked: {e}");
                         }

@@ -10,6 +10,9 @@ use md5::{Digest, Md5};
 
 use crate::types::ObjectMeta;
 
+/// Result of listing objects: (objects, `common_prefixes`, truncated).
+pub type ListResult = (Vec<(String, ObjectMeta)>, Vec<String>, bool);
+
 const DEAD_BYTES_KEY: &[u8] = b"__dead_bytes__";
 const COMPACTING_KEY: &[u8] = b"__compacting__";
 
@@ -27,16 +30,17 @@ impl BucketStore {
         fs::create_dir_all(bucket_dir)?;
 
         let db = sled::open(bucket_dir.join("index.db"))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let objects = db
             .open_tree("objects")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let meta = db
             .open_tree("meta")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         let data_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(bucket_dir.join("data.bin"))?;
@@ -44,14 +48,13 @@ impl BucketStore {
         // GC: remove leftover temp files, multipart parts, and compaction temps
         for entry in fs::read_dir(bucket_dir)? {
             let p = entry?.path();
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with(".tmp_")
+            if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && (name.starts_with(".tmp_")
                     || name.starts_with(".mpu_")
-                    || name == "data.bin.tmp"
+                    || name == "data.bin.tmp")
                 {
                     fs::remove_file(&p).ok();
                 }
-            }
         }
 
         let store = Self {
@@ -81,10 +84,10 @@ impl BucketStore {
 
         // Find max(offset + length) across all live objects
         let mut max_end: u64 = 0;
-        for result in self.objects.iter() {
-            let (_k, v) = result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        for result in &self.objects {
+            let (_k, v) = result.map_err(io::Error::other)?;
             let obj: ObjectMeta = bincode::deserialize(&v)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             let end = obj.offset + obj.length;
             if end > max_end {
                 max_end = end;
@@ -94,6 +97,7 @@ impl BucketStore {
         if file_size > max_end {
             file.set_len(max_end)?;
         }
+        drop(file);
 
         Ok(())
     }
@@ -103,13 +107,13 @@ impl BucketStore {
         // Rebuild: re-read all live objects, rewrite data.bin from scratch.
         // This is the nuclear recovery option — correct but slow.
         let mut live: Vec<(String, ObjectMeta)> = Vec::new();
-        for result in self.objects.iter() {
-            let (k, v) = result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        for result in &self.objects {
+            let (k, v) = result.map_err(io::Error::other)?;
             let key = std::str::from_utf8(&k)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                 .to_string();
             let obj: ObjectMeta = bincode::deserialize(&v)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             live.push((key, obj));
         }
         live.sort_by_key(|(_, m)| m.offset);
@@ -121,7 +125,9 @@ impl BucketStore {
 
         for (key, obj) in &live {
             if obj.offset + obj.length <= file_size {
-                let mut buf = vec![0u8; obj.length as usize];
+                let len = usize::try_from(obj.length)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let mut buf = vec![0u8; len];
                 if file.read_exact_at(&mut buf, obj.offset).is_ok() {
                     data_chunks.push((key.clone(), obj.clone(), buf));
                 }
@@ -140,7 +146,7 @@ impl BucketStore {
             obj.offset = offset;
             offset += obj.length;
             let v = bincode::serialize(&obj)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             batch.insert(key.as_bytes(), v);
         }
         tmp.flush()?;
@@ -160,7 +166,7 @@ impl BucketStore {
         // Apply batch + clear flags
         self.objects
             .apply_batch(batch)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         self.set_dead_bytes(0)?;
         self.set_meta_flag(COMPACTING_KEY, false)?;
 
@@ -169,16 +175,20 @@ impl BucketStore {
 
     // === Dead space tracking ===
 
+    /// Returns the number of dead (reclaimable) bytes in the data file.
     pub fn dead_bytes(&self) -> u64 {
         self.meta
             .get(DEAD_BYTES_KEY)
             .ok()
             .flatten()
             .and_then(|v| v.as_ref().try_into().ok())
-            .map(u64::from_le_bytes)
-            .unwrap_or(0)
+            .map_or(0, u64::from_le_bytes)
     }
 
+    /// # Errors
+    /// Returns `io::Error` if reading file metadata fails.
+    /// # Panics
+    /// Panics if the data file `RwLock` is poisoned.
     pub fn data_file_size(&self) -> io::Result<u64> {
         let file = self.data_file.read().unwrap();
         Ok(file.metadata()?.len())
@@ -192,7 +202,7 @@ impl BucketStore {
     fn set_dead_bytes(&self, n: u64) -> io::Result<()> {
         self.meta
             .insert(DEAD_BYTES_KEY, &n.to_le_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -201,39 +211,52 @@ impl BucketStore {
             .get(key)
             .ok()
             .flatten()
-            .map(|v| !v.is_empty() && v[0] == 1)
-            .unwrap_or(false)
+            .is_some_and(|v| !v.is_empty() && v[0] == 1)
     }
 
     fn set_meta_flag(&self, key: &[u8], val: bool) -> io::Result<()> {
         self.meta
-            .insert(key, &[val as u8])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .insert(key, &[u8::from(val)])
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
     // === Data operations (append-only) ===
 
+    /// # Errors
+    /// Returns `io::Error` if data file write fails.
+    /// # Panics
+    /// Panics if the data file `RwLock` is poisoned.
     pub fn append_data(&self, data: &[u8]) -> io::Result<(u64, u64)> {
         let mut file = self.data_file.write().unwrap();
         let offset = file.seek(SeekFrom::End(0))?;
         file.write_all(data)?;
-        Ok((offset, data.len() as u64))
+        drop(file);
+        #[allow(clippy::cast_possible_truncation)]
+        let len = data.len() as u64;
+        Ok((offset, len))
     }
 
+    /// # Errors
+    /// Returns `io::Error` if data file read fails.
+    /// # Panics
+    /// Panics if the data file `RwLock` is poisoned.
     pub fn read_data(&self, offset: u64, length: u64) -> io::Result<Vec<u8>> {
-        let file = self.data_file.read().unwrap();
-        let mut buf = vec![0u8; length as usize];
-        file.read_exact_at(&mut buf, offset)?;
+        let len = usize::try_from(length)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut buf = vec![0u8; len];
+        self.data_file.read().unwrap().read_exact_at(&mut buf, offset)?;
         Ok(buf)
     }
 
+    /// # Errors
+    /// Returns `io::Error` if sled insert fails.
     pub fn put_meta(&self, key: &str, meta: &ObjectMeta) -> io::Result<()> {
         let v = bincode::serialize(meta)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         self.objects
             .insert(key.as_bytes(), v)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -244,6 +267,11 @@ impl BucketStore {
     /// Append data from tmp file to data.bin + write metadata.
     /// If key already exists, old data becomes dead space (no inline compaction).
     /// Crash-safe: append-only + sled is individually crash-safe.
+    ///
+    /// # Errors
+    /// Returns `io::Error` on file I/O or sled failure.
+    /// # Panics
+    /// Panics if the data file `RwLock` is poisoned.
     pub fn put_object_streamed(
         &self,
         key: &str,
@@ -299,6 +327,8 @@ impl BucketStore {
         format!("{nanos:032x}")
     }
 
+    /// # Errors
+    /// Returns `io::Error` if writing the part file fails.
     pub fn upload_part(
         &self,
         upload_id: &str,
@@ -316,6 +346,10 @@ impl BucketStore {
         Ok(etag)
     }
 
+    /// # Errors
+    /// Returns `io::Error` on file I/O or sled failure.
+    /// # Panics
+    /// Panics if the data file `RwLock` is poisoned.
     pub fn complete_multipart_upload(
         &self,
         upload_id: &str,
@@ -347,7 +381,7 @@ impl BucketStore {
             })?;
 
             let mut part_hasher = Md5::new();
-            let mut buf = [0u8; 65536];
+            let mut buf = vec![0u8; 65536];
             loop {
                 let n = part_file.read(&mut buf)?;
                 if n == 0 {
@@ -355,7 +389,8 @@ impl BucketStore {
                 }
                 file.write_all(&buf[..n])?;
                 part_hasher.update(&buf[..n]);
-                total_len += n as u64;
+                #[allow(clippy::cast_possible_truncation)]
+                { total_len += n as u64; }
             }
             part_md5_concat.extend_from_slice(&part_hasher.finalize());
         }
@@ -396,6 +431,8 @@ impl BucketStore {
         Ok((meta, etag))
     }
 
+    /// # Errors
+    /// Returns `io::Error` if directory listing fails.
     pub fn abort_multipart_upload(&self, upload_id: &str) -> io::Result<()> {
         let prefix = format!(".mpu_{upload_id}_");
         for entry in fs::read_dir(&self.bucket_dir)? {
@@ -410,15 +447,17 @@ impl BucketStore {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns `io::Error` if sled read or deserialization fails.
     pub fn get_meta(&self, key: &str) -> io::Result<Option<ObjectMeta>> {
         match self
             .objects
             .get(key.as_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
         {
             Some(v) => {
                 let meta: ObjectMeta = bincode::deserialize(&v)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    .map_err(io::Error::other)?;
                 Ok(Some(meta))
             }
             None => Ok(None),
@@ -427,49 +466,57 @@ impl BucketStore {
 
     // === Delete (append-only: just remove sled key, data becomes dead space) ===
 
+    /// # Errors
+    /// Returns `io::Error` if sled operations fail.
     pub fn delete_object(&self, key: &str) -> io::Result<Option<ObjectMeta>> {
         let k = key.as_bytes();
 
         let meta = match self
             .objects
             .get(k)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
         {
             Some(v) => bincode::deserialize::<ObjectMeta>(&v)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
+                .map_err(io::Error::other)?,
             None => return Ok(None),
         };
 
         self.objects
             .remove(k)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         self.add_dead_bytes(meta.length)?;
 
         Ok(Some(meta))
     }
 
-    // Backward compat alias for tests
+    /// Backward compat alias for tests.
+    /// # Errors
+    /// Returns `io::Error` if sled operations fail.
     pub fn delete_and_compact(&self, key: &str) -> io::Result<Option<ObjectMeta>> {
         self.delete_object(key)
     }
 
     // === Deferred full-rewrite compaction ===
 
+    /// # Errors
+    /// Returns `io::Error` on file I/O or sled failure.
+    /// # Panics
+    /// Panics if the data file `RwLock` is poisoned.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn compact(&self) -> io::Result<()> {
         // Collect live objects sorted by offset
         let mut live: Vec<(Vec<u8>, ObjectMeta)> = Vec::new();
-        for result in self.objects.iter() {
-            let (k, v) = result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        for result in &self.objects {
+            let (k, v) = result.map_err(io::Error::other)?;
             let obj: ObjectMeta = bincode::deserialize(&v)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             live.push((k.to_vec(), obj));
         }
         live.sort_by_key(|(_, m)| m.offset);
 
         if live.is_empty() {
-            let file = self.data_file.write().unwrap();
-            file.set_len(0)?;
+            self.data_file.read().unwrap().set_len(0)?;
             self.set_dead_bytes(0)?;
             return Ok(());
         }
@@ -483,13 +530,15 @@ impl BucketStore {
         {
             let file = self.data_file.read().unwrap();
             for (key, mut obj) in live {
-                let mut buf = vec![0u8; obj.length as usize];
+                let len = usize::try_from(obj.length)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let mut buf = vec![0u8; len];
                 file.read_exact_at(&mut buf, obj.offset)?;
                 tmp.write_all(&buf)?;
                 obj.offset = new_offset;
                 new_offset += obj.length;
                 let v = bincode::serialize(&obj)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    .map_err(io::Error::other)?;
                 batch.insert(key, v);
             }
         }
@@ -502,7 +551,7 @@ impl BucketStore {
         self.set_meta_flag(COMPACTING_KEY, true)?;
         self.meta
             .flush()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         // Atomic rename
         fs::rename(&tmp_path, self.bucket_dir.join("data.bin"))?;
@@ -517,13 +566,15 @@ impl BucketStore {
         // Apply new offsets + clear dead bytes + clear flag
         self.objects
             .apply_batch(batch)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         self.set_dead_bytes(0)?;
         self.set_meta_flag(COMPACTING_KEY, false)?;
 
         Ok(())
     }
 
+    /// # Errors
+    /// Returns `io::Error` if sled iteration or deserialization fails.
     pub fn list_objects(
         &self,
         prefix: Option<&str>,
@@ -536,44 +587,45 @@ impl BucketStore {
     }
 
     /// List objects with optional delimiter support (for directory-like browsing).
-    /// Returns (objects, common_prefixes, truncated).
+    ///
+    /// # Errors
+    /// Returns `io::Error` if sled iteration or deserialization fails.
     pub fn list_objects_with_delimiter(
         &self,
         prefix: Option<&str>,
         delimiter: Option<&str>,
         max_keys: usize,
         continuation_token: Option<&str>,
-    ) -> io::Result<(Vec<(String, ObjectMeta)>, Vec<String>, bool)> {
+    ) -> io::Result<ListResult> {
         use std::collections::BTreeSet;
 
         let iter: Box<dyn Iterator<Item = sled::Result<(sled::IVec, sled::IVec)>>> =
-            match prefix {
-                Some(p) => Box::new(self.objects.scan_prefix(p.as_bytes())),
-                None => Box::new(self.objects.iter()),
-            };
+            prefix.map_or_else(
+                || Box::new(self.objects.iter()) as Box<dyn Iterator<Item = _>>,
+                |p| Box::new(self.objects.scan_prefix(p.as_bytes())),
+            );
 
         let mut results = Vec::new();
         let mut common_prefixes: BTreeSet<String> = BTreeSet::new();
         let mut truncated = false;
-        let prefix_len = prefix.map(|p| p.len()).unwrap_or(0);
+        let prefix_len = prefix.map_or(0, str::len);
 
         for result in iter {
-            let (k, v) = result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let (k, v) = result.map_err(io::Error::other)?;
             let obj_key = std::str::from_utf8(&k)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                 .to_string();
 
-            if let Some(token) = continuation_token {
-                if obj_key.as_str() <= token {
+            if let Some(token) = continuation_token
+                && obj_key.as_str() <= token {
                     continue;
                 }
-            }
 
             // Check delimiter: if key has delimiter after prefix, group into common_prefixes
             if let Some(delim) = delimiter {
                 let rest = &obj_key[prefix_len..];
                 if let Some(pos) = rest.find(delim) {
-                    let cp = format!("{}{}", prefix.unwrap_or(""), &rest[..=pos + delim.len() - 1]);
+                    let cp = format!("{}{}", prefix.unwrap_or(""), &rest[..(pos + delim.len())]);
                     if common_prefixes.contains(&cp) {
                         continue; // already counted
                     }
@@ -592,13 +644,15 @@ impl BucketStore {
             }
 
             let meta: ObjectMeta = bincode::deserialize(&v)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             results.push((obj_key, meta));
         }
 
         Ok((results, common_prefixes.into_iter().collect(), truncated))
     }
 
+    /// # Errors
+    /// This method currently always succeeds.
     pub fn is_empty(&self) -> io::Result<bool> {
         Ok(self.objects.is_empty())
     }
@@ -610,6 +664,8 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// # Errors
+    /// Returns `io::Error` if directory creation or bucket loading fails.
     pub fn open(data_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
 
@@ -638,6 +694,10 @@ impl Storage {
         })
     }
 
+    /// # Errors
+    /// Returns `io::Error` if bucket directory creation fails.
+    /// # Panics
+    /// Panics if the buckets `RwLock` is poisoned.
     pub fn create_bucket(&self, name: &str) -> io::Result<bool> {
         let mut map = self.buckets.write().unwrap();
         if map.contains_key(name) {
@@ -646,27 +706,35 @@ impl Storage {
         let bucket_dir = self.data_dir.join(name);
         let store = BucketStore::open(&bucket_dir)?;
         map.insert(name.to_string(), Arc::new(store));
+        drop(map);
         Ok(false)
     }
 
+    /// # Panics
+    /// Panics if the buckets `RwLock` is poisoned.
     pub fn get_bucket(&self, name: &str) -> Option<Arc<BucketStore>> {
-        let map = self.buckets.read().unwrap();
-        map.get(name).cloned()
+        self.buckets.read().unwrap().get(name).cloned()
     }
 
+    /// # Errors
+    /// Returns `io::Error` if removing the bucket directory fails.
+    /// # Panics
+    /// Panics if the buckets `RwLock` is poisoned.
     pub fn delete_bucket(&self, name: &str) -> io::Result<bool> {
         let mut map = self.buckets.write().unwrap();
         if map.remove(name).is_none() {
             return Ok(false);
         }
+        drop(map);
         let bucket_dir = self.data_dir.join(name);
         fs::remove_dir_all(&bucket_dir)?;
         Ok(true)
     }
 
+    /// # Panics
+    /// Panics if the buckets `RwLock` is poisoned.
     pub fn list_buckets(&self) -> Vec<String> {
-        let map = self.buckets.read().unwrap();
-        let mut names: Vec<String> = map.keys().cloned().collect();
+        let mut names: Vec<String> = self.buckets.read().unwrap().keys().cloned().collect();
         names.sort();
         names
     }

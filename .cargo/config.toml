@@ -1,0 +1,67 @@
+# https://doc.rust-lang.org/cargo/reference/config.html
+
+# Build configuration
+[build]
+# Use all available CPUs for parallel compilation
+jobs = -1
+
+# Rustflags for all targets
+[target.'cfg(all())']
+rustflags = [
+    # Deny warnings in CI (treat warnings as errors)
+    "-Dwarnings",
+    # Enable additional lints
+    "-Wrust-2024-compatibility",
+    "-Wclippy::all",
+    "-Wclippy::pedantic",
+    # Allow some pedantic lints that are too noisy
+    "-Aclippy::module_name_repetitions",
+    "-Aclippy::must_use_candidate",
+    "-Aclippy::missing_errors_doc",
+    "-Aclippy::missing_panics_doc",
+]
+
+# macOS specific settings (darwin)
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-Dwarnings",
+    "-Wrust-2024-compatibility",
+    "-Wclippy::all",
+    "-Wclippy::pedantic",
+    "-Aclippy::module_name_repetitions",
+    "-Aclippy::must_use_candidate",
+    "-Aclippy::missing_errors_doc",
+    "-Aclippy::missing_panics_doc",
+]
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-Dwarnings",
+    "-Wrust-2024-compatibility",
+    "-Wclippy::all",
+    "-Wclippy::pedantic",
+    "-Aclippy::module_name_repetitions",
+    "-Aclippy::must_use_candidate",
+    "-Aclippy::missing_errors_doc",
+    "-Aclippy::missing_panics_doc",
+]
+
+# Linux specific settings (for Docker/production)
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-Dwarnings",
+    "-Wrust-2024-compatibility",
+    "-Wclippy::all",
+    "-Wclippy::pedantic",
+    "-Aclippy::module_name_repetitions",
+    "-Aclippy::must_use_candidate",
+    "-Aclippy::missing_errors_doc",
+    "-Aclippy::missing_panics_doc",
+    # Link-time optimization for release builds
+    "-Clink-arg=-fuse-ld=lld",
+]
+
+# Useful aliases for common operations
+[alias]
+lint = "clippy -- -W clippy::all -W clippy::pedantic -W clippy::nursery"
+fix-lint = "clippy --fix --allow-dirty --allow-staged"
