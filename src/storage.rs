@@ -179,6 +179,11 @@ impl BucketStore {
             .unwrap_or(0)
     }
 
+    pub fn data_file_size(&self) -> io::Result<u64> {
+        let file = self.data_file.read().unwrap();
+        Ok(file.metadata()?.len())
+    }
+
     fn add_dead_bytes(&self, n: u64) -> io::Result<()> {
         let current = self.dead_bytes();
         self.set_dead_bytes(current + n)
@@ -525,6 +530,22 @@ impl BucketStore {
         max_keys: usize,
         continuation_token: Option<&str>,
     ) -> io::Result<(Vec<(String, ObjectMeta)>, bool)> {
+        let (objects, _, truncated) =
+            self.list_objects_with_delimiter(prefix, None, max_keys, continuation_token)?;
+        Ok((objects, truncated))
+    }
+
+    /// List objects with optional delimiter support (for directory-like browsing).
+    /// Returns (objects, common_prefixes, truncated).
+    pub fn list_objects_with_delimiter(
+        &self,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
+        max_keys: usize,
+        continuation_token: Option<&str>,
+    ) -> io::Result<(Vec<(String, ObjectMeta)>, Vec<String>, bool)> {
+        use std::collections::BTreeSet;
+
         let iter: Box<dyn Iterator<Item = sled::Result<(sled::IVec, sled::IVec)>>> =
             match prefix {
                 Some(p) => Box::new(self.objects.scan_prefix(p.as_bytes())),
@@ -532,7 +553,9 @@ impl BucketStore {
             };
 
         let mut results = Vec::new();
+        let mut common_prefixes: BTreeSet<String> = BTreeSet::new();
         let mut truncated = false;
+        let prefix_len = prefix.map(|p| p.len()).unwrap_or(0);
 
         for result in iter {
             let (k, v) = result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -546,7 +569,24 @@ impl BucketStore {
                 }
             }
 
-            if results.len() >= max_keys {
+            // Check delimiter: if key has delimiter after prefix, group into common_prefixes
+            if let Some(delim) = delimiter {
+                let rest = &obj_key[prefix_len..];
+                if let Some(pos) = rest.find(delim) {
+                    let cp = format!("{}{}", prefix.unwrap_or(""), &rest[..=pos + delim.len() - 1]);
+                    if common_prefixes.contains(&cp) {
+                        continue; // already counted
+                    }
+                    if results.len() + common_prefixes.len() >= max_keys {
+                        truncated = true;
+                        break;
+                    }
+                    common_prefixes.insert(cp);
+                    continue;
+                }
+            }
+
+            if results.len() + common_prefixes.len() >= max_keys {
                 truncated = true;
                 break;
             }
@@ -556,7 +596,7 @@ impl BucketStore {
             results.push((obj_key, meta));
         }
 
-        Ok((results, truncated))
+        Ok((results, common_prefixes.into_iter().collect(), truncated))
     }
 
     pub fn is_empty(&self) -> io::Result<bool> {

@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use hyper_util::rt::TokioIo;
@@ -27,12 +29,48 @@ enum Command {
         host: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// Autovacuum interval in seconds (0 = disabled)
+        #[arg(long, default_value_t = 300)]
+        autovacuum_interval: u64,
+        /// Autovacuum threshold: compact when dead_bytes > threshold fraction of file size (0.0-1.0)
+        #[arg(long, default_value_t = 0.5)]
+        autovacuum_threshold: f64,
     },
     /// Compact buckets to reclaim dead space
     Compact {
         /// Compact only this bucket (default: all buckets)
         bucket: Option<String>,
     },
+}
+
+fn run_autovacuum(storage: Arc<Storage>, threshold: f64) {
+    let buckets = storage.list_buckets();
+    for name in &buckets {
+        let Some(store) = storage.get_bucket(name) else {
+            continue;
+        };
+        let dead = store.dead_bytes();
+        if dead == 0 {
+            continue;
+        }
+        let file_size = store
+            .data_file_size()
+            .unwrap_or(0);
+        if file_size == 0 {
+            continue;
+        }
+        let ratio = dead as f64 / file_size as f64;
+        if ratio >= threshold {
+            tracing::info!(
+                "autovacuum: {name} — {dead} dead bytes ({:.0}%), compacting...",
+                ratio * 100.0
+            );
+            match store.compact() {
+                Ok(()) => tracing::info!("autovacuum: {name} — done"),
+                Err(e) => tracing::error!("autovacuum: {name} — compact failed: {e}"),
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -66,13 +104,42 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         cmd => {
-            let (host, port) = match cmd {
-                Some(Command::Serve { host, port }) => (host, port),
-                _ => ("0.0.0.0".into(), 8080),
+            let (host, port, autovacuum_interval, autovacuum_threshold) = match cmd {
+                Some(Command::Serve {
+                    host,
+                    port,
+                    autovacuum_interval,
+                    autovacuum_threshold,
+                }) => (host, port, autovacuum_interval, autovacuum_threshold),
+                _ => ("0.0.0.0".into(), 8080, 300, 0.5),
             };
 
-            let storage = Storage::open(&cli.data_dir)?;
-            let s3 = SimpleStorage::new(storage);
+            let storage = Arc::new(Storage::open(&cli.data_dir)?);
+            let s3 = SimpleStorage::new(Arc::clone(&storage));
+
+            // Start autovacuum background task
+            if autovacuum_interval > 0 {
+                let av_storage = Arc::clone(&storage);
+                let interval = Duration::from_secs(autovacuum_interval);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        let st = Arc::clone(&av_storage);
+                        let threshold = autovacuum_threshold;
+                        // Run compaction on blocking thread (it does file I/O)
+                        if let Err(e) =
+                            tokio::task::spawn_blocking(move || run_autovacuum(st, threshold)).await
+                        {
+                            tracing::error!("autovacuum task panicked: {e}");
+                        }
+                    }
+                });
+                tracing::info!(
+                    "autovacuum enabled: interval={}s, threshold={:.0}%",
+                    autovacuum_interval,
+                    autovacuum_threshold * 100.0
+                );
+            }
 
             let mut builder = S3ServiceBuilder::new(s3);
             builder.set_auth(SimpleAuth::from_single("test", "test"));

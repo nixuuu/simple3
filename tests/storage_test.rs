@@ -270,6 +270,50 @@ fn test_list_objects_prefix() {
 }
 
 #[test]
+fn test_list_objects_delimiter() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    storage.create_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap();
+
+    for key in [
+        "photos/vacation/a.jpg",
+        "photos/vacation/b.jpg",
+        "photos/work/c.jpg",
+        "photos/d.jpg",
+        "docs/x.txt",
+        "root.txt",
+    ] {
+        let (off, len) = bucket.append_data(b"data").unwrap();
+        bucket.put_meta(key, &make_meta(off, len, "e")).unwrap();
+    }
+
+    // Root level with delimiter
+    let (objects, prefixes, trunc) = bucket
+        .list_objects_with_delimiter(None, Some("/"), 1000, None)
+        .unwrap();
+    assert!(!trunc);
+    assert_eq!(objects.len(), 1); // "root.txt"
+    assert_eq!(objects[0].0, "root.txt");
+    assert_eq!(prefixes, vec!["docs/", "photos/"]);
+
+    // "photos/" prefix with delimiter
+    let (objects, prefixes, _) = bucket
+        .list_objects_with_delimiter(Some("photos/"), Some("/"), 1000, None)
+        .unwrap();
+    assert_eq!(objects.len(), 1); // "photos/d.jpg"
+    assert_eq!(objects[0].0, "photos/d.jpg");
+    assert_eq!(prefixes, vec!["photos/vacation/", "photos/work/"]);
+
+    // No delimiter — flat list
+    let (objects, prefixes, _) = bucket
+        .list_objects_with_delimiter(Some("photos/"), None, 1000, None)
+        .unwrap();
+    assert_eq!(objects.len(), 4);
+    assert!(prefixes.is_empty());
+}
+
+#[test]
 fn test_list_objects_pagination() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();

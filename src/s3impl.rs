@@ -15,10 +15,8 @@ pub struct SimpleStorage {
 }
 
 impl SimpleStorage {
-    pub fn new(storage: Storage) -> Self {
-        Self {
-            inner: Arc::new(storage),
-        }
+    pub fn new(storage: Arc<Storage>) -> Self {
+        Self { inner: storage }
     }
 }
 
@@ -259,10 +257,11 @@ impl S3 for SimpleStorage {
 
         let max_keys = input.max_keys.unwrap_or(1000) as usize;
         let prefix = input.prefix.as_deref();
+        let delimiter = input.delimiter.as_deref();
         let continuation = input.continuation_token.as_deref();
 
-        let (entries, truncated) = store
-            .list_objects(prefix, max_keys, continuation)
+        let (entries, common_prefixes, truncated) = store
+            .list_objects_with_delimiter(prefix, delimiter, max_keys, continuation)
             .map_err(|e| s3_error!(e, InternalError))?;
 
         let next_token = if truncated {
@@ -286,10 +285,26 @@ impl S3 for SimpleStorage {
             })
             .collect();
 
+        let cp: Option<Vec<CommonPrefix>> = if common_prefixes.is_empty() {
+            None
+        } else {
+            Some(
+                common_prefixes
+                    .into_iter()
+                    .map(|p| CommonPrefix {
+                        prefix: Some(p),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )
+        };
+
         let key_count = objects.len() as i32;
 
         let output = ListObjectsV2Output {
             contents: Some(objects),
+            common_prefixes: cp,
+            delimiter: input.delimiter,
             is_truncated: Some(truncated),
             key_count: Some(key_count),
             max_keys: Some(max_keys as i32),
