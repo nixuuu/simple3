@@ -1,7 +1,3 @@
-mod s3impl;
-mod storage;
-mod types;
-
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -10,8 +6,8 @@ use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use tokio::net::TcpListener;
 
-use s3impl::SimpleStorage;
-use storage::Storage;
+use simple3::s3impl::SimpleStorage;
+use simple3::storage::Storage;
 
 #[derive(Parser)]
 #[command(name = "simple3", about = "Simple S3-compatible storage service")]
