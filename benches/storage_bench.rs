@@ -1,7 +1,9 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use simple3::storage::Storage;
 use simple3::types::ObjectMeta;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 fn make_meta(offset: u64, length: u64) -> ObjectMeta {
     ObjectMeta {
@@ -14,12 +16,28 @@ fn make_meta(offset: u64, length: u64) -> ObjectMeta {
     }
 }
 
-fn setup_bucket(prefix: &str) -> (tempfile::TempDir, Storage) {
+fn setup_bucket(name: &str) -> (tempfile::TempDir, Storage) {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
-    storage.create_bucket(prefix).unwrap();
+    storage.create_bucket(name).unwrap();
     (dir, storage)
 }
+
+/// Pre-fill bucket with N objects of given size, return keys
+fn prefill(storage: &Storage, bucket: &str, count: usize, obj_size: usize) -> Vec<String> {
+    let b = storage.get_bucket(bucket).unwrap();
+    let data = vec![0x42u8; obj_size];
+    let mut keys = Vec::with_capacity(count);
+    for i in 0..count {
+        let key = format!("key{i:06}");
+        let (off, len) = b.append_data(&data).unwrap();
+        b.put_meta(&key, &make_meta(off, len)).unwrap();
+        keys.push(key);
+    }
+    keys
+}
+
+// === Put benchmarks (shared bucket, unique keys via atomic counter) ===
 
 fn bench_put(c: &mut Criterion) {
     let data_1kb = vec![0x42u8; 1024];
@@ -28,111 +46,207 @@ fn bench_put(c: &mut Criterion) {
     c.bench_function("put_1kb", |b| {
         let (_dir, storage) = setup_bucket("b");
         let bucket = storage.get_bucket("b").unwrap();
-        let mut i = 0u64;
+        let counter = AtomicU64::new(0);
         b.iter(|| {
+            let i = counter.fetch_add(1, Ordering::Relaxed);
+            let key = format!("k{i}");
             let (off, len) = bucket.append_data(&data_1kb).unwrap();
-            bucket
-                .put_meta(&format!("k{i}"), &make_meta(off, len))
-                .unwrap();
-            i += 1;
+            bucket.put_meta(&key, &make_meta(off, len)).unwrap();
         });
     });
 
     c.bench_function("put_1mb", |b| {
         let (_dir, storage) = setup_bucket("b");
         let bucket = storage.get_bucket("b").unwrap();
-        let mut i = 0u64;
+        let counter = AtomicU64::new(0);
         b.iter(|| {
+            let i = counter.fetch_add(1, Ordering::Relaxed);
+            let key = format!("k{i}");
             let (off, len) = bucket.append_data(&data_1mb).unwrap();
-            bucket
-                .put_meta(&format!("k{i}"), &make_meta(off, len))
-                .unwrap();
-            i += 1;
+            bucket.put_meta(&key, &make_meta(off, len)).unwrap();
         });
     });
 }
+
+// === Get benchmarks (random key access across many objects) ===
 
 fn bench_get(c: &mut Criterion) {
-    let data_1kb = vec![0x42u8; 1024];
-    let data_1mb = vec![0x42u8; 1024 * 1024];
+    let mut group = c.benchmark_group("get_random");
 
-    c.bench_function("get_1kb", |b| {
-        let (_dir, storage) = setup_bucket("b");
-        let bucket = storage.get_bucket("b").unwrap();
-        let (off, len) = bucket.append_data(&data_1kb).unwrap();
-        bucket.put_meta("obj", &make_meta(off, len)).unwrap();
-        b.iter(|| {
-            let meta = bucket.get_meta("obj").unwrap().unwrap();
-            bucket.read_data(meta.offset, meta.length).unwrap();
+    for &(label, obj_size, count) in &[
+        ("1kb_among_100", 1024, 100),
+        ("1kb_among_1000", 1024, 1000),
+        ("1mb_among_100", 1024 * 1024, 100),
+    ] {
+        group.bench_function(label, |b| {
+            let (_dir, storage) = setup_bucket("b");
+            let keys = prefill(&storage, "b", count, obj_size);
+            let bucket = storage.get_bucket("b").unwrap();
+            let mut idx = 0usize;
+            b.iter(|| {
+                let key = &keys[idx % keys.len()];
+                idx = idx.wrapping_add(7919); // prime stride for pseudo-random
+                let meta = bucket.get_meta(key).unwrap().unwrap();
+                bucket.read_data(meta.offset, meta.length).unwrap();
+            });
         });
-    });
+    }
 
-    c.bench_function("get_1mb", |b| {
-        let (_dir, storage) = setup_bucket("b");
-        let bucket = storage.get_bucket("b").unwrap();
-        let (off, len) = bucket.append_data(&data_1mb).unwrap();
-        bucket.put_meta("obj", &make_meta(off, len)).unwrap();
-        b.iter(|| {
-            let meta = bucket.get_meta("obj").unwrap().unwrap();
-            bucket.read_data(meta.offset, meta.length).unwrap();
-        });
-    });
+    group.finish();
 }
 
-fn bench_delete_with_compact(c: &mut Criterion) {
-    c.bench_function("delete_compact_100_objects", |b| {
-        b.iter_custom(|iters| {
-            let mut total = std::time::Duration::ZERO;
-            for _ in 0..iters {
-                let (_dir, storage) = setup_bucket("b");
-                let bucket = storage.get_bucket("b").unwrap();
-                // Pre-fill 100 objects
-                for i in 0..100 {
-                    let data = format!("data-{i:04}");
-                    let (off, len) = bucket.append_data(data.as_bytes()).unwrap();
-                    bucket
-                        .put_meta(&format!("key{i:04}"), &make_meta(off, len))
-                        .unwrap();
-                }
-                // Bench: delete from middle
-                let start = std::time::Instant::now();
-                bucket.delete_and_compact("key0050").unwrap();
-                total += start.elapsed();
-            }
-            total
+// === Delete+compact scaling ===
+
+fn bench_compact_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compact_scaling");
+    group.sample_size(30);
+
+    for count in [100, 1000, 5000] {
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.iter_batched(
+                || {
+                    let (dir, storage) = setup_bucket("b");
+                    let keys = prefill(&storage, "b", count, 64);
+                    let mid_key = keys[count / 2].clone();
+                    (dir, storage, mid_key)
+                },
+                |(_dir, storage, mid_key)| {
+                    let bucket = storage.get_bucket("b").unwrap();
+                    bucket.delete_object(&mid_key).unwrap();
+                    bucket.compact().unwrap();
+                },
+                criterion::BatchSize::LargeInput,
+            );
         });
-    });
+    }
+
+    group.finish();
 }
+
+// === List scaling ===
 
 fn bench_list(c: &mut Criterion) {
-    c.bench_function("list_100_objects", |b| {
-        let (_dir, storage) = setup_bucket("b");
-        let bucket = storage.get_bucket("b").unwrap();
-        for i in 0..100 {
-            let (off, len) = bucket.append_data(b"x").unwrap();
-            bucket
-                .put_meta(&format!("k{i:04}"), &make_meta(off, len))
-                .unwrap();
-        }
-        b.iter(|| {
-            bucket.list_objects(None, 1000, None).unwrap();
-        });
-    });
+    let mut group = c.benchmark_group("list_scaling");
 
-    c.bench_function("list_1000_objects", |b| {
-        let (_dir, storage) = setup_bucket("b");
-        let bucket = storage.get_bucket("b").unwrap();
-        for i in 0..1000 {
-            let (off, len) = bucket.append_data(b"x").unwrap();
-            bucket
-                .put_meta(&format!("k{i:04}"), &make_meta(off, len))
-                .unwrap();
-        }
-        b.iter(|| {
-            bucket.list_objects(None, 1000, None).unwrap();
+    for count in [100, 1000, 5000] {
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            let (_dir, storage) = setup_bucket("b");
+            prefill(&storage, "b", count, 1);
+            let bucket = storage.get_bucket("b").unwrap();
+            b.iter(|| {
+                bucket.list_objects(None, count, None).unwrap();
+            });
         });
-    });
+    }
+
+    group.finish();
 }
 
-criterion_group!(benches, bench_put, bench_get, bench_delete_with_compact, bench_list);
+// === Concurrent read/write ===
+
+fn bench_concurrent(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent");
+    group.sample_size(20);
+
+    // Concurrent reads (4 threads)
+    group.bench_function("4_thread_get_1kb", |b| {
+        let (_dir, storage) = setup_bucket("b");
+        prefill(&storage, "b", 100, 1024);
+        let bucket = storage.get_bucket("b").unwrap();
+
+        b.iter(|| {
+            std::thread::scope(|s| {
+                for t in 0..4u64 {
+                    let bucket = Arc::clone(&bucket);
+                    s.spawn(move || {
+                        for i in 0..25 {
+                            let key = format!("key{:06}", (t * 25 + i) % 100);
+                            let meta = bucket.get_meta(&key).unwrap().unwrap();
+                            bucket.read_data(meta.offset, meta.length).unwrap();
+                        }
+                    });
+                }
+            });
+        });
+    });
+
+    // Concurrent writes (4 threads)
+    group.bench_function("4_thread_put_1kb", |b| {
+        let data = vec![0x42u8; 1024];
+
+        b.iter_batched(
+            || setup_bucket("b"),
+            |(_dir, storage)| {
+                let bucket = storage.get_bucket("b").unwrap();
+                std::thread::scope(|s| {
+                    for t in 0..4u64 {
+                        let bucket = Arc::clone(&bucket);
+                        let data = &data;
+                        s.spawn(move || {
+                            for i in 0..25 {
+                                let key = format!("t{t}k{i}");
+                                let (off, len) = bucket.append_data(data).unwrap();
+                                bucket.put_meta(&key, &make_meta(off, len)).unwrap();
+                            }
+                        });
+                    }
+                });
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+
+    // Mixed: 2 readers + 2 writers
+    group.bench_function("mixed_2r_2w", |b| {
+        let data = vec![0x42u8; 1024];
+
+        b.iter_batched(
+            || {
+                let (dir, storage) = setup_bucket("b");
+                prefill(&storage, "b", 50, 1024);
+                (dir, storage)
+            },
+            |(_dir, storage)| {
+                let bucket = storage.get_bucket("b").unwrap();
+                std::thread::scope(|s| {
+                    // 2 readers
+                    for t in 0..2u64 {
+                        let bucket = Arc::clone(&bucket);
+                        s.spawn(move || {
+                            for i in 0..25 {
+                                let key = format!("key{:06}", (t * 25 + i) % 50);
+                                let meta = bucket.get_meta(&key).unwrap().unwrap();
+                                bucket.read_data(meta.offset, meta.length).unwrap();
+                            }
+                        });
+                    }
+                    // 2 writers
+                    for t in 0..2u64 {
+                        let bucket = Arc::clone(&bucket);
+                        let data = &data;
+                        s.spawn(move || {
+                            for i in 0..25 {
+                                let key = format!("new_t{t}k{i}");
+                                let (off, len) = bucket.append_data(data).unwrap();
+                                bucket.put_meta(&key, &make_meta(off, len)).unwrap();
+                            }
+                        });
+                    }
+                });
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_put,
+    bench_get,
+    bench_compact_scaling,
+    bench_list,
+    bench_concurrent
+);
 criterion_main!(benches);

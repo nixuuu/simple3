@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,7 +9,6 @@ use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::storage::Storage;
-use crate::types::ObjectMeta;
 
 pub struct SimpleStorage {
     inner: Arc<Storage>,
@@ -92,38 +93,59 @@ impl S3 for SimpleStorage {
 
         let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
-        let mut data = Vec::new();
-        let mut stream = body;
-        while let Some(chunk) = stream.try_next().await.map_err(|_| s3_error!(InternalError))? {
-            data.extend_from_slice(&chunk);
+        // Stream body to temp file (no lock on data.bin, bounded RAM)
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        let tmp_path = store.bucket_dir().join(format!(".tmp_{now_nanos:020}"));
+
+        let stream_result: S3Result<String> = async {
+            let mut tmp_file = std::fs::File::create(&tmp_path)
+                .map_err(|e| s3_error!(e, InternalError))?;
+            let mut hasher = Md5::new();
+            let mut stream = body;
+
+            while let Some(chunk) =
+                stream.try_next().await.map_err(|_| s3_error!(InternalError))?
+            {
+                tmp_file
+                    .write_all(&chunk)
+                    .map_err(|e| s3_error!(e, InternalError))?;
+                hasher.update(&chunk);
+            }
+            tmp_file.flush().map_err(|e| s3_error!(e, InternalError))?;
+
+            Ok(format!("{:x}", hasher.finalize()))
         }
+        .await;
 
-        let mut hasher = Md5::new();
-        hasher.update(&data);
-        let etag_hex = format!("{:x}", hasher.finalize());
-
-        let (offset, length) = store
-            .append_data(&data)
-            .map_err(|e| s3_error!(e, InternalError))?;
+        let etag_hex = match stream_result {
+            Ok(etag) => etag,
+            Err(e) => {
+                std::fs::remove_file(&tmp_path).ok();
+                return Err(e);
+            }
+        };
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
-        let meta = ObjectMeta {
-            offset,
-            length,
-            content_type: input.content_type,
-            etag: etag_hex.clone(),
-            last_modified: now,
-            user_metadata: input.metadata.unwrap_or_default(),
-        };
-
-        store
-            .put_meta(&input.key, &meta)
+        // Atomically: copy tmp→data.bin + write meta (with rollback)
+        let meta = store
+            .put_object_streamed(
+                &input.key,
+                &tmp_path,
+                input.content_type,
+                etag_hex.clone(),
+                now,
+                input.metadata.unwrap_or_default(),
+            )
             .map_err(|e| s3_error!(e, InternalError))?;
 
+        let _ = meta; // offset/length used internally
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag_hex)),
             ..Default::default()
@@ -219,7 +241,7 @@ impl S3 for SimpleStorage {
             .ok_or_else(|| s3_error!(NoSuchBucket))?;
 
         store
-            .delete_and_compact(&input.key)
+            .delete_object(&input.key)
             .map_err(|e| s3_error!(e, InternalError))?;
 
         Ok(S3Response::new(DeleteObjectOutput::default()))
@@ -277,5 +299,127 @@ impl S3 for SimpleStorage {
             ..Default::default()
         };
         Ok(S3Response::new(output))
+    }
+
+    // === Multipart upload ===
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let input = req.input;
+        let store = self
+            .inner
+            .get_bucket(&input.bucket)
+            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+
+        let upload_id = store.create_multipart_upload();
+
+        let output = CreateMultipartUploadOutput {
+            bucket: Some(input.bucket),
+            key: Some(input.key),
+            upload_id: Some(upload_id),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let input = req.input;
+        let store = self
+            .inner
+            .get_bucket(&input.bucket)
+            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+
+        let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
+
+        let mut data = Vec::new();
+        let mut stream = body;
+        while let Some(chunk) = stream.try_next().await.map_err(|_| s3_error!(InternalError))? {
+            data.extend_from_slice(&chunk);
+        }
+
+        let etag = store
+            .upload_part(&input.upload_id, input.part_number, &data)
+            .map_err(|e| s3_error!(e, InternalError))?;
+
+        let output = UploadPartOutput {
+            e_tag: Some(ETag::Strong(etag)),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let input = req.input;
+        let store = self
+            .inner
+            .get_bucket(&input.bucket)
+            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+
+        let completed = input
+            .multipart_upload
+            .ok_or_else(|| s3_error!(MalformedXML))?;
+        let parts_list = completed.parts.ok_or_else(|| s3_error!(MalformedXML))?;
+
+        let parts: Vec<(i32, String)> = parts_list
+            .iter()
+            .map(|p| {
+                let num = p.part_number.unwrap_or(0);
+                let etag = p
+                    .e_tag
+                    .as_ref()
+                    .map(|e| e.value().to_owned())
+                    .unwrap_or_default();
+                (num, etag)
+            })
+            .collect();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        let (_meta, etag) = store
+            .complete_multipart_upload(
+                &input.upload_id,
+                &input.key,
+                &parts,
+                None, // content_type from CreateMultipartUpload not stored yet
+                now,
+                HashMap::new(),
+            )
+            .map_err(|e| s3_error!(e, InternalError))?;
+
+        let output = CompleteMultipartUploadOutput {
+            bucket: Some(input.bucket),
+            key: Some(input.key),
+            e_tag: Some(ETag::Strong(etag)),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let input = req.input;
+        let store = self
+            .inner
+            .get_bucket(&input.bucket)
+            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+
+        store
+            .abort_multipart_upload(&input.upload_id)
+            .map_err(|e| s3_error!(e, InternalError))?;
+
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 }
