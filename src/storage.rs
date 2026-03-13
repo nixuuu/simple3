@@ -698,11 +698,13 @@ impl BucketStore {
     // === Multipart upload ===
 
     pub fn create_multipart_upload(&self) -> String {
+        static MPU_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = MPU_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        format!("{nanos:032x}")
+        format!("{nanos:032x}_{id:08x}")
     }
 
     fn part_path(&self, upload_id: &str, part_num: i32) -> PathBuf {

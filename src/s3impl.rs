@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
@@ -10,6 +11,9 @@ use s3s::dto::{CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteB
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::storage::{BucketStore, Storage};
+
+/// Monotonic counter for unique temp file names across concurrent requests.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct SimpleStorage {
     inner: Arc<Storage>,
@@ -114,11 +118,8 @@ impl S3 for SimpleStorage {
 
         let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
-        let now_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let tmp_path = store.bucket_dir().join(format!(".tmp_{now_nanos:020}"));
+        let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = store.bucket_dir().join(format!(".tmp_{tmp_id:020}"));
 
         let etag_hex = match stream_body_to_tmp(body, &tmp_path).await {
             Ok(etag) => etag,
