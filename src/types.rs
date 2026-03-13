@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ObjectMeta {
+    pub segment_id: u32,
     pub offset: u64,
     pub length: u64,
     pub content_type: Option<String>,

@@ -164,7 +164,7 @@ impl S3 for SimpleStorage {
             .ok_or_else(|| s3_error!(NoSuchKey))?;
 
         let data = store
-            .read_data(meta.offset, meta.length)
+            .read_data(meta.segment_id, meta.offset, meta.length)
             .map_err(|e| s3_error!(e, InternalError))?;
 
         let stream =

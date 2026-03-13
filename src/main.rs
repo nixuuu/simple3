@@ -51,26 +51,31 @@ fn run_autovacuum(storage: &Arc<Storage>, threshold: f64) {
         let Some(store) = storage.get_bucket(name).ok().flatten() else {
             continue;
         };
-        let dead = store.dead_bytes();
-        if dead == 0 {
+        let Ok(stats) = store.segment_stats() else {
             continue;
-        }
-        let file_size = store
-            .data_file_size()
-            .unwrap_or(0);
-        if file_size == 0 {
-            continue;
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let ratio = dead as f64 / file_size as f64;
-        if ratio >= threshold {
-            tracing::info!(
-                "autovacuum: {name} — {dead} dead bytes ({:.0}%), compacting...",
-                ratio * 100.0
-            );
-            match store.compact() {
-                Ok(()) => tracing::info!("autovacuum: {name} — done"),
-                Err(e) => tracing::error!("autovacuum: {name} — compact failed: {e}"),
+        };
+        for stat in stats {
+            if stat.dead_bytes == 0 || stat.size == 0 {
+                continue;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let ratio = stat.dead_bytes as f64 / stat.size as f64;
+            if ratio >= threshold {
+                tracing::info!(
+                    "autovacuum: {name}/seg_{:06} — {} dead bytes ({:.0}%), compacting...",
+                    stat.id,
+                    stat.dead_bytes,
+                    ratio * 100.0
+                );
+                match store.compact_segment(stat.id) {
+                    Ok(()) => tracing::info!("autovacuum: {name}/seg_{:06} — done", stat.id),
+                    Err(e) => {
+                        tracing::error!(
+                            "autovacuum: {name}/seg_{:06} — compact failed: {e}",
+                            stat.id
+                        );
+                    }
+                }
             }
         }
     }
