@@ -300,6 +300,7 @@ impl BucketStore {
         let offset = file.seek(SeekFrom::End(0))?;
         let length = io::copy(&mut tmp, &mut *file)?;
         file.flush()?;
+        file.sync_all()?;
         drop(tmp);
 
         let meta = ObjectMeta {
@@ -404,6 +405,7 @@ impl BucketStore {
             part_md5_concat.extend_from_slice(&part_hasher.finalize());
         }
         file.flush()?;
+        file.sync_all()?;
 
         let mut final_hasher = Md5::new();
         final_hasher.update(&part_md5_concat);
