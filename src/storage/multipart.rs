@@ -54,11 +54,14 @@ impl BucketStore {
         sorted_parts.sort_by_key(|(num, _)| *num);
 
         // Pre-calculate total size for rotation check
-        let mut total_expected: u64 = 0;
-        for (part_num, _) in &sorted_parts {
-            let pp = self.part_path(upload_id, *part_num);
-            total_expected += fs::metadata(&pp)?.len().saturating_sub(16);
-        }
+        let total_expected: u64 = sorted_parts
+            .iter()
+            .map(|(part_num, _)| -> io::Result<u64> {
+                Ok(fs::metadata(self.part_path(upload_id, *part_num))?
+                    .len()
+                    .saturating_sub(16))
+            })
+            .sum::<io::Result<u64>>()?;
 
         let mut w = self
             .writer

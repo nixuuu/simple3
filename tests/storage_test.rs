@@ -164,7 +164,7 @@ fn test_delete_object() {
         .put_meta("k", &make_meta(seg, off, len, "e"))
         .unwrap();
 
-    let removed = bucket.delete_and_compact("k").unwrap();
+    let removed = bucket.delete_object("k").unwrap();
     assert!(removed.is_some());
     assert!(bucket.get_meta("k").unwrap().is_none());
 }
@@ -176,7 +176,7 @@ fn test_delete_nonexistent() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    assert!(bucket.delete_and_compact("nope").unwrap().is_none());
+    assert!(bucket.delete_object("nope").unwrap().is_none());
 }
 
 // === Compaction ===
@@ -202,7 +202,7 @@ fn test_compaction_shrinks_file() {
     assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 10);
 
     // Delete leaves dead space, then compact reclaims it
-    bucket.delete_and_compact("a").unwrap();
+    bucket.delete_object("a").unwrap();
     assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 10);
 
     bucket.compact().unwrap();
@@ -232,7 +232,7 @@ fn test_compaction_preserves_other_objects() {
         .put_meta("c", &make_meta(seg, off_c, len_c, "ec"))
         .unwrap();
 
-    bucket.delete_and_compact("b").unwrap();
+    bucket.delete_object("b").unwrap();
     bucket.compact().unwrap();
 
     let meta_a = bucket.get_meta("a").unwrap().unwrap();

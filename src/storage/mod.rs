@@ -270,10 +270,7 @@ impl BucketStore {
                 let obj: ObjectMeta =
                     bincode::deserialize(v.value()).map_err(io::Error::other)?;
                 if obj.segment_id == active_id {
-                    let end = obj.offset + obj.length;
-                    if end > max_end {
-                        max_end = end;
-                    }
+                    max_end = max_end.max(obj.offset + obj.length);
                 }
             }
         }
@@ -345,15 +342,12 @@ impl BucketStore {
             .segments
             .read()
             .map_err(|_| io::Error::other("segments lock poisoned"))?;
-        let mut total = 0u64;
-        for seg in map.values() {
+        map.values().try_fold(0u64, |total, seg| {
             let file = seg
                 .read()
                 .map_err(|_| io::Error::other("segment lock poisoned"))?;
-            total += file.metadata()?.len();
-        }
-        drop(map);
-        Ok(total)
+            Ok(total + file.metadata()?.len())
+        })
     }
 
     /// Per-segment stats for autovacuum.
@@ -473,6 +467,37 @@ impl BucketStore {
 
     // === Streamed PUT ===
 
+    /// Write tmp file data into the active segment — rename if empty, copy otherwise.
+    fn write_to_segment(
+        &self,
+        w: &mut ActiveWriter,
+        tmp_path: &Path,
+        mut tmp: File,
+        tmp_size: u64,
+    ) -> io::Result<(u64, u64)> {
+        let seg_path = self.bucket_dir.join(segment_filename(w.id));
+        if w.size == 0 {
+            // Empty segment — rename tmp file to become the segment (O(1) vs O(n) copy)
+            drop(tmp);
+            fs::rename(tmp_path, &seg_path)?;
+            w.file = OpenOptions::new().read(true).write(true).open(&seg_path)?;
+            w.file.sync_all()?;
+            w.size = tmp_size;
+            let reader = w.file.try_clone()?;
+            self.segments
+                .write()
+                .map_err(|_| io::Error::other("segments lock poisoned"))?
+                .insert(w.id, Arc::new(RwLock::new(reader)));
+            Ok((0, tmp_size))
+        } else {
+            let offset = w.file.seek(SeekFrom::End(0))?;
+            let length = copy_large(&mut tmp, &mut w.file)?;
+            w.file.sync_all()?;
+            w.size = offset + length;
+            Ok((offset, length))
+        }
+    }
+
     pub fn put_object_streamed(
         &self,
         key: &str,
@@ -482,7 +507,7 @@ impl BucketStore {
         last_modified: u64,
         user_metadata: HashMap<String, String>,
     ) -> io::Result<ObjectMeta> {
-        let mut tmp = File::open(tmp_path)?;
+        let tmp = File::open(tmp_path)?;
         let tmp_size = tmp.metadata()?.len();
         let mut w = self
             .writer
@@ -494,29 +519,7 @@ impl BucketStore {
         }
 
         let segment_id = w.id;
-        let seg_path = self.bucket_dir.join(segment_filename(segment_id));
-
-        let (offset, length) = if w.size == 0 {
-            // Empty segment — rename tmp file to become the segment (O(1) vs O(n) copy)
-            drop(tmp);
-            fs::rename(tmp_path, &seg_path)?;
-            w.file = OpenOptions::new().read(true).write(true).open(&seg_path)?;
-            w.file.sync_all()?;
-            w.size = tmp_size;
-            let reader = w.file.try_clone()?;
-            self.segments
-                .write()
-                .map_err(|_| io::Error::other("segments lock poisoned"))?
-                .insert(segment_id, Arc::new(RwLock::new(reader)));
-            (0, tmp_size)
-        } else {
-            let offset = w.file.seek(SeekFrom::End(0))?;
-            let length = copy_large(&mut tmp, &mut w.file)?;
-            w.file.sync_all()?;
-            w.size = offset + length;
-            drop(tmp);
-            (offset, length)
-        };
+        let (offset, length) = self.write_to_segment(&mut w, tmp_path, tmp, tmp_size)?;
 
         let meta = ObjectMeta {
             segment_id,
@@ -567,11 +570,6 @@ impl BucketStore {
 
         txn.commit().map_err(io::Error::other)?;
         Ok(Some(meta))
-    }
-
-    /// Backward compat alias for tests.
-    pub fn delete_and_compact(&self, key: &str) -> io::Result<Option<ObjectMeta>> {
-        self.delete_object(key)
     }
 
     // === List objects ===
