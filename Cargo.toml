@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 s3s = "0.13.0"
+redb = "3.1"
 sled = "0.34"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"

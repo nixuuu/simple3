@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-simple3 is an S3-compatible storage service in Rust. It uses append-only data files per bucket with sled embedded database for metadata indexing. Supports single and multipart uploads, crash-safe compaction, and autovacuum.
+simple3 is an S3-compatible storage service in Rust. It uses segmented append-only data files per bucket with redb embedded database for metadata indexing. Supports single and multipart uploads, crash-safe compaction, and autovacuum. Existing sled databases are auto-migrated to redb on first startup.
 
 ## Commands
 
@@ -30,26 +30,27 @@ No `unwrap()` in library code — use `Result`/`Option` propagation. `unwrap()` 
 
 Three modules exported from `lib.rs`:
 
-- **`storage.rs`** — Append-only storage engine. `Storage` manages buckets (lazy-loaded, `RwLock<HashMap>`). `BucketStore` owns a `data.bin` (append-only) + sled DB (objects tree for `ObjectMeta`, meta tree for dead_bytes/compaction flag). Supports multipart uploads via temporary `.mpu_*` files.
+- **`storage.rs`** — Segmented append-only storage engine. `Storage` manages buckets (lazy-loaded, `RwLock<HashMap>`). `BucketStore` owns segmented data files + redb DB (three typed tables: `objects` for `ObjectMeta`, `seg_dead` for per-segment dead bytes, `seg_compacting` for compaction flags). Cross-table atomic transactions for delete/put/compaction. Supports multipart uploads via temporary `.mpu_*` files. Auto-migrates from sled (v1/v2) to redb on first open.
 - **`s3impl.rs`** — Implements `s3s::S3` trait on `SimpleStorage(Arc<Storage>)`. Maps storage operations to S3 API (CreateBucket, PutObject, GetObject, ListObjectsV2, multipart, etc.). Streams request bodies to temp files, computes MD5 ETags.
-- **`types.rs`** — `ObjectMeta` struct (offset, length, content_type, etag, last_modified, user_metadata). Serialized with bincode for sled storage.
+- **`types.rs`** — `ObjectMeta` struct (segment_id, offset, length, content_type, etag, last_modified, user_metadata). Serialized with bincode for redb storage.
 
 ### Per-bucket file layout
 
 ```
 {bucket}/
-├── index.db/       # sled database (objects + meta trees)
-├── data.bin        # append-only object data
-├── .tmp_*          # temp files during put (cleaned on startup)
-├── .mpu_*          # multipart part files (cleaned on startup)
-└── data.bin.tmp    # temp file during compaction
+├── index.redb          # redb database (objects + seg_dead + seg_compacting tables)
+├── seg_000000.bin      # segmented append-only data files
+├── seg_000001.bin
+├── .tmp_*              # temp files during put (cleaned on startup)
+├── .mpu_*              # multipart part files (cleaned on startup)
+└── seg_NNNNNN.bin.tmp  # temp file during compaction
 ```
 
 ### Key patterns
 
-- **Crash safety**: Append-only writes + sled ACID. Compaction sets `__compacting__` flag before atomic rename; recovery rebuilds if flag found. Orphan temp files cleaned on startup. `truncate_orphans()` trims data.bin to last known object.
-- **Dead space tracking**: Overwrite/delete increments `dead_bytes` in meta tree. Autovacuum triggers compaction when `dead_bytes / file_size > threshold`.
-- **Locking**: `RwLock` on buckets map and per-bucket data file. sled handles its own concurrency.
+- **Crash safety**: Append-only writes + redb ACID transactions. Compaction sets `seg_compacting` flag before atomic rename; recovery rebuilds if flag found. Orphan temp files cleaned on startup. `truncate_orphans()` trims active segment to last known object.
+- **Dead space tracking**: Overwrite/delete atomically increments per-segment dead bytes in `seg_dead` table (same transaction as metadata update). Autovacuum triggers compaction when `dead_bytes / file_size > threshold`.
+- **Locking**: `RwLock` on buckets map, `Mutex` on active writer, per-segment `RwLock<File>` for concurrent reads. redb handles its own write serialization.
 - **Error handling**: `anyhow` for application errors, `s3_error!` macro maps `io::Error` to S3 error codes.
 
 ## Code Style

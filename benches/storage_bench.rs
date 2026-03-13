@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-fn make_meta(offset: u64, length: u64) -> ObjectMeta {
+fn make_meta(segment_id: u32, offset: u64, length: u64) -> ObjectMeta {
     ObjectMeta {
+        segment_id,
         offset,
         length,
         content_type: Some("application/octet-stream".into()),
@@ -30,8 +31,8 @@ fn prefill(storage: &Storage, bucket: &str, count: usize, obj_size: usize) -> Ve
     let mut keys = Vec::with_capacity(count);
     for i in 0..count {
         let key = format!("key{i:06}");
-        let (off, len) = b.append_data(&data).unwrap();
-        b.put_meta(&key, &make_meta(off, len)).unwrap();
+        let (seg, off, len) = b.append_data(&data).unwrap();
+        b.put_meta(&key, &make_meta(seg, off, len)).unwrap();
         keys.push(key);
     }
     keys
@@ -50,8 +51,8 @@ fn bench_put(c: &mut Criterion) {
         b.iter(|| {
             let i = counter.fetch_add(1, Ordering::Relaxed);
             let key = format!("k{i}");
-            let (off, len) = bucket.append_data(&data_1kb).unwrap();
-            bucket.put_meta(&key, &make_meta(off, len)).unwrap();
+            let (seg, off, len) = bucket.append_data(&data_1kb).unwrap();
+            bucket.put_meta(&key, &make_meta(seg, off, len)).unwrap();
         });
     });
 
@@ -62,8 +63,8 @@ fn bench_put(c: &mut Criterion) {
         b.iter(|| {
             let i = counter.fetch_add(1, Ordering::Relaxed);
             let key = format!("k{i}");
-            let (off, len) = bucket.append_data(&data_1mb).unwrap();
-            bucket.put_meta(&key, &make_meta(off, len)).unwrap();
+            let (seg, off, len) = bucket.append_data(&data_1mb).unwrap();
+            bucket.put_meta(&key, &make_meta(seg, off, len)).unwrap();
         });
     });
 }
@@ -87,7 +88,7 @@ fn bench_get(c: &mut Criterion) {
                 let key = &keys[idx % keys.len()];
                 idx = idx.wrapping_add(7919); // prime stride for pseudo-random
                 let meta = bucket.get_meta(key).unwrap().unwrap();
-                bucket.read_data(meta.offset, meta.length).unwrap();
+                bucket.read_data(meta.segment_id, meta.offset, meta.length).unwrap();
             });
         });
     }
@@ -162,7 +163,7 @@ fn bench_concurrent(c: &mut Criterion) {
                         for i in 0..25 {
                             let key = format!("key{:06}", (t * 25 + i) % 100);
                             let meta = bucket.get_meta(&key).unwrap().unwrap();
-                            bucket.read_data(meta.offset, meta.length).unwrap();
+                            bucket.read_data(meta.segment_id, meta.offset, meta.length).unwrap();
                         }
                     });
                 }
@@ -185,8 +186,8 @@ fn bench_concurrent(c: &mut Criterion) {
                         s.spawn(move || {
                             for i in 0..25 {
                                 let key = format!("t{t}k{i}");
-                                let (off, len) = bucket.append_data(data).unwrap();
-                                bucket.put_meta(&key, &make_meta(off, len)).unwrap();
+                                let (seg, off, len) = bucket.append_data(data).unwrap();
+                                bucket.put_meta(&key, &make_meta(seg, off, len)).unwrap();
                             }
                         });
                     }
@@ -216,7 +217,7 @@ fn bench_concurrent(c: &mut Criterion) {
                             for i in 0..25 {
                                 let key = format!("key{:06}", (t * 25 + i) % 50);
                                 let meta = bucket.get_meta(&key).unwrap().unwrap();
-                                bucket.read_data(meta.offset, meta.length).unwrap();
+                                bucket.read_data(meta.segment_id, meta.offset, meta.length).unwrap();
                             }
                         });
                     }
@@ -227,8 +228,8 @@ fn bench_concurrent(c: &mut Criterion) {
                         s.spawn(move || {
                             for i in 0..25 {
                                 let key = format!("new_t{t}k{i}");
-                                let (off, len) = bucket.append_data(data).unwrap();
-                                bucket.put_meta(&key, &make_meta(off, len)).unwrap();
+                                let (seg, off, len) = bucket.append_data(data).unwrap();
+                                bucket.put_meta(&key, &make_meta(seg, off, len)).unwrap();
                             }
                         });
                     }

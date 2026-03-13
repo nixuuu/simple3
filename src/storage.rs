@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use md5::{Digest, Md5};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::types::ObjectMeta;
@@ -14,7 +15,10 @@ use crate::types::ObjectMeta;
 /// Result of listing objects: (objects, `common_prefixes`, truncated).
 pub type ListResult = (Vec<(String, ObjectMeta)>, Vec<String>, bool);
 
-const STORAGE_VERSION_KEY: &[u8] = b"__storage_version__";
+const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
+const SEG_DEAD: TableDefinition<u32, u64> = TableDefinition::new("seg_dead");
+const SEG_COMPACTING: TableDefinition<u32, u8> = TableDefinition::new("seg_compacting");
+
 const COPY_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 const DEFAULT_MAX_SEGMENT_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
 
@@ -39,15 +43,7 @@ fn segment_filename(id: u32) -> String {
     format!("seg_{id:06}.bin")
 }
 
-fn seg_dead_key(id: u32) -> Vec<u8> {
-    format!("__seg_dead_{id:06}__").into_bytes()
-}
-
-fn seg_compacting_key(id: u32) -> Vec<u8> {
-    format!("__compacting_{id:06}__").into_bytes()
-}
-
-/// V1 format (without `segment_id`) for migration.
+/// V1 format (without `segment_id`) for sled→redb migration.
 #[derive(Serialize, Deserialize)]
 struct ObjectMetaV1 {
     offset: u64,
@@ -100,75 +96,120 @@ fn discover_segments(bucket_dir: &Path) -> io::Result<Vec<u32>> {
     Ok(ids)
 }
 
-/// Migrate v1 (single data.bin) to v2 (segments). Idempotent.
-fn migrate_v1_to_v2(
-    bucket_dir: &Path,
-    objects: &sled::Tree,
-    meta: &sled::Tree,
-) -> io::Result<()> {
-    let data_bin = bucket_dir.join("data.bin");
-    if data_bin.exists() {
-        fs::rename(&data_bin, bucket_dir.join(segment_filename(0)))?;
+/// Migrate from sled (v1 or v2) to redb. Idempotent — only runs if
+/// `index.db/` exists and `index.redb` does not.
+fn migrate_sled_to_redb(bucket_dir: &Path) -> io::Result<()> {
+    let sled_path = bucket_dir.join("index.db");
+    let redb_path = bucket_dir.join("index.redb");
+
+    if !sled_path.exists() || redb_path.exists() {
+        return Ok(());
     }
 
-    // Re-serialize all objects with segment_id = 0.
-    // Uses serialize-back check to skip entries already in v2 format.
-    let mut batch = sled::Batch::default();
-    let mut has_updates = false;
+    let sled_db = sled::open(&sled_path).map_err(io::Error::other)?;
+    let sled_objects = sled_db.open_tree("objects").map_err(io::Error::other)?;
+    let sled_meta = sled_db.open_tree("meta").map_err(io::Error::other)?;
 
-    for result in objects {
-        let (k, v) = result.map_err(io::Error::other)?;
-        if let Ok(v1) = bincode::deserialize::<ObjectMetaV1>(&v) {
-            let v1_bytes = bincode::serialize(&v1).map_err(io::Error::other)?;
-            if v1_bytes == v.as_ref() {
-                let v2 = ObjectMeta {
-                    segment_id: 0,
-                    offset: v1.offset,
-                    length: v1.length,
-                    content_type: v1.content_type,
-                    etag: v1.etag,
-                    last_modified: v1.last_modified,
-                    user_metadata: v1.user_metadata,
-                };
-                batch.insert(k, bincode::serialize(&v2).map_err(io::Error::other)?);
-                has_updates = true;
+    let is_v1 = sled_meta
+        .get(b"__storage_version__")
+        .map_err(io::Error::other)?
+        .is_none();
+
+    // v1: rename data.bin → seg_000000.bin
+    if is_v1 {
+        let data_bin = bucket_dir.join("data.bin");
+        if data_bin.exists() {
+            fs::rename(&data_bin, bucket_dir.join(segment_filename(0)))?;
+        }
+    }
+
+    let rdb = Database::create(&redb_path).map_err(io::Error::other)?;
+    let txn = rdb.begin_write().map_err(io::Error::other)?;
+
+    {
+        let mut objects_table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+
+        for result in &sled_objects {
+            let (k, v) = result.map_err(io::Error::other)?;
+            let key_str = std::str::from_utf8(&k)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            if is_v1
+                && let Ok(v1) = bincode::deserialize::<ObjectMetaV1>(&v)
+            {
+                let v1_bytes = bincode::serialize(&v1).map_err(io::Error::other)?;
+                if v1_bytes == v.as_ref() {
+                    let v2 = ObjectMeta {
+                        segment_id: 0,
+                        offset: v1.offset,
+                        length: v1.length,
+                        content_type: v1.content_type,
+                        etag: v1.etag,
+                        last_modified: v1.last_modified,
+                        user_metadata: v1.user_metadata,
+                    };
+                    let bytes = bincode::serialize(&v2).map_err(io::Error::other)?;
+                    objects_table
+                        .insert(key_str, bytes.as_slice())
+                        .map_err(io::Error::other)?;
+                    continue;
+                }
+            }
+            // v2 format, unrecognized v1, or non-v1 — copy as-is
+            objects_table
+                .insert(key_str, v.as_ref())
+                .map_err(io::Error::other)?;
+        }
+    }
+
+    {
+        let mut dead_table = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
+
+        if is_v1 {
+            if let Some(v) = sled_meta.get(b"__dead_bytes__").map_err(io::Error::other)?
+                && let Ok(bytes) = <[u8; 8]>::try_from(v.as_ref())
+            {
+                dead_table
+                    .insert(0u32, u64::from_le_bytes(bytes))
+                    .map_err(io::Error::other)?;
+            }
+        } else {
+            for result in sled_meta.scan_prefix(b"__seg_dead_") {
+                let (k, v) = result.map_err(io::Error::other)?;
+                let key_str = std::str::from_utf8(&k).unwrap_or("");
+                if let Some(id_str) = key_str
+                    .strip_prefix("__seg_dead_")
+                    .and_then(|s| s.strip_suffix("__"))
+                    && let (Ok(seg_id), Ok(bytes)) =
+                        (id_str.parse::<u32>(), <[u8; 8]>::try_from(v.as_ref()))
+                {
+                    dead_table
+                        .insert(seg_id, u64::from_le_bytes(bytes))
+                        .map_err(io::Error::other)?;
+                }
             }
         }
     }
-    if has_updates {
-        objects.apply_batch(batch).map_err(io::Error::other)?;
-    }
 
-    // Migrate global dead_bytes → segment 0
-    if let Some(v) = meta.get(b"__dead_bytes__").map_err(io::Error::other)? {
-        meta.insert(seg_dead_key(0), v.as_ref())
-            .map_err(io::Error::other)?;
-        meta.remove(b"__dead_bytes__").map_err(io::Error::other)?;
-    }
-
-    // Migrate old compaction flag → segment 0
-    if meta
-        .get(b"__compacting__")
-        .map_err(io::Error::other)?
-        .is_some_and(|v| !v.is_empty() && v[0] == 1)
+    // Create SEG_COMPACTING table (migration assumes clean shutdown — no active compactions)
     {
-        meta.insert(seg_compacting_key(0), &[1u8])
-            .map_err(io::Error::other)?;
+        let _ = txn.open_table(SEG_COMPACTING).map_err(io::Error::other)?;
     }
-    meta.remove(b"__compacting__").map_err(io::Error::other)?;
 
-    meta.insert(STORAGE_VERSION_KEY, b"2")
-        .map_err(io::Error::other)?;
+    txn.commit().map_err(io::Error::other)?;
+    drop(rdb);
+    drop(sled_objects);
+    drop(sled_meta);
+    drop(sled_db);
+
+    fs::rename(&sled_path, bucket_dir.join("index.db.bak"))?;
     Ok(())
 }
 
 // === BucketStore ===
 
 pub struct BucketStore {
-    #[allow(dead_code)]
-    db: sled::Db,
-    objects: sled::Tree,
-    meta: sled::Tree,
+    db: Database,
     /// Serializes appends and rotation on the active segment.
     writer: Mutex<ActiveWriter>,
     /// Per-segment read handles.
@@ -184,10 +225,6 @@ impl BucketStore {
     fn open(bucket_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(bucket_dir)?;
 
-        let db = sled::open(bucket_dir.join("index.db")).map_err(io::Error::other)?;
-        let objects = db.open_tree("objects").map_err(io::Error::other)?;
-        let meta = db.open_tree("meta").map_err(io::Error::other)?;
-
         // GC: remove leftover temp files
         for entry in fs::read_dir(bucket_dir)? {
             let p = entry?.path();
@@ -201,9 +238,20 @@ impl BucketStore {
             }
         }
 
-        // Migrate from v1 (single data.bin) to v2 (segments) if needed
-        if meta.get(STORAGE_VERSION_KEY).map_err(io::Error::other)?.is_none() {
-            migrate_v1_to_v2(bucket_dir, &objects, &meta)?;
+        // Migrate from sled to redb if needed
+        migrate_sled_to_redb(bucket_dir)?;
+
+        // Open redb
+        let redb_path = bucket_dir.join("index.redb");
+        let db = Database::create(&redb_path).map_err(io::Error::other)?;
+
+        // Ensure tables exist
+        {
+            let txn = db.begin_write().map_err(io::Error::other)?;
+            let _ = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+            let _ = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
+            let _ = txn.open_table(SEG_COMPACTING).map_err(io::Error::other)?;
+            txn.commit().map_err(io::Error::other)?;
         }
 
         // Discover existing segments
@@ -233,8 +281,6 @@ impl BucketStore {
 
         let store = Self {
             db,
-            objects,
-            meta,
             writer: Mutex::new(ActiveWriter {
                 id: active_id,
                 file: active_file,
@@ -297,12 +343,17 @@ impl BucketStore {
         if seg_path.exists() {
             fs::remove_file(&seg_path)?;
         }
-        self.meta
-            .remove(seg_dead_key(segment_id))
-            .map_err(io::Error::other)?;
-        self.meta
-            .remove(seg_compacting_key(segment_id))
-            .map_err(io::Error::other)?;
+
+        let txn = self.db.begin_write().map_err(io::Error::other)?;
+        {
+            let mut t = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
+            t.remove(segment_id).map_err(io::Error::other)?;
+        }
+        {
+            let mut t = txn.open_table(SEG_COMPACTING).map_err(io::Error::other)?;
+            t.remove(segment_id).map_err(io::Error::other)?;
+        }
+        txn.commit().map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -316,13 +367,18 @@ impl BucketStore {
         let active_id = w.id;
 
         let mut max_end: u64 = 0;
-        for result in &self.objects {
-            let (_k, v) = result.map_err(io::Error::other)?;
-            let obj: ObjectMeta = bincode::deserialize(&v).map_err(io::Error::other)?;
-            if obj.segment_id == active_id {
-                let end = obj.offset + obj.length;
-                if end > max_end {
-                    max_end = end;
+        {
+            let txn = self.db.begin_read().map_err(io::Error::other)?;
+            let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+            for result in table.iter().map_err(io::Error::other)? {
+                let (_k, v) = result.map_err(io::Error::other)?;
+                let obj: ObjectMeta =
+                    bincode::deserialize(v.value()).map_err(io::Error::other)?;
+                if obj.segment_id == active_id {
+                    let end = obj.offset + obj.length;
+                    if end > max_end {
+                        max_end = end;
+                    }
                 }
             }
         }
@@ -339,13 +395,16 @@ impl BucketStore {
     fn collect_live_objects_for_segment(
         &self,
         segment_id: u32,
-    ) -> io::Result<Vec<(Vec<u8>, ObjectMeta)>> {
+    ) -> io::Result<Vec<(String, ObjectMeta)>> {
         let mut live = Vec::new();
-        for result in &self.objects {
+        let txn = self.db.begin_read().map_err(io::Error::other)?;
+        let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+        for result in table.iter().map_err(io::Error::other)? {
             let (k, v) = result.map_err(io::Error::other)?;
-            let obj: ObjectMeta = bincode::deserialize(&v).map_err(io::Error::other)?;
+            let obj: ObjectMeta =
+                bincode::deserialize(v.value()).map_err(io::Error::other)?;
             if obj.segment_id == segment_id {
-                live.push((k.to_vec(), obj));
+                live.push((k.value().to_owned(), obj));
             }
         }
         live.sort_by_key(|(_, m)| m.offset);
@@ -363,70 +422,86 @@ impl BucketStore {
             .max()
             .unwrap_or(0);
 
-        // If file matches compacted size (rename happened, sled has old offsets), fix offsets
+        let txn = self.db.begin_write().map_err(io::Error::other)?;
+
+        // If file matches compacted size (rename happened, redb has old offsets), fix offsets
         if current_size == compacted_size && current_size != original_end && !live.is_empty() {
-            let mut batch = sled::Batch::default();
+            let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
             let mut new_offset: u64 = 0;
             for (key, mut obj) in live {
                 obj.offset = new_offset;
                 new_offset += obj.length;
-                batch.insert(key, bincode::serialize(&obj).map_err(io::Error::other)?);
+                let bytes = bincode::serialize(&obj).map_err(io::Error::other)?;
+                table
+                    .insert(key.as_str(), bytes.as_slice())
+                    .map_err(io::Error::other)?;
             }
-            self.objects
-                .apply_batch(batch)
-                .map_err(io::Error::other)?;
         }
 
-        self.set_seg_dead_bytes(segment_id, 0)?;
-        self.set_seg_compacting(segment_id, false)?;
+        {
+            let mut t = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
+            t.insert(segment_id, 0u64).map_err(io::Error::other)?;
+        }
+        {
+            let mut t = txn.open_table(SEG_COMPACTING).map_err(io::Error::other)?;
+            t.insert(segment_id, 0u8).map_err(io::Error::other)?;
+        }
+
+        txn.commit().map_err(io::Error::other)?;
         Ok(())
     }
 
     // === Per-segment dead bytes tracking ===
 
     fn seg_dead_bytes(&self, segment_id: u32) -> u64 {
-        self.meta
-            .get(seg_dead_key(segment_id))
+        let Ok(txn) = self.db.begin_read() else {
+            return 0;
+        };
+        let Ok(table) = txn.open_table(SEG_DEAD) else {
+            return 0;
+        };
+        table
+            .get(segment_id)
             .ok()
             .flatten()
-            .and_then(|v| v.as_ref().try_into().ok())
-            .map_or(0, u64::from_le_bytes)
+            .map_or(0, |g| g.value())
     }
 
-    fn set_seg_dead_bytes(&self, segment_id: u32, n: u64) -> io::Result<()> {
-        self.meta
-            .insert(seg_dead_key(segment_id), &n.to_le_bytes())
-            .map_err(io::Error::other)?;
-        Ok(())
-    }
-
-    fn add_seg_dead_bytes(&self, segment_id: u32, n: u64) -> io::Result<()> {
-        let current = self.seg_dead_bytes(segment_id);
-        self.set_seg_dead_bytes(segment_id, current + n)
-    }
 
     fn get_seg_compacting(&self, segment_id: u32) -> bool {
-        self.meta
-            .get(seg_compacting_key(segment_id))
+        let Ok(txn) = self.db.begin_read() else {
+            return false;
+        };
+        let Ok(table) = txn.open_table(SEG_COMPACTING) else {
+            return false;
+        };
+        table
+            .get(segment_id)
             .ok()
             .flatten()
-            .is_some_and(|v| !v.is_empty() && v[0] == 1)
+            .is_some_and(|g| g.value() == 1)
     }
 
     fn set_seg_compacting(&self, segment_id: u32, val: bool) -> io::Result<()> {
-        self.meta
-            .insert(seg_compacting_key(segment_id), &[u8::from(val)])
-            .map_err(io::Error::other)?;
+        let txn = self.db.begin_write().map_err(io::Error::other)?;
+        {
+            let mut t = txn.open_table(SEG_COMPACTING).map_err(io::Error::other)?;
+            t.insert(segment_id, u8::from(val)).map_err(io::Error::other)?;
+        }
+        txn.commit().map_err(io::Error::other)?;
         Ok(())
     }
 
     /// Total dead bytes across all segments.
     pub fn dead_bytes(&self) -> u64 {
-        self.meta
-            .scan_prefix(b"__seg_dead_")
-            .filter_map(Result::ok)
-            .filter_map(|(_k, v)| v.as_ref().try_into().ok().map(u64::from_le_bytes))
-            .sum()
+        let Ok(txn) = self.db.begin_read() else {
+            return 0;
+        };
+        let Ok(table) = txn.open_table(SEG_DEAD) else {
+            return 0;
+        };
+        let Ok(iter) = table.iter() else { return 0 };
+        iter.filter_map(Result::ok).map(|(_, v)| v.value()).sum()
     }
 
     /// Total size across all segments.
@@ -519,26 +594,48 @@ impl BucketStore {
     }
 
     pub fn put_meta(&self, key: &str, meta: &ObjectMeta) -> io::Result<()> {
-        let v = bincode::serialize(meta).map_err(io::Error::other)?;
-        self.objects
-            .insert(key.as_bytes(), v)
-            .map_err(io::Error::other)?;
-        Ok(())
+        self.commit_put(key, meta, None)
     }
 
     pub fn get_meta(&self, key: &str) -> io::Result<Option<ObjectMeta>> {
-        match self
-            .objects
-            .get(key.as_bytes())
-            .map_err(io::Error::other)?
-        {
+        let txn = self.db.begin_read().map_err(io::Error::other)?;
+        let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+        match table.get(key).map_err(io::Error::other)? {
             Some(v) => {
                 let meta: ObjectMeta =
-                    bincode::deserialize(&v).map_err(io::Error::other)?;
+                    bincode::deserialize(v.value()).map_err(io::Error::other)?;
                 Ok(Some(meta))
             }
             None => Ok(None),
         }
+    }
+
+    /// Atomically insert/update an object and optionally track dead bytes from the old version.
+    fn commit_put(
+        &self,
+        key: &str,
+        meta: &ObjectMeta,
+        old_meta: Option<&ObjectMeta>,
+    ) -> io::Result<()> {
+        let v = bincode::serialize(meta).map_err(io::Error::other)?;
+        let txn = self.db.begin_write().map_err(io::Error::other)?;
+        {
+            let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+            table
+                .insert(key, v.as_slice())
+                .map_err(io::Error::other)?;
+        }
+        if let Some(old) = old_meta {
+            let mut dead = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
+            let current = dead
+                .get(old.segment_id)
+                .map_err(io::Error::other)?
+                .map_or(0, |g| g.value());
+            dead.insert(old.segment_id, current + old.length)
+                .map_err(io::Error::other)?;
+        }
+        txn.commit().map_err(io::Error::other)?;
+        Ok(())
     }
 
     pub fn bucket_dir(&self) -> &Path {
@@ -586,7 +683,7 @@ impl BucketStore {
             user_metadata,
         };
 
-        if let Err(e) = self.put_meta(key, &meta) {
+        if let Err(e) = self.commit_put(key, &meta, old_meta.as_ref()) {
             w.file.set_len(offset).ok();
             w.size = offset;
             fs::remove_file(tmp_path).ok();
@@ -595,11 +692,6 @@ impl BucketStore {
 
         drop(w);
         fs::remove_file(tmp_path).ok();
-
-        if let Some(old) = old_meta {
-            self.add_seg_dead_bytes(old.segment_id, old.length)?;
-        }
-
         Ok(meta)
     }
 
@@ -712,7 +804,7 @@ impl BucketStore {
             user_metadata,
         };
 
-        if let Err(e) = self.put_meta(key, &meta) {
+        if let Err(e) = self.commit_put(key, &meta, old_meta.as_ref()) {
             w.file.set_len(offset).ok();
             w.size = offset;
             return Err(e);
@@ -721,10 +813,6 @@ impl BucketStore {
 
         for (part_num, _) in &sorted_parts {
             fs::remove_file(self.part_path(upload_id, *part_num)).ok();
-        }
-
-        if let Some(old) = old_meta {
-            self.add_seg_dead_bytes(old.segment_id, old.length)?;
         }
 
         Ok((meta, etag))
@@ -747,15 +835,29 @@ impl BucketStore {
     // === Delete ===
 
     pub fn delete_object(&self, key: &str) -> io::Result<Option<ObjectMeta>> {
-        let k = key.as_bytes();
+        let txn = self.db.begin_write().map_err(io::Error::other)?;
 
-        let meta = match self.objects.get(k).map_err(io::Error::other)? {
-            Some(v) => bincode::deserialize::<ObjectMeta>(&v).map_err(io::Error::other)?,
-            None => return Ok(None),
+        let meta = {
+            let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+            match table.remove(key).map_err(io::Error::other)? {
+                Some(v) => {
+                    bincode::deserialize::<ObjectMeta>(v.value()).map_err(io::Error::other)?
+                }
+                None => return Ok(None),
+            }
         };
 
-        self.objects.remove(k).map_err(io::Error::other)?;
-        self.add_seg_dead_bytes(meta.segment_id, meta.length)?;
+        {
+            let mut dead = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
+            let current = dead
+                .get(meta.segment_id)
+                .map_err(io::Error::other)?
+                .map_or(0, |g| g.value());
+            dead.insert(meta.segment_id, current + meta.length)
+                .map_err(io::Error::other)?;
+        }
+
+        txn.commit().map_err(io::Error::other)?;
         Ok(Some(meta))
     }
 
@@ -777,18 +879,18 @@ impl BucketStore {
         Ok(())
     }
 
-    /// Swap a compacted segment file and update sled metadata atomically.
+    /// Swap a compacted segment file and update redb metadata atomically.
     ///
-    /// The per-segment write lock MUST be held across both the file swap and the sled
-    /// batch apply. Dropping it between would let readers see the new (compacted) file
-    /// with old (pre-compaction) offsets — corrupted reads.
+    /// The per-segment write lock MUST be held across both the file swap and the redb
+    /// transaction commit. Dropping it between would let readers see the new (compacted)
+    /// file with old (pre-compaction) offsets — corrupted reads.
     #[allow(clippy::significant_drop_tightening)]
     fn apply_compaction(
         &self,
         seg: &RwLock<File>,
         tmp_path: &Path,
         seg_path: &Path,
-        batch: sled::Batch,
+        updates: &[(String, ObjectMeta)],
         segment_id: u32,
     ) -> io::Result<()> {
         let mut file = seg
@@ -797,11 +899,25 @@ impl BucketStore {
         fs::rename(tmp_path, seg_path)?;
         *file = File::open(seg_path)?;
 
-        self.objects
-            .apply_batch(batch)
-            .map_err(io::Error::other)?;
-        self.set_seg_dead_bytes(segment_id, 0)?;
-        self.set_seg_compacting(segment_id, false)?;
+        let txn = self.db.begin_write().map_err(io::Error::other)?;
+        {
+            let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+            for (key, obj) in updates {
+                let v = bincode::serialize(obj).map_err(io::Error::other)?;
+                table
+                    .insert(key.as_str(), v.as_slice())
+                    .map_err(io::Error::other)?;
+            }
+        }
+        {
+            let mut t = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
+            t.insert(segment_id, 0u64).map_err(io::Error::other)?;
+        }
+        {
+            let mut t = txn.open_table(SEG_COMPACTING).map_err(io::Error::other)?;
+            t.insert(segment_id, 0u8).map_err(io::Error::other)?;
+        }
+        txn.commit().map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -873,21 +989,14 @@ impl BucketStore {
             entries
         };
 
-        // Build sled batch outside the read lock (serialization doesn't need segment access)
-        let mut batch = sled::Batch::default();
-        for (key, obj) in updated {
-            batch.insert(key, bincode::serialize(&obj).map_err(io::Error::other)?);
-        }
-
         tmp.flush()?;
         tmp.sync_all()?;
         drop(tmp);
 
         self.set_seg_compacting(segment_id, true)?;
-        self.meta.flush().map_err(io::Error::other)?;
 
-        // Phase 2: Swap file + update sled under per-segment write lock
-        self.apply_compaction(&seg_arc, &tmp_path, &seg_path, batch, segment_id)
+        // Phase 2: Swap file + update redb under per-segment write lock
+        self.apply_compaction(&seg_arc, &tmp_path, &seg_path, &updated, segment_id)
     }
 
     // === List objects ===
@@ -912,26 +1021,33 @@ impl BucketStore {
     ) -> io::Result<ListResult> {
         use std::collections::BTreeSet;
 
-        let iter: Box<dyn Iterator<Item = sled::Result<(sled::IVec, sled::IVec)>>> =
-            prefix.map_or_else(
-                || Box::new(self.objects.iter()) as Box<dyn Iterator<Item = _>>,
-                |p| Box::new(self.objects.scan_prefix(p.as_bytes())),
-            );
+        let txn = self.db.begin_read().map_err(io::Error::other)?;
+        let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+
+        let prefix_str = prefix.unwrap_or("");
+        let prefix_len = prefix_str.len();
+
+        let iter = if prefix_str.is_empty() {
+            table.iter().map_err(io::Error::other)?
+        } else {
+            table.range(prefix_str..).map_err(io::Error::other)?
+        };
 
         let mut results = Vec::new();
         let mut common_prefixes: BTreeSet<String> = BTreeSet::new();
         let mut truncated = false;
-        let prefix_str = prefix.unwrap_or("");
-        let prefix_len = prefix_str.len();
 
         for result in iter {
             let (k, v) = result.map_err(io::Error::other)?;
-            let obj_key = std::str::from_utf8(&k)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                .to_string();
+            let obj_key = k.value();
+
+            // Stop when we've passed the prefix
+            if !prefix_str.is_empty() && !obj_key.starts_with(prefix_str) {
+                break;
+            }
 
             if let Some(token) = continuation_token
-                && obj_key.as_str() <= token
+                && obj_key <= token
             {
                 continue;
             }
@@ -960,15 +1076,17 @@ impl BucketStore {
             }
 
             let meta: ObjectMeta =
-                bincode::deserialize(&v).map_err(io::Error::other)?;
-            results.push((obj_key, meta));
+                bincode::deserialize(v.value()).map_err(io::Error::other)?;
+            results.push((obj_key.to_owned(), meta));
         }
 
         Ok((results, common_prefixes.into_iter().collect(), truncated))
     }
 
     pub fn is_empty(&self) -> io::Result<bool> {
-        Ok(self.objects.is_empty())
+        let txn = self.db.begin_read().map_err(io::Error::other)?;
+        let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+        table.is_empty().map_err(io::Error::other)
     }
 }
 

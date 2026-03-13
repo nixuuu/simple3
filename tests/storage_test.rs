@@ -912,6 +912,11 @@ fn test_v1_migration() {
     assert!(!bucket_dir.join("data.bin").exists());
     assert!(bucket_dir.join("seg_000000.bin").exists());
 
+    // sled dir backed up, redb file created
+    assert!(bucket_dir.join("index.redb").exists());
+    assert!(bucket_dir.join("index.db.bak").exists());
+    assert!(!bucket_dir.join("index.db").exists());
+
     // Objects readable with segment_id = 0
     let meta_a = bucket.get_meta("a").unwrap().unwrap();
     assert_eq!(meta_a.segment_id, 0);
