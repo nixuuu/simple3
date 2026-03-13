@@ -7,7 +7,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
 use md5::{Digest, Md5};
-use s3s::dto::{CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput, ListBucketsInput, ListBucketsOutput, Bucket, Timestamp, PutObjectInput, PutObjectOutput, ETag, GetObjectInput, GetObjectOutput, StreamingBlob, HeadObjectInput, HeadObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, CreateMultipartUploadInput, CreateMultipartUploadOutput, UploadPartInput, UploadPartOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, AbortMultipartUploadInput, AbortMultipartUploadOutput};
+use s3s::dto::{
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+    DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
+    DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetObjectInput,
+    GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput,
+    StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
+};
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::storage::{BucketStore, Storage};
