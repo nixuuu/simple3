@@ -118,7 +118,7 @@ pub struct BucketStore {
 
 #[allow(clippy::missing_errors_doc)]
 impl BucketStore {
-    fn open(bucket_dir: &Path) -> io::Result<Self> {
+    fn open(bucket_dir: &Path, max_segment_size: u64) -> io::Result<Self> {
         fs::create_dir_all(bucket_dir)?;
         cleanup_temp_files(bucket_dir)?;
         migration::migrate_sled_to_redb(bucket_dir)?;
@@ -167,7 +167,7 @@ impl BucketStore {
             }),
             segments: RwLock::new(seg_map),
             bucket_dir: bucket_dir.to_path_buf(),
-            max_segment_size: DEFAULT_MAX_SEGMENT_SIZE,
+            max_segment_size,
         };
 
         // Recovery: check per-segment compaction flags
@@ -652,11 +652,16 @@ impl BucketStore {
 pub struct Storage {
     data_dir: PathBuf,
     buckets: RwLock<HashMap<String, Arc<BucketStore>>>,
+    max_segment_size: u64,
 }
 
 #[allow(clippy::missing_errors_doc)]
 impl Storage {
     pub fn open(data_dir: &Path) -> io::Result<Self> {
+        Self::open_with_segment_size(data_dir, DEFAULT_MAX_SEGMENT_SIZE)
+    }
+
+    pub fn open_with_segment_size(data_dir: &Path, max_segment_size: u64) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
 
         let mut map = HashMap::new();
@@ -672,7 +677,7 @@ impl Storage {
                             io::Error::new(io::ErrorKind::InvalidData, "invalid bucket dir name")
                         })?
                         .to_string();
-                    let store = BucketStore::open(&entry.path())?;
+                    let store = BucketStore::open(&entry.path(), max_segment_size)?;
                     map.insert(name, Arc::new(store));
                 }
             }
@@ -681,6 +686,7 @@ impl Storage {
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             buckets: RwLock::new(map),
+            max_segment_size,
         })
     }
 
@@ -702,7 +708,7 @@ impl Storage {
             return Ok(true);
         }
         let bucket_dir = self.data_dir.join(name);
-        let store = BucketStore::open(&bucket_dir)?;
+        let store = BucketStore::open(&bucket_dir, self.max_segment_size)?;
         map.insert(name.to_string(), Arc::new(store));
         drop(map);
         Ok(false)

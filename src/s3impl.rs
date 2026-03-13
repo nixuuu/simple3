@@ -189,21 +189,46 @@ impl S3 for SimpleStorage {
         let store = self.bucket(&input.bucket)?;
 
         let key = input.key;
-        let (meta, data) = blocking(move || {
-            let meta = store.get_meta(&key)?
+        let range = input.range;
+
+        let (meta, data, content_range) = blocking(move || {
+            let meta = store
+                .get_meta(&key)?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NoSuchKey"))?;
-            let data = store.read_data(meta.segment_id, meta.offset, meta.length)?;
-            Ok((meta, data))
+
+            if let Some(ref range) = range {
+                let byte_range = range
+                    .check(meta.length)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "InvalidRange"))?;
+                let range_offset = meta.offset + byte_range.start;
+                let range_len = byte_range.end - byte_range.start;
+                let data = store.read_data(meta.segment_id, range_offset, range_len)?;
+                let cr = format!(
+                    "bytes {}-{}/{}",
+                    byte_range.start,
+                    byte_range.end - 1,
+                    meta.length
+                );
+                Ok((meta, data, Some(cr)))
+            } else {
+                let data = store.read_data(meta.segment_id, meta.offset, meta.length)?;
+                Ok((meta, data, None))
+            }
         })
         .await
         .map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 return s3_error!(NoSuchKey);
             }
+            if e.kind() == io::ErrorKind::InvalidInput {
+                return s3_error!(InvalidRange);
+            }
             tracing::error!("get_object: {e}");
             s3_error!(e, InternalError)
         })?;
 
+        #[allow(clippy::cast_possible_wrap)]
+        let content_length = data.len() as i64;
         let stream =
             futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from(data)) });
         let body = StreamingBlob::wrap(stream);
@@ -218,7 +243,8 @@ impl S3 for SimpleStorage {
 
         let output = GetObjectOutput {
             body: Some(body),
-            content_length: Some(meta.length.cast_signed()),
+            content_length: Some(content_length),
+            content_range,
             content_type: meta.content_type,
             e_tag: Some(ETag::Strong(meta.etag)),
             last_modified: Some(last_modified),

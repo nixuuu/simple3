@@ -1612,6 +1612,7 @@ dependencies = [
  "redb",
  "s3s",
  "serde",
+ "serde_json",
  "sled",
  "tempfile",
  "tikv-jemallocator",
