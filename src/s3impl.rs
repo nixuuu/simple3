@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,17 @@ use crate::storage::{BucketStore, Storage};
 
 /// Monotonic counter for unique temp file names across concurrent requests.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Run a blocking closure on the tokio blocking thread pool.
+async fn blocking<F, T>(f: F) -> Result<T, io::Error>
+where
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| io::Error::other(format!("task panicked: {e}")))?
+}
 
 pub struct SimpleStorage {
     inner: Arc<Storage>,
@@ -56,11 +67,11 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        let bucket = &req.input.bucket;
-        let existed = self
-            .inner
-            .create_bucket(bucket)
-            .map_err(|e| { tracing::error!("create_bucket({bucket}): {e}"); s3_error!(e, InternalError) })?;
+        let bucket = req.input.bucket;
+        let storage = Arc::clone(&self.inner);
+        let existed = blocking(move || storage.create_bucket(&bucket))
+            .await
+            .map_err(|e| { tracing::error!("create_bucket: {e}"); s3_error!(e, InternalError) })?;
         if existed {
             return Err(s3_error!(BucketAlreadyOwnedByYou));
         }
@@ -71,17 +82,26 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let bucket = &req.input.bucket;
-        let store = self.bucket(bucket)?;
+        let bucket = req.input.bucket;
+        let store = self.bucket(&bucket)?;
+        let storage = Arc::clone(&self.inner);
 
-        if !store.is_empty().map_err(|e| { tracing::error!("delete_bucket({bucket}): is_empty check: {e}"); s3_error!(e, InternalError) })? {
-            return Err(s3_error!(BucketNotEmpty));
-        }
-        drop(store);
-
-        self.inner
-            .delete_bucket(bucket)
-            .map_err(|e| { tracing::error!("delete_bucket({bucket}): {e}"); s3_error!(e, InternalError) })?;
+        blocking(move || {
+            if !store.is_empty()? {
+                return Err(io::Error::other("BucketNotEmpty"));
+            }
+            drop(store);
+            storage.delete_bucket(&bucket)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            if e.to_string() == "BucketNotEmpty" {
+                return s3_error!(BucketNotEmpty);
+            }
+            tracing::error!("delete_bucket: {e}");
+            s3_error!(e, InternalError)
+        })?;
 
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }
@@ -90,9 +110,9 @@ impl S3 for SimpleStorage {
         &self,
         _req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        let names = self
-            .inner
-            .list_buckets()
+        let storage = Arc::clone(&self.inner);
+        let names = blocking(move || storage.list_buckets())
+            .await
             .map_err(|e| { tracing::error!("list_buckets: {e}"); s3_error!(e, InternalError) })?;
         let buckets: Vec<Bucket> = names
             .into_iter()
@@ -134,16 +154,16 @@ impl S3 for SimpleStorage {
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
-        store
-            .put_object_streamed(
-                &input.key,
-                &tmp_path,
-                input.content_type,
-                etag_hex.clone(),
-                now,
-                input.metadata.unwrap_or_default(),
-            )
-            .map_err(|e| { tracing::error!("put_object({}): {e}", input.key); s3_error!(e, InternalError) })?;
+        let key = input.key;
+        let content_type = input.content_type;
+        let etag_clone = etag_hex.clone();
+        let metadata = input.metadata.unwrap_or_default();
+        blocking(move || {
+            store.put_object_streamed(&key, &tmp_path, content_type, etag_clone, now, metadata)
+                .map(|_| ())
+        })
+        .await
+        .map_err(|e| { tracing::error!("put_object: {e}"); s3_error!(e, InternalError) })?;
 
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag_hex)),
@@ -159,14 +179,21 @@ impl S3 for SimpleStorage {
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
-        let meta = store
-            .get_meta(&input.key)
-            .map_err(|e| { tracing::error!("get_object({}): metadata: {e}", input.key); s3_error!(e, InternalError) })?
-            .ok_or_else(|| s3_error!(NoSuchKey))?;
-
-        let data = store
-            .read_data(meta.segment_id, meta.offset, meta.length)
-            .map_err(|e| { tracing::error!("get_object({}): read_data: {e}", input.key); s3_error!(e, InternalError) })?;
+        let key = input.key;
+        let (meta, data) = blocking(move || {
+            let meta = store.get_meta(&key)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NoSuchKey"))?;
+            let data = store.read_data(meta.segment_id, meta.offset, meta.length)?;
+            Ok((meta, data))
+        })
+        .await
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                return s3_error!(NoSuchKey);
+            }
+            tracing::error!("get_object: {e}");
+            s3_error!(e, InternalError)
+        })?;
 
         let stream =
             futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from(data)) });
@@ -199,10 +226,19 @@ impl S3 for SimpleStorage {
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
-        let meta = store
-            .get_meta(&input.key)
-            .map_err(|e| { tracing::error!("head_object({}): {e}", input.key); s3_error!(e, InternalError) })?
-            .ok_or_else(|| s3_error!(NoSuchKey))?;
+        let key = input.key;
+        let meta = blocking(move || {
+            store.get_meta(&key)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NoSuchKey"))
+        })
+        .await
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                return s3_error!(NoSuchKey);
+            }
+            tracing::error!("head_object: {e}");
+            s3_error!(e, InternalError)
+        })?;
 
         let last_modified = Timestamp::from(UNIX_EPOCH + Duration::from_secs(meta.last_modified));
 
@@ -230,9 +266,10 @@ impl S3 for SimpleStorage {
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
-        store
-            .delete_object(&input.key)
-            .map_err(|e| { tracing::error!("delete_object({}): {e}", input.key); s3_error!(e, InternalError) })?;
+        let key = input.key;
+        blocking(move || store.delete_object(&key).map(|_| ()))
+            .await
+            .map_err(|e| { tracing::error!("delete_object: {e}"); s3_error!(e, InternalError) })?;
 
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
@@ -246,13 +283,20 @@ impl S3 for SimpleStorage {
 
         #[allow(clippy::cast_sign_loss)] // max(0) guarantees non-negative
         let max_keys = input.max_keys.unwrap_or(1000).max(0) as usize;
-        let prefix = input.prefix.as_deref();
-        let delimiter = input.delimiter.as_deref();
-        let continuation = input.continuation_token.as_deref();
+        let prefix = input.prefix.clone();
+        let delimiter = input.delimiter.clone();
+        let continuation = input.continuation_token.clone();
 
-        let (entries, common_prefixes, truncated) = store
-            .list_objects_with_delimiter(prefix, delimiter, max_keys, continuation)
-            .map_err(|e| { tracing::error!("list_objects_v2({}): {e}", input.bucket); s3_error!(e, InternalError) })?;
+        let (entries, common_prefixes, truncated) = blocking(move || {
+            store.list_objects_with_delimiter(
+                prefix.as_deref(),
+                delimiter.as_deref(),
+                max_keys,
+                continuation.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| { tracing::error!("list_objects_v2({}): {e}", input.bucket); s3_error!(e, InternalError) })?;
 
         let next_token = if truncated {
             entries.last().map(|(k, _)| k.clone())
@@ -343,9 +387,11 @@ impl S3 for SimpleStorage {
             data.extend_from_slice(&chunk);
         }
 
-        let etag = store
-            .upload_part(&input.upload_id, input.part_number, &data)
-            .map_err(|e| { tracing::error!("upload_part({}): {e}", input.upload_id); s3_error!(e, InternalError) })?;
+        let upload_id = input.upload_id;
+        let part_number = input.part_number;
+        let etag = blocking(move || store.upload_part(&upload_id, part_number, &data))
+            .await
+            .map_err(|e| { tracing::error!("upload_part: {e}"); s3_error!(e, InternalError) })?;
 
         let output = UploadPartOutput {
             e_tag: Some(ETag::Strong(etag)),
@@ -384,20 +430,25 @@ impl S3 for SimpleStorage {
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
-        let (_meta, etag) = store
-            .complete_multipart_upload(
-                &input.upload_id,
-                &input.key,
+        let upload_id = input.upload_id;
+        let key = input.key;
+        let bucket = input.bucket;
+        let (_meta, etag) = blocking(move || {
+            store.complete_multipart_upload(
+                &upload_id,
+                &key,
                 &parts,
                 None, // content_type from CreateMultipartUpload not stored yet
                 now,
                 HashMap::new(),
             )
-            .map_err(|e| { tracing::error!("complete_multipart_upload({}): {e}", input.upload_id); s3_error!(e, InternalError) })?;
+        })
+        .await
+        .map_err(|e| { tracing::error!("complete_multipart_upload: {e}"); s3_error!(e, InternalError) })?;
 
         let output = CompleteMultipartUploadOutput {
-            bucket: Some(input.bucket),
-            key: Some(input.key),
+            bucket: Some(bucket),
+            key: None,
             e_tag: Some(ETag::Strong(etag)),
             ..Default::default()
         };
@@ -411,9 +462,10 @@ impl S3 for SimpleStorage {
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
-        store
-            .abort_multipart_upload(&input.upload_id)
-            .map_err(|e| { tracing::error!("abort_multipart_upload({}): {e}", input.upload_id); s3_error!(e, InternalError) })?;
+        let upload_id = input.upload_id;
+        blocking(move || store.abort_multipart_upload(&upload_id))
+            .await
+            .map_err(|e| { tracing::error!("abort_multipart_upload: {e}"); s3_error!(e, InternalError) })?;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
