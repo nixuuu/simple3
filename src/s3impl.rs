@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,7 +9,7 @@ use md5::{Digest, Md5};
 use s3s::dto::{CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput, ListBucketsInput, ListBucketsOutput, Bucket, Timestamp, PutObjectInput, PutObjectOutput, ETag, GetObjectInput, GetObjectOutput, StreamingBlob, HeadObjectInput, HeadObjectOutput, DeleteObjectInput, DeleteObjectOutput, ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, CreateMultipartUploadInput, CreateMultipartUploadOutput, UploadPartInput, UploadPartOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, AbortMultipartUploadInput, AbortMultipartUploadOutput};
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
-use crate::storage::Storage;
+use crate::storage::{BucketStore, Storage};
 
 pub struct SimpleStorage {
     inner: Arc<Storage>,
@@ -18,6 +19,31 @@ impl SimpleStorage {
     pub const fn new(storage: Arc<Storage>) -> Self {
         Self { inner: storage }
     }
+
+    fn bucket(&self, name: &str) -> S3Result<Arc<BucketStore>> {
+        self.inner
+            .get_bucket(name)
+            .map_err(|e| s3_error!(e, InternalError))?
+            .ok_or_else(|| s3_error!(NoSuchBucket))
+    }
+}
+
+/// Stream request body to a temp file, returning the MD5 hex digest.
+async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<String> {
+    let mut tmp_file =
+        std::fs::File::create(tmp_path).map_err(|e| s3_error!(e, InternalError))?;
+    let mut hasher = Md5::new();
+    let mut stream = body;
+
+    while let Some(chunk) = stream.try_next().await.map_err(|_| s3_error!(InternalError))? {
+        tmp_file
+            .write_all(&chunk)
+            .map_err(|e| s3_error!(e, InternalError))?;
+        hasher.update(&chunk);
+    }
+    tmp_file.flush().map_err(|e| s3_error!(e, InternalError))?;
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[async_trait::async_trait]
@@ -42,10 +68,7 @@ impl S3 for SimpleStorage {
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
         let bucket = &req.input.bucket;
-        let store = self
-            .inner
-            .get_bucket(bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(bucket)?;
 
         if !store.is_empty().map_err(|e| s3_error!(e, InternalError))? {
             return Err(s3_error!(BucketNotEmpty));
@@ -63,7 +86,10 @@ impl S3 for SimpleStorage {
         &self,
         _req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        let names = self.inner.list_buckets();
+        let names = self
+            .inner
+            .list_buckets()
+            .map_err(|e| s3_error!(e, InternalError))?;
         let buckets: Vec<Bucket> = names
             .into_iter()
             .map(|name| Bucket {
@@ -84,41 +110,17 @@ impl S3 for SimpleStorage {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
-        // Stream body to temp file (no lock on data.bin, bounded RAM)
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_nanos();
         let tmp_path = store.bucket_dir().join(format!(".tmp_{now_nanos:020}"));
 
-        let stream_result: S3Result<String> = async {
-            let mut tmp_file = std::fs::File::create(&tmp_path)
-                .map_err(|e| s3_error!(e, InternalError))?;
-            let mut hasher = Md5::new();
-            let mut stream = body;
-
-            while let Some(chunk) =
-                stream.try_next().await.map_err(|_| s3_error!(InternalError))?
-            {
-                tmp_file
-                    .write_all(&chunk)
-                    .map_err(|e| s3_error!(e, InternalError))?;
-                hasher.update(&chunk);
-            }
-            tmp_file.flush().map_err(|e| s3_error!(e, InternalError))?;
-
-            Ok(format!("{:x}", hasher.finalize()))
-        }
-        .await;
-
-        let etag_hex = match stream_result {
+        let etag_hex = match stream_body_to_tmp(body, &tmp_path).await {
             Ok(etag) => etag,
             Err(e) => {
                 std::fs::remove_file(&tmp_path).ok();
@@ -131,8 +133,7 @@ impl S3 for SimpleStorage {
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
-        // Atomically: copy tmp→data.bin + write meta (with rollback)
-        let meta = store
+        store
             .put_object_streamed(
                 &input.key,
                 &tmp_path,
@@ -143,7 +144,6 @@ impl S3 for SimpleStorage {
             )
             .map_err(|e| s3_error!(e, InternalError))?;
 
-        let _ = meta; // offset/length used internally
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag_hex)),
             ..Default::default()
@@ -156,10 +156,7 @@ impl S3 for SimpleStorage {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         let meta = store
             .get_meta(&input.key)
@@ -199,10 +196,7 @@ impl S3 for SimpleStorage {
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         let meta = store
             .get_meta(&input.key)
@@ -233,10 +227,7 @@ impl S3 for SimpleStorage {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         store
             .delete_object(&input.key)
@@ -250,10 +241,7 @@ impl S3 for SimpleStorage {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         #[allow(clippy::cast_sign_loss)] // max(0) guarantees non-negative
         let max_keys = input.max_keys.unwrap_or(1000).max(0) as usize;
@@ -326,10 +314,7 @@ impl S3 for SimpleStorage {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         let upload_id = store.create_multipart_upload();
 
@@ -347,10 +332,7 @@ impl S3 for SimpleStorage {
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
@@ -376,10 +358,7 @@ impl S3 for SimpleStorage {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         let completed = input
             .multipart_upload
@@ -429,10 +408,7 @@ impl S3 for SimpleStorage {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         let input = req.input;
-        let store = self
-            .inner
-            .get_bucket(&input.bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let store = self.bucket(&input.bucket)?;
 
         store
             .abort_multipart_upload(&input.upload_id)

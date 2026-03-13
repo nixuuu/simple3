@@ -24,7 +24,7 @@ fn test_create_bucket() {
     let existed = storage.create_bucket("mybucket").unwrap();
     assert!(!existed);
 
-    let buckets = storage.list_buckets();
+    let buckets = storage.list_buckets().unwrap();
     assert_eq!(buckets, vec!["mybucket"]);
 }
 
@@ -44,7 +44,7 @@ fn test_delete_bucket_empty() {
 
     storage.create_bucket("gone").unwrap();
     assert!(storage.delete_bucket("gone").unwrap());
-    assert!(storage.list_buckets().is_empty());
+    assert!(storage.list_buckets().unwrap().is_empty());
     assert!(!dir.path().join("gone").exists());
 }
 
@@ -61,7 +61,7 @@ fn test_get_bucket_nonexistent() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
 
-    assert!(storage.get_bucket("nope").is_none());
+    assert!(storage.get_bucket("nope").unwrap().is_none());
 }
 
 // === Object operations ===
@@ -71,7 +71,7 @@ fn test_put_get_object() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let data = b"hello world";
     let (offset, length) = bucket.append_data(data).unwrap();
@@ -93,7 +93,7 @@ fn test_put_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let (off1, len1) = bucket.append_data(b"old data").unwrap();
     bucket.put_meta("key", &make_meta(off1, len1, "old")).unwrap();
@@ -114,7 +114,7 @@ fn test_get_nonexistent() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     assert!(bucket.get_meta("nope").unwrap().is_none());
 }
@@ -124,7 +124,7 @@ fn test_head_object_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let data = b"some content";
     let (offset, length) = bucket.append_data(data).unwrap();
@@ -150,7 +150,7 @@ fn test_delete_object() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let (off, len) = bucket.append_data(b"deleteme").unwrap();
     bucket.put_meta("k", &make_meta(off, len, "e")).unwrap();
@@ -165,7 +165,7 @@ fn test_delete_nonexistent() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     assert!(bucket.delete_and_compact("nope").unwrap().is_none());
 }
@@ -177,7 +177,7 @@ fn test_compaction_shrinks_file() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let (off_a, len_a) = bucket.append_data(b"AAAA").unwrap();
     bucket.put_meta("a", &make_meta(off_a, len_a, "ea")).unwrap();
@@ -203,7 +203,7 @@ fn test_compaction_preserves_other_objects() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let (off_a, len_a) = bucket.append_data(b"AAA").unwrap();
     bucket.put_meta("a", &make_meta(off_a, len_a, "ea")).unwrap();
@@ -242,7 +242,7 @@ fn test_list_objects_empty() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let (items, truncated) = bucket.list_objects(None, 1000, None).unwrap();
     assert!(items.is_empty());
@@ -254,7 +254,7 @@ fn test_list_objects_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     for key in ["photos/a.jpg", "photos/b.jpg", "docs/x.txt", "docs/y.txt"] {
         let (off, len) = bucket.append_data(b"data").unwrap();
@@ -274,7 +274,7 @@ fn test_list_objects_delimiter() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     for key in [
         "photos/vacation/a.jpg",
@@ -318,7 +318,7 @@ fn test_list_objects_pagination() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     for i in 0..5 {
         let key = format!("key{i:02}");
@@ -353,17 +353,17 @@ fn test_reopen_storage() {
     {
         let storage = Storage::open(dir.path()).unwrap();
         storage.create_bucket("persist").unwrap();
-        let bucket = storage.get_bucket("persist").unwrap();
+        let bucket = storage.get_bucket("persist").unwrap().unwrap();
         let (off, len) = bucket.append_data(b"survive restart").unwrap();
         bucket.put_meta("key1", &make_meta(off, len, "etag")).unwrap();
     }
 
     // Reopen
     let storage = Storage::open(dir.path()).unwrap();
-    let buckets = storage.list_buckets();
+    let buckets = storage.list_buckets().unwrap();
     assert_eq!(buckets, vec!["persist"]);
 
-    let bucket = storage.get_bucket("persist").unwrap();
+    let bucket = storage.get_bucket("persist").unwrap().unwrap();
     let meta = bucket.get_meta("key1").unwrap().unwrap();
     let data = bucket.read_data(meta.offset, meta.length).unwrap();
     assert_eq!(data, b"survive restart");
@@ -399,7 +399,7 @@ fn test_put_object_streamed() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     // Write data to temp file
     let tmp_path = bucket.bucket_dir().join(".tmp_test");
@@ -441,7 +441,7 @@ fn test_multipart_upload_basic() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let upload_id = bucket.create_multipart_upload();
     assert!(!upload_id.is_empty());
@@ -484,7 +484,7 @@ fn test_multipart_upload_out_of_order() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let upload_id = bucket.create_multipart_upload();
 
@@ -508,7 +508,7 @@ fn test_abort_multipart_upload() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let upload_id = bucket.create_multipart_upload();
     bucket.upload_part(&upload_id, 1, b"data").unwrap();
@@ -560,7 +560,7 @@ fn test_overwrite_compacts_old_data() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     // Upload via streamed put
     let tmp1 = bucket.bucket_dir().join(".tmp_ow1");
@@ -599,7 +599,7 @@ fn test_multipart_overwrite_compacts() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     // First upload: 10 bytes
     let tmp = bucket.bucket_dir().join(".tmp_mow");
@@ -640,7 +640,7 @@ fn test_dead_bytes_tracking() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     assert_eq!(bucket.dead_bytes(), 0);
 
@@ -670,7 +670,7 @@ fn test_compact_full_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     // Put 3 objects: A(4) + B(6) + C(3) = 13 bytes
     let (off_a, len_a) = bucket.append_data(b"AAAA").unwrap();
@@ -705,7 +705,7 @@ fn test_recovery_truncates_orphans() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let (off, len) = bucket.append_data(b"HELLO").unwrap();
     bucket.put_meta("key", &make_meta(off, len, "e1")).unwrap();
@@ -726,7 +726,7 @@ fn test_recovery_truncates_orphans() {
 
     // Reopen — recovery should truncate orphans
     let storage2 = Storage::open(dir.path()).unwrap();
-    let bucket2 = storage2.get_bucket("b").unwrap();
+    let bucket2 = storage2.get_bucket("b").unwrap().unwrap();
 
     assert_eq!(std::fs::metadata(&data_path).unwrap().len(), 5);
     let meta = bucket2.get_meta("key").unwrap().unwrap();
@@ -738,7 +738,7 @@ fn test_recovery_after_interrupted_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("b").unwrap();
-    let bucket = storage.get_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     // Put objects
     let (off_a, len_a) = bucket.append_data(b"AAAA").unwrap();
@@ -758,7 +758,7 @@ fn test_recovery_after_interrupted_compaction() {
 
     // Reopen — should clean up data.bin.tmp and remain consistent
     let storage2 = Storage::open(dir.path()).unwrap();
-    let bucket2 = storage2.get_bucket("b").unwrap();
+    let bucket2 = storage2.get_bucket("b").unwrap().unwrap();
 
     // data.bin.tmp should be gone
     assert!(!bucket_dir.join("data.bin.tmp").exists());

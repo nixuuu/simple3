@@ -44,9 +44,11 @@ enum Command {
 }
 
 fn run_autovacuum(storage: &Arc<Storage>, threshold: f64) {
-    let buckets = storage.list_buckets();
+    let Ok(buckets) = storage.list_buckets() else {
+        return;
+    };
     for name in &buckets {
-        let Some(store) = storage.get_bucket(name) else {
+        let Some(store) = storage.get_bucket(name).ok().flatten() else {
             continue;
         };
         let dead = store.dead_bytes();
@@ -85,10 +87,10 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Compact { bucket }) => {
             let storage = Storage::open(&cli.data_dir)?;
-            let buckets = bucket.map_or_else(|| storage.list_buckets(), |name| vec![name]);
+            let buckets = bucket.map_or_else(|| storage.list_buckets(), |name| Ok(vec![name]))?;
             for name in &buckets {
                 let store = storage
-                    .get_bucket(name)
+                    .get_bucket(name)?
                     .ok_or_else(|| anyhow::anyhow!("bucket '{name}' not found"))?;
                 let dead = store.dead_bytes();
                 if dead == 0 {

@@ -25,7 +25,7 @@ fn setup_bucket(name: &str) -> (tempfile::TempDir, Storage) {
 
 /// Pre-fill bucket with N objects of given size, return keys
 fn prefill(storage: &Storage, bucket: &str, count: usize, obj_size: usize) -> Vec<String> {
-    let b = storage.get_bucket(bucket).unwrap();
+    let b = storage.get_bucket(bucket).unwrap().unwrap();
     let data = vec![0x42u8; obj_size];
     let mut keys = Vec::with_capacity(count);
     for i in 0..count {
@@ -45,7 +45,7 @@ fn bench_put(c: &mut Criterion) {
 
     c.bench_function("put_1kb", |b| {
         let (_dir, storage) = setup_bucket("b");
-        let bucket = storage.get_bucket("b").unwrap();
+        let bucket = storage.get_bucket("b").unwrap().unwrap();
         let counter = AtomicU64::new(0);
         b.iter(|| {
             let i = counter.fetch_add(1, Ordering::Relaxed);
@@ -57,7 +57,7 @@ fn bench_put(c: &mut Criterion) {
 
     c.bench_function("put_1mb", |b| {
         let (_dir, storage) = setup_bucket("b");
-        let bucket = storage.get_bucket("b").unwrap();
+        let bucket = storage.get_bucket("b").unwrap().unwrap();
         let counter = AtomicU64::new(0);
         b.iter(|| {
             let i = counter.fetch_add(1, Ordering::Relaxed);
@@ -81,7 +81,7 @@ fn bench_get(c: &mut Criterion) {
         group.bench_function(label, |b| {
             let (_dir, storage) = setup_bucket("b");
             let keys = prefill(&storage, "b", count, obj_size);
-            let bucket = storage.get_bucket("b").unwrap();
+            let bucket = storage.get_bucket("b").unwrap().unwrap();
             let mut idx = 0usize;
             b.iter(|| {
                 let key = &keys[idx % keys.len()];
@@ -111,7 +111,7 @@ fn bench_compact_scaling(c: &mut Criterion) {
                     (dir, storage, mid_key)
                 },
                 |(_dir, storage, mid_key)| {
-                    let bucket = storage.get_bucket("b").unwrap();
+                    let bucket = storage.get_bucket("b").unwrap().unwrap();
                     bucket.delete_object(&mid_key).unwrap();
                     bucket.compact().unwrap();
                 },
@@ -132,7 +132,7 @@ fn bench_list(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             let (_dir, storage) = setup_bucket("b");
             prefill(&storage, "b", count, 1);
-            let bucket = storage.get_bucket("b").unwrap();
+            let bucket = storage.get_bucket("b").unwrap().unwrap();
             b.iter(|| {
                 bucket.list_objects(None, count, None).unwrap();
             });
@@ -152,7 +152,7 @@ fn bench_concurrent(c: &mut Criterion) {
     group.bench_function("4_thread_get_1kb", |b| {
         let (_dir, storage) = setup_bucket("b");
         prefill(&storage, "b", 100, 1024);
-        let bucket = storage.get_bucket("b").unwrap();
+        let bucket = storage.get_bucket("b").unwrap().unwrap();
 
         b.iter(|| {
             std::thread::scope(|s| {
@@ -177,7 +177,7 @@ fn bench_concurrent(c: &mut Criterion) {
         b.iter_batched(
             || setup_bucket("b"),
             |(_dir, storage)| {
-                let bucket = storage.get_bucket("b").unwrap();
+                let bucket = storage.get_bucket("b").unwrap().unwrap();
                 std::thread::scope(|s| {
                     for t in 0..4u64 {
                         let bucket = Arc::clone(&bucket);
@@ -207,7 +207,7 @@ fn bench_concurrent(c: &mut Criterion) {
                 (dir, storage)
             },
             |(_dir, storage)| {
-                let bucket = storage.get_bucket("b").unwrap();
+                let bucket = storage.get_bucket("b").unwrap().unwrap();
                 std::thread::scope(|s| {
                     // 2 readers
                     for t in 0..2u64 {
