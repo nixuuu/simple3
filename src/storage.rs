@@ -594,7 +594,7 @@ impl BucketStore {
     }
 
     pub fn put_meta(&self, key: &str, meta: &ObjectMeta) -> io::Result<()> {
-        self.commit_put(key, meta, None)
+        self.commit_put(key, meta)
     }
 
     pub fn get_meta(&self, key: &str) -> io::Result<Option<ObjectMeta>> {
@@ -611,20 +611,26 @@ impl BucketStore {
     }
 
     /// Atomically insert/update an object and optionally track dead bytes from the old version.
-    fn commit_put(
-        &self,
-        key: &str,
-        meta: &ObjectMeta,
-        old_meta: Option<&ObjectMeta>,
-    ) -> io::Result<()> {
+    /// Atomically insert/update an object and track dead bytes from the previous version.
+    ///
+    /// Reads the old meta **inside** the write transaction to avoid TOCTOU races
+    /// where concurrent overwrites double-count dead bytes.
+    fn commit_put(&self, key: &str, meta: &ObjectMeta) -> io::Result<()> {
         let v = bincode::serialize(meta).map_err(io::Error::other)?;
         let txn = self.db.begin_write().map_err(io::Error::other)?;
-        {
+        let old_meta = {
             let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+            let old = table
+                .get(key)
+                .map_err(io::Error::other)?
+                .map(|v| bincode::deserialize::<ObjectMeta>(v.value()))
+                .transpose()
+                .map_err(io::Error::other)?;
             table
                 .insert(key, v.as_slice())
                 .map_err(io::Error::other)?;
-        }
+            old
+        };
         if let Some(old) = old_meta {
             let mut dead = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
             let current = dead
@@ -653,8 +659,6 @@ impl BucketStore {
         last_modified: u64,
         user_metadata: HashMap<String, String>,
     ) -> io::Result<ObjectMeta> {
-        let old_meta = self.get_meta(key)?;
-
         let mut tmp = File::open(tmp_path)?;
         let tmp_size = tmp.metadata()?.len();
         let mut w = self
@@ -683,7 +687,7 @@ impl BucketStore {
             user_metadata,
         };
 
-        if let Err(e) = self.commit_put(key, &meta, old_meta.as_ref()) {
+        if let Err(e) = self.commit_put(key, &meta) {
             w.file.set_len(offset).ok();
             w.size = offset;
             fs::remove_file(tmp_path).ok();
@@ -735,8 +739,6 @@ impl BucketStore {
         last_modified: u64,
         user_metadata: HashMap<String, String>,
     ) -> io::Result<(ObjectMeta, String)> {
-        let old_meta = self.get_meta(key)?;
-
         let mut sorted_parts: Vec<_> = parts.to_vec();
         sorted_parts.sort_by_key(|(num, _)| *num);
 
@@ -806,7 +808,7 @@ impl BucketStore {
             user_metadata,
         };
 
-        if let Err(e) = self.commit_put(key, &meta, old_meta.as_ref()) {
+        if let Err(e) = self.commit_put(key, &meta) {
             w.file.set_len(offset).ok();
             w.size = offset;
             return Err(e);
