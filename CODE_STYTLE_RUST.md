@@ -1,135 +1,135 @@
-# Pisanie wydajnego kodu w Rust – checklist do code review
+# Writing efficient Rust code – code review checklist
 
-## Ownership i borrowing
-- unikaj niepotrzebnych `.clone()`, `.to_owned()`, `.to_string()`
-- przekazuj referencje `&T` / `&mut T` tam, gdzie to możliwe
-- korzystaj z `Cow<'_, T>` zamiast klonowania w sytuacjach „może potrzebuję własności, może nie"
-- nie trzymaj dużych struktur przez ownership, gdy wystarczy referencja
-- używaj `Arc<T>` w kodzie wielowątkowym, `Rc<T>` tylko w single-threaded
-- rozważ `Box<dyn Trait>` vs generics — dynamic dispatch zmniejsza rozmiar binarki, ale kosztuje wydajność
+## Ownership and borrowing
+- avoid unnecessary `.clone()`, `.to_owned()`, `.to_string()`
+- pass references `&T` / `&mut T` wherever possible
+- use `Cow<'_, T>` instead of cloning in "might need ownership, might not" situations
+- don't hold large structs by ownership when a reference suffices
+- use `Arc<T>` in multithreaded code, `Rc<T>` only in single-threaded
+- consider `Box<dyn Trait>` vs generics — dynamic dispatch reduces binary size but costs performance
 
-## Wybór struktur danych
-- używaj `Vec` do sekwencyjnego dostępu i operacji push/pop z końca
-- używaj `VecDeque` do operacji z obu końców
-- używaj `HashMap` do szybkiego wyszukiwania po kluczu (średnio O(1))
-- używaj `BTreeMap` / `BTreeSet` gdy potrzebny jest porządek lub zakresy
-- unikaj wyszukiwania liniowego (`find`, `position`) na dużych kolekcjach
-- dla małych kolekcji (do ~20 elementów) `Vec` + liniowe wyszukiwanie bywa szybsze niż `HashMap`
+## Data structure selection
+- use `Vec` for sequential access and push/pop from the end
+- use `VecDeque` for operations from both ends
+- use `HashMap` for fast key lookup (average O(1))
+- use `BTreeMap` / `BTreeSet` when ordering or range queries are needed
+- avoid linear search (`find`, `position`) on large collections
+- for small collections (up to ~20 elements) `Vec` + linear search can be faster than `HashMap`
 
-## Iteratory vs pętle ręczne
-- preferuj chain iteratorów: `map` → `filter` → `collect` / `for_each` / `fold`
-- unikaj pętli `for i in 0..len` z indeksowaniem, gdy da się to zrobić iteratorem
-- nie twórz `.collect::<Vec<_>>()` tylko po to, żeby potem iterować po wektorze
-- używaj `Iterator::size_hint()` i `ExactSizeIterator` gdy implementujesz własne iteratory
+## Iterators vs manual loops
+- prefer iterator chains: `map` → `filter` → `collect` / `for_each` / `fold`
+- avoid `for i in 0..len` with indexing when an iterator can do the job
+- don't `.collect::<Vec<_>>()` just to iterate over the vector afterwards
+- use `Iterator::size_hint()` and `ExactSizeIterator` when implementing custom iterators
 
-## Równoległe przetwarzanie (rayon)
-- używaj `par_iter()` / `par_iter_mut()` / `into_par_iter()` dla CPU-bound operacji na dużych kolekcjach
-- zamiana `.iter()` na `.par_iter()` ma sens gdy:
-  - kolekcja ma > 1000 elementów lub
-  - pojedyncza iteracja trwa > 1μs
-- nie używaj rayon dla operacji I/O-bound — tam lepszy async (tokio, async-std)
-- unikaj `par_iter()` gdy:
-  - operacja wymaga zachowania kolejności i używasz `for_each` (użyj `par_bridge()` + `collect()` jeśli kolejność ważna)
-  - kolekcja jest mała (overhead thread pool przewyższa zysk)
-  - wewnątrz iteracji są alokacje lub locki (kontencja zniweluje zysk)
-- preferuj `par_chunks()` / `par_chunks_mut()` dla przetwarzania dużych danych w partiach
-- dla redukcji używaj `par_iter().reduce()` lub `par_iter().sum()` zamiast ręcznego zbierania wyników
-- ustaw rozmiar thread pool jawnie przez `rayon::ThreadPoolBuilder` gdy domyślny (liczba CPU) nie jest optymalny
-- profiluj przed i po — nie wszystkie pętle zyskują na równoległości
+## Parallel processing (rayon)
+- use `par_iter()` / `par_iter_mut()` / `into_par_iter()` for CPU-bound operations on large collections
+- switching `.iter()` to `.par_iter()` makes sense when:
+  - the collection has > 1000 elements, or
+  - a single iteration takes > 1μs
+- don't use rayon for I/O-bound operations — use async instead (tokio, async-std)
+- avoid `par_iter()` when:
+  - the operation requires ordering and you're using `for_each` (use `par_bridge()` + `collect()` if order matters)
+  - the collection is small (thread pool overhead exceeds the gain)
+  - iterations contain allocations or locks (contention will negate the gain)
+- prefer `par_chunks()` / `par_chunks_mut()` for batch processing of large data
+- for reductions use `par_iter().reduce()` or `par_iter().sum()` instead of manually collecting results
+- set thread pool size explicitly via `rayon::ThreadPoolBuilder` when the default (CPU count) is suboptimal
+- profile before and after — not all loops benefit from parallelism
 
-## Alokacje i zarządzanie pamięcią
-- minimalizuj alokacje wewnątrz hot paths (fragmentów kodu wykonywanych wielokrotnie w pętlach lub na krytycznej ścieżce)
-- używaj `&str` zamiast `String` w argumentach funkcji (gdy nie modyfikujesz)
-- preferuj `String::with_capacity()` + `push_str` zamiast wielokrotnego `+=`
-- unikaj `format!` w pętlach — buduj `String` ręcznie lub użyj `write!` do istniejącego bufora
-- dla małych wektorów rozważ `smallvec`, `tinyvec`
-- dla małych stringów rozważ `smol_str`, `compact_str`, `smartstring`
+## Allocations and memory management
+- minimize allocations inside hot paths (code executed repeatedly in loops or on the critical path)
+- use `&str` instead of `String` in function arguments (when not modifying)
+- prefer `String::with_capacity()` + `push_str` over repeated `+=`
+- avoid `format!` in loops — build the `String` manually or use `write!` to an existing buffer
+- for small vectors consider `smallvec`, `tinyvec`
+- for small strings consider `smol_str`, `compact_str`, `smartstring`
 
 ## Async
-- używaj `tokio::spawn` dla zadań async, `spawn_blocking` dla blokującego CPU/IO
-- unikaj `.await` w pętlach gdy da się użyć `join_all`, `try_join_all` lub `FuturesUnordered`
-- nie trzymaj `MutexGuard` przez `.await` — użyj `tokio::sync::Mutex` lub przeorganizuj kod
-- preferuj `select!` z `biased` gdy kolejność sprawdzania ma znaczenie
+- use `tokio::spawn` for async tasks, `spawn_blocking` for blocking CPU/IO
+- avoid `.await` in loops when `join_all`, `try_join_all`, or `FuturesUnordered` can be used
+- don't hold a `MutexGuard` across `.await` — use `tokio::sync::Mutex` or restructure the code
+- prefer `select!` with `biased` when check order matters
 
-## Bezpieczeństwo i panika
-- używaj `unwrap()` / `expect()` tylko w testach i `main`
-- w bibliotekach i kodzie produkcyjnym zwracaj `Result` / `Option`
-- unikaj `panic!` na hot paths (koszt unwind jest wysoki)
-- bloki `unsafe` trzymaj małe, dobrze udokumentowane i uzasadnione
-- oznaczaj funkcje zwracające wartość, która nie powinna być ignorowana, atrybutem `#[must_use]`
+## Safety and panics
+- use `unwrap()` / `expect()` only in tests and `main`
+- in libraries and production code return `Result` / `Option`
+- avoid `panic!` on hot paths (unwind cost is high)
+- keep `unsafe` blocks small, well-documented, and justified
+- mark functions returning values that should not be ignored with `#[must_use]`
 
-## Obsługa błędów
-- w bibliotekach definiuj własne typy błędów (`thiserror`)
-- w aplikacjach używaj `anyhow` dla uproszczonej propagacji błędów
-- unikaj `Box<dyn Error>` jako typu zwracanego w publicznym API
-- nie nadużywaj `.unwrap_or_default()` — jawnie obsługuj przypadki brzegowe
+## Error handling
+- in libraries define custom error types (`thiserror`)
+- in applications use `anyhow` for simplified error propagation
+- avoid `Box<dyn Error>` as a return type in public APIs
+- don't overuse `.unwrap_or_default()` — explicitly handle edge cases
 
-## SQLx i baza danych
-- używaj makr `sqlx::query!()`, `sqlx::query_as!()`, `sqlx::query_scalar!()` zamiast runtime `query()` / `query_as()`
-- compile-time verification wymaga ustawionej zmiennej `DATABASE_URL` podczas kompilacji
-- dla CI bez dostępu do bazy używaj offline mode:
-  - generuj cache: `cargo sqlx prepare`
-  - commituj katalog `.sqlx/` do repozytorium
-  - w CI ustaw `SQLX_OFFLINE=true`
-- migracje trzymaj w `migrations/` i uruchamiaj przez `sqlx::migrate!()` lub CLI
-- unikaj `sqlx::query_unchecked!()` — jeśli musisz go użyć, dodaj komentarz z uzasadnieniem
-- dla dynamicznych zapytań (np. filtry budowane w runtime) używaj query buildera (`sea-query`, `diesel` dsl) lub `QueryBuilder` z sqlx
-- nie interpoluj wartości do SQL stringów — zawsze używaj bind parameters (`$1`, `$2` w Postgres)
+## SQLx and databases
+- use macros `sqlx::query!()`, `sqlx::query_as!()`, `sqlx::query_scalar!()` instead of runtime `query()` / `query_as()`
+- compile-time verification requires `DATABASE_URL` set during compilation
+- for CI without database access use offline mode:
+  - generate cache: `cargo sqlx prepare`
+  - commit the `.sqlx/` directory to the repository
+  - in CI set `SQLX_OFFLINE=true`
+- keep migrations in `migrations/` and run via `sqlx::migrate!()` or CLI
+- avoid `sqlx::query_unchecked!()` — if you must use it, add a comment with justification
+- for dynamic queries (e.g. filters built at runtime) use a query builder (`sea-query`, `diesel` dsl) or `QueryBuilder` from sqlx
+- never interpolate values into SQL strings — always use bind parameters (`$1`, `$2` in Postgres)
 
-## Długość plików i organizacja kodu
-- trzymaj pliki z typami + podstawowymi metodami w przedziale 300–700 linii
-- pliki z implementacjami traitów, serde, sqlx: do 800–1000 linii
-- pliki testów jednostkowych: do 1200–1500 linii (jeśli czytelne)
-- pliki `main.rs` / `lib.rs` w korzeniu: maksymalnie 400–600 linii
-- gdy plik przekracza 800 linii i nadal rośnie → wyciągaj prywatne moduły
-- gdy w pliku jest więcej niż 1–2 publiczne typy → rozbij
-- gdy scrollujesz więcej niż 2–3 razy, żeby znaleźć metodę → rozbij
-- preferuj strukturę vertical slice (grupowanie po funkcjonalności, np. `orders/`, `users/`) zamiast podziału warstwowego (`models/`, `services/`, `controllers/`)
-- wyciągaj implementacje traitów, serde, sqlx do osobnych plików (np. `order/impls.rs`, `order/db.rs`)
+## File length and code organization
+- keep files with types + basic methods in the 300–700 line range
+- files with trait implementations, serde, sqlx: up to 800–1000 lines
+- unit test files: up to 1200–1500 lines (if readable)
+- `main.rs` / `lib.rs` root files: 400–600 lines maximum
+- when a file exceeds 800 lines and keeps growing → extract private modules
+- when a file has more than 1–2 public types → split it
+- when you scroll more than 2–3 times to find a method → split it
+- prefer vertical slice structure (grouping by feature, e.g. `orders/`, `users/`) over layered organization (`models/`, `services/`, `controllers/`)
+- extract trait implementations, serde, sqlx into separate files (e.g. `order/impls.rs`, `order/db.rs`)
 
-## Wydajność praktyczna
-- wykonuj profilowanie przed optymalizacją:
+## Practical performance
+- profile before optimizing:
   - `cargo flamegraph`, `samply` — CPU profiling
-  - `heaptrack` — analiza alokacji
-  - `cargo-show-asm` — inspekcja wygenerowanego kodu
-- trzymaj hot paths wolne od blokującego I/O i alokacji
-- unikaj niepotrzebnych kopii przy pracy z dużymi danymi (np. `bytes::Bytes`, `&[u8]`)
-- stosuj `#[inline]` / `#[inline(always)]` tylko po rzeczywistych pomiarach — kompilator zwykle wie lepiej
+  - `heaptrack` — allocation analysis
+  - `cargo-show-asm` — generated code inspection
+- keep hot paths free of blocking I/O and allocations
+- avoid unnecessary copies when working with large data (e.g. `bytes::Bytes`, `&[u8]`)
+- use `#[inline]` / `#[inline(always)]` only after actual measurements — the compiler usually knows better
 
-## Czytelność i utrzymywalność
-- jawnie podawaj lifetimes tylko tam, gdzie kompilator ich nie wywnioskuje
-- używaj nazw zmiennych i funkcji opisujących intencję, a nie typ
-- trzymaj funkcje w granicach 30–50 linii
-- usuwaj martwy kod (unused variables, imports, funkcje)
+## Readability and maintainability
+- explicitly specify lifetimes only where the compiler cannot infer them
+- use variable and function names that describe intent, not type
+- keep functions within 30–50 lines
+- remove dead code (unused variables, imports, functions)
 
-## Testy wydajnościowe
-- pisz benchmarki dla krytycznych fragmentów (`criterion`, `divan`)
-- porównuj wyniki przed i po zmianach
-- pokrywaj testami typowe i graniczne przypadki użycia
-- uruchamiaj benchmarki na tej samej maszynie / w CI z pinowanym CPU
+## Performance testing
+- write benchmarks for critical sections (`criterion`, `divan`)
+- compare results before and after changes
+- cover both typical and edge cases with tests
+- run benchmarks on the same machine / in CI with pinned CPU
 
-## Zależności i kompilacja
-- ogranicz liczbę zależności do minimum
-- wyłączaj niepotrzebne features w `Cargo.toml` (`default-features = false`)
-- w profilu release dla finalnych binarek produkcyjnych:
+## Dependencies and compilation
+- keep the number of dependencies to a minimum
+- disable unnecessary features in `Cargo.toml` (`default-features = false`)
+- in release profile for final production binaries:
   ```toml
   [profile.release]
   opt-level = 3
   lto = "fat"
   codegen-units = 1
   ```
-  (znacząco wydłuża kompilację — nie używaj w dev buildach)
-- usuwaj debug info z binarki (`strip = true` w profilu lub `strip` po buildzie)
+  (significantly increases compile time — don't use in dev builds)
+- strip debug info from the binary (`strip = true` in profile or `strip` after build)
 
-## Clippy i rustfmt
-- kod musi przechodzić `cargo clippy -- -D warnings`
-- nie używaj `#![allow(...)]` ani `#[allow(...)]` bez konkretnego, trwałego uzasadnienia
-- zabronione uzasadnienia: „ktoś kiedyś poprawi", „bez tego nie buduje się", „tymczasowo"
-- każde ignorowanie clippy wymaga komentarza z rzeczywistym powodem, np.:
+## Clippy and rustfmt
+- code must pass `cargo clippy -- -D warnings`
+- don't use `#![allow(...)]` or `#[allow(...)]` without a specific, lasting justification
+- forbidden justifications: "someone will fix it later", "it won't build without this", "temporarily"
+- every clippy suppression requires a comment with a real reason, e.g.:
   ```rust
   #[allow(clippy::too_many_arguments)]
-  // Uzasadnienie: builder pattern nie pasuje do tego API,
-  // argumenty są ze sobą logicznie powiązane i zawsze przekazywane razem
+  // Justification: builder pattern doesn't fit this API,
+  // arguments are logically related and always passed together
   ```
-- formatuj zgodnie z `rustfmt`
-- usuwaj wszystkie unused imports i zmienne
+- format according to `rustfmt`
+- remove all unused imports and variables

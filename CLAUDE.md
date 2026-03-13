@@ -54,4 +54,4 @@ Three modules exported from `lib.rs`:
 
 ## Code Style
 
-Follow `CODE_STYTLE_RUST.md` (Polish). Key points: prefer iterators over indexed loops, minimize allocations on hot paths, keep functions under 50 lines, files under 800 lines. Use `spawn_blocking` for blocking I/O in async context.
+Follow `CODE_STYTLE_RUST.md`. Key points: prefer iterators over indexed loops, minimize allocations on hot paths, keep functions under 50 lines, files under 800 lines. Use `spawn_blocking` for blocking I/O in async context.
