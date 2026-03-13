@@ -494,11 +494,29 @@ impl BucketStore {
         }
 
         let segment_id = w.id;
-        let offset = w.file.seek(SeekFrom::End(0))?;
-        let length = copy_large(&mut tmp, &mut w.file)?;
-        w.file.sync_all()?;
-        w.size = offset + length;
-        drop(tmp);
+        let seg_path = self.bucket_dir.join(segment_filename(segment_id));
+
+        let (offset, length) = if w.size == 0 {
+            // Empty segment — rename tmp file to become the segment (O(1) vs O(n) copy)
+            drop(tmp);
+            fs::rename(tmp_path, &seg_path)?;
+            w.file = OpenOptions::new().read(true).write(true).open(&seg_path)?;
+            w.file.sync_all()?;
+            w.size = tmp_size;
+            let reader = w.file.try_clone()?;
+            self.segments
+                .write()
+                .map_err(|_| io::Error::other("segments lock poisoned"))?
+                .insert(segment_id, Arc::new(RwLock::new(reader)));
+            (0, tmp_size)
+        } else {
+            let offset = w.file.seek(SeekFrom::End(0))?;
+            let length = copy_large(&mut tmp, &mut w.file)?;
+            w.file.sync_all()?;
+            w.size = offset + length;
+            drop(tmp);
+            (offset, length)
+        };
 
         let meta = ObjectMeta {
             segment_id,

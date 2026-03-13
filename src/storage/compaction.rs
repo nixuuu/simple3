@@ -92,18 +92,34 @@ impl BucketStore {
         *file = File::open(seg_path)?;
 
         let txn = self.db.begin_write().map_err(io::Error::other)?;
+        let mut stale_bytes: u64 = 0;
         {
             let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
             for (key, obj) in updates {
-                let v = bincode::serialize(obj).map_err(io::Error::other)?;
-                table
-                    .insert(key.as_str(), v.as_slice())
-                    .map_err(io::Error::other)?;
+                // Check current state — object may have been deleted or moved
+                // between collect_live_objects and this write transaction.
+                let still_here = table
+                    .get(key.as_str())
+                    .map_err(io::Error::other)?
+                    .map(|v| bincode::deserialize::<ObjectMeta>(v.value()))
+                    .transpose()
+                    .map_err(io::Error::other)?
+                    .is_some_and(|cur| cur.segment_id == segment_id);
+
+                if still_here {
+                    let v = bincode::serialize(obj).map_err(io::Error::other)?;
+                    table
+                        .insert(key.as_str(), v.as_slice())
+                        .map_err(io::Error::other)?;
+                } else {
+                    stale_bytes += obj.length;
+                }
             }
         }
         {
             let mut t = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
-            t.insert(segment_id, 0u64).map_err(io::Error::other)?;
+            t.insert(segment_id, stale_bytes)
+                .map_err(io::Error::other)?;
         }
         {
             let mut t = txn.open_table(SEG_COMPACTING).map_err(io::Error::other)?;
