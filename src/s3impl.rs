@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
 use md5::{Digest, Md5};
-use s3s::dto::{CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput, ListBucketsInput, ListBucketsOutput, Bucket, Timestamp, PutObjectInput, PutObjectOutput, ETag, GetObjectInput, GetObjectOutput, StreamingBlob, HeadObjectInput, HeadObjectOutput, DeleteObjectInput, DeleteObjectOutput, ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, CreateMultipartUploadInput, CreateMultipartUploadOutput, UploadPartInput, UploadPartOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, AbortMultipartUploadInput, AbortMultipartUploadOutput};
+use s3s::dto::{CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput, ListBucketsInput, ListBucketsOutput, Bucket, Timestamp, PutObjectInput, PutObjectOutput, ETag, GetObjectInput, GetObjectOutput, StreamingBlob, HeadObjectInput, HeadObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, CreateMultipartUploadInput, CreateMultipartUploadOutput, UploadPartInput, UploadPartOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, AbortMultipartUploadInput, AbortMultipartUploadOutput};
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::storage::{BucketStore, Storage};
@@ -272,6 +272,66 @@ impl S3 for SimpleStorage {
             .map_err(|e| { tracing::error!("delete_object: {e}"); s3_error!(e, InternalError) })?;
 
         Ok(S3Response::new(DeleteObjectOutput::default()))
+    }
+
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let input = req.input;
+        let store = self.bucket(&input.bucket)?;
+        let quiet = input.delete.quiet.unwrap_or(false);
+        let objects = input.delete.objects;
+
+        let (deleted_keys, errors) = blocking(move || {
+            let mut deleted_keys = Vec::new();
+            let mut errors: Vec<s3s::dto::Error> = Vec::new();
+            for obj_id in objects {
+                let key = obj_id.key;
+                match store.delete_object(&key) {
+                    Ok(_) => deleted_keys.push(key),
+                    Err(e) => errors.push(s3s::dto::Error {
+                        code: Some("InternalError".to_owned()),
+                        key: Some(key),
+                        message: Some(e.to_string()),
+                        version_id: None,
+                    }),
+                }
+            }
+            Ok((deleted_keys, errors))
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("delete_objects: {e}");
+            s3_error!(e, InternalError)
+        })?;
+
+        let deleted = if quiet {
+            None
+        } else {
+            Some(
+                deleted_keys
+                    .into_iter()
+                    .map(|key| DeletedObject {
+                        key: Some(key),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )
+        };
+
+        let errors = if errors.is_empty() {
+            None
+        } else {
+            Some(errors)
+        };
+
+        let output = DeleteObjectsOutput {
+            deleted,
+            errors,
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
     }
 
     async fn list_objects_v2(
