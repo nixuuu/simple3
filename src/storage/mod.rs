@@ -1,6 +1,7 @@
 mod compaction;
 mod migration;
 mod multipart;
+mod verify;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -267,8 +268,7 @@ impl BucketStore {
             let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
             for result in table.iter().map_err(io::Error::other)? {
                 let (_k, v) = result.map_err(io::Error::other)?;
-                let obj: ObjectMeta =
-                    bincode::deserialize(v.value()).map_err(io::Error::other)?;
+                let obj = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
                 if obj.segment_id == active_id {
                     max_end = max_end.max(obj.offset + obj.length);
                 }
@@ -420,8 +420,7 @@ impl BucketStore {
         let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
         match table.get(key).map_err(io::Error::other)? {
             Some(v) => {
-                let meta: ObjectMeta =
-                    bincode::deserialize(v.value()).map_err(io::Error::other)?;
+                let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
                 Ok(Some(meta))
             }
             None => Ok(None),
@@ -440,7 +439,7 @@ impl BucketStore {
             let old = table
                 .get(key)
                 .map_err(io::Error::other)?
-                .map(|v| bincode::deserialize::<ObjectMeta>(v.value()))
+                .map(|v| ObjectMeta::from_bytes(v.value()))
                 .transpose()
                 .map_err(io::Error::other)?;
             table
@@ -521,6 +520,7 @@ impl BucketStore {
         let segment_id = w.id;
         let (offset, length) = self.write_to_segment(&mut w, tmp_path, tmp, tmp_size)?;
 
+        let content_md5 = Some(etag.clone());
         let meta = ObjectMeta {
             segment_id,
             offset,
@@ -529,6 +529,7 @@ impl BucketStore {
             etag,
             last_modified,
             user_metadata,
+            content_md5,
         };
 
         if let Err(e) = self.commit_put(key, &meta) {
@@ -551,9 +552,7 @@ impl BucketStore {
         let meta = {
             let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
             match table.remove(key).map_err(io::Error::other)? {
-                Some(v) => {
-                    bincode::deserialize::<ObjectMeta>(v.value()).map_err(io::Error::other)?
-                }
+                Some(v) => ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?,
                 None => return Ok(None),
             }
         };
@@ -648,8 +647,7 @@ impl BucketStore {
                 break;
             }
 
-            let meta: ObjectMeta =
-                bincode::deserialize(v.value()).map_err(io::Error::other)?;
+            let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
             results.push((obj_key.to_owned(), meta));
         }
 

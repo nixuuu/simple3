@@ -3,7 +3,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +49,11 @@ enum Command {
     /// Compact buckets to reclaim dead space
     Compact {
         /// Compact only this bucket (default: all buckets)
+        bucket: Option<String>,
+    },
+    /// Verify data integrity of stored objects
+    Verify {
+        /// Verify only this bucket (default: all buckets)
         bucket: Option<String>,
     },
 }
@@ -181,6 +186,13 @@ async fn handle_admin(
             .unwrap_or_else(|e| {
                 json_response(500, &serde_json::json!({"error": e.to_string()}))
             })
+    } else if method == hyper::Method::GET && path.starts_with("/_/verify/") {
+        let bucket = path["/_/verify/".len()..].trim_end_matches('/').to_owned();
+        tokio::task::spawn_blocking(move || admin_verify(&storage, &bucket))
+            .await
+            .unwrap_or_else(|e| {
+                json_response(500, &serde_json::json!({"error": e.to_string()}))
+            })
     } else {
         json_response(404, &serde_json::json!({"error": "not found"}))
     }
@@ -227,6 +239,45 @@ fn admin_compact(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
     )
 }
 
+fn admin_verify(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
+    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
+        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    };
+    match store.verify_integrity() {
+        Ok(result) => json_response(200, &result),
+        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+fn run_verify(data_dir: &Path, bucket: Option<String>) -> anyhow::Result<()> {
+    let storage = Storage::open(data_dir)?;
+    let buckets = bucket.map_or_else(|| storage.list_buckets(), |name| Ok(vec![name]))?;
+    let mut all_ok = true;
+    for name in &buckets {
+        let store = storage
+            .get_bucket(name)?
+            .ok_or_else(|| anyhow::anyhow!("bucket '{name}' not found"))?;
+        println!("{name}: verifying...");
+        let result = store.verify_integrity()?;
+        if result.errors.is_empty() {
+            println!("{name}: OK ({} objects verified)", result.verified_ok);
+        } else {
+            all_ok = false;
+            for err in &result.errors {
+                println!("  FAIL {}: {}", err.key, err.detail);
+            }
+            println!(
+                "{name}: {} ok, {} checksum errors, {} read errors",
+                result.verified_ok, result.checksum_errors, result.read_errors
+            );
+        }
+    }
+    if !all_ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -254,6 +305,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Some(Command::Verify { bucket }) => run_verify(&cli.data_dir, bucket),
         cmd => {
             let (host, port, autovacuum_interval, autovacuum_threshold, max_segment_size_mb) =
                 match cmd {

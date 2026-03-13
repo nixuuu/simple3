@@ -21,8 +21,7 @@ impl BucketStore {
         let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
         for result in table.iter().map_err(io::Error::other)? {
             let (k, v) = result.map_err(io::Error::other)?;
-            let obj: ObjectMeta =
-                bincode::deserialize(v.value()).map_err(io::Error::other)?;
+            let obj = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
             if obj.segment_id == segment_id {
                 live.push((k.value().to_owned(), obj));
             }
@@ -101,7 +100,7 @@ impl BucketStore {
                 let still_here = table
                     .get(key.as_str())
                     .map_err(io::Error::other)?
-                    .map(|v| bincode::deserialize::<ObjectMeta>(v.value()))
+                    .map(|v| ObjectMeta::from_bytes(v.value()))
                     .transpose()
                     .map_err(io::Error::other)?
                     .is_some_and(|cur| cur.segment_id == segment_id);

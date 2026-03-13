@@ -1,3 +1,4 @@
+use md5::{Digest, Md5};
 use simple3::storage::Storage;
 use simple3::types::ObjectMeta;
 use std::collections::HashMap;
@@ -12,6 +13,7 @@ fn make_meta(segment_id: u32, offset: u64, length: u64, etag: &str) -> ObjectMet
         etag: etag.into(),
         last_modified: 1000,
         user_metadata: HashMap::new(),
+        content_md5: None,
     }
 }
 
@@ -142,6 +144,7 @@ fn test_head_object_metadata() {
         etag: "etag123".into(),
         last_modified: 42,
         user_metadata: [("x-custom".into(), "val".into())].into(),
+        content_md5: None,
     };
     bucket.put_meta("obj", &meta).unwrap();
 
@@ -965,4 +968,116 @@ fn test_segment_stats() {
     assert_eq!(stats[0].id, 0);
     assert_eq!(stats[0].size, 8); // 4 + 4
     assert_eq!(stats[0].dead_bytes, 4);
+}
+
+// === Verify integrity ===
+
+#[test]
+fn test_verify_integrity_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    storage.create_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
+
+    // Put objects with correct content_md5
+    let data = b"hello world";
+    let md5 = format!("{:x}", Md5::digest(data));
+    let (seg, off, len) = bucket.append_data(data).unwrap();
+    let meta = ObjectMeta {
+        segment_id: seg,
+        offset: off,
+        length: len,
+        content_type: None,
+        etag: md5.clone(),
+        last_modified: 0,
+        user_metadata: HashMap::new(),
+        content_md5: Some(md5),
+    };
+    bucket.put_meta("key1", &meta).unwrap();
+
+    let result = bucket.verify_integrity().unwrap();
+    assert_eq!(result.total_objects, 1);
+    assert_eq!(result.verified_ok, 1);
+    assert!(result.errors.is_empty());
+}
+
+#[test]
+fn test_verify_integrity_checksum_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    storage.create_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
+
+    let data = b"hello world";
+    let (seg, off, len) = bucket.append_data(data).unwrap();
+    let meta = ObjectMeta {
+        segment_id: seg,
+        offset: off,
+        length: len,
+        content_type: None,
+        etag: "wrong_md5_value".into(),
+        last_modified: 0,
+        user_metadata: HashMap::new(),
+        content_md5: Some("wrong_md5_value".into()),
+    };
+    bucket.put_meta("key1", &meta).unwrap();
+
+    let result = bucket.verify_integrity().unwrap();
+    assert_eq!(result.total_objects, 1);
+    assert_eq!(result.verified_ok, 0);
+    assert_eq!(result.checksum_errors, 1);
+}
+
+#[test]
+fn test_verify_streamed_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    storage.create_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
+
+    // Use put_object_streamed which sets content_md5 automatically
+    let tmp_path = dir.path().join("tmp_upload");
+    let data = b"test data for verification";
+    std::fs::write(&tmp_path, data).unwrap();
+    let etag = format!("{:x}", Md5::digest(data));
+
+    bucket
+        .put_object_streamed("obj1", &tmp_path, None, etag, 0, HashMap::new())
+        .unwrap();
+
+    let result = bucket.verify_integrity().unwrap();
+    assert_eq!(result.total_objects, 1);
+    assert_eq!(result.verified_ok, 1);
+    assert!(result.errors.is_empty());
+}
+
+#[test]
+fn test_verify_multipart_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    storage.create_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
+
+    let upload_id = bucket.create_multipart_upload();
+    let etag1 = bucket.upload_part(&upload_id, 1, b"part one ").unwrap();
+    let etag2 = bucket.upload_part(&upload_id, 2, b"part two").unwrap();
+    let parts = vec![(1, etag1), (2, etag2)];
+    bucket
+        .complete_multipart_upload(&upload_id, "mpu_obj", &parts, None, 0, HashMap::new())
+        .unwrap();
+
+    // Verify should pass — content_md5 was set during assembly
+    let result = bucket.verify_integrity().unwrap();
+    assert_eq!(result.total_objects, 1);
+    assert_eq!(result.verified_ok, 1);
+    assert!(result.errors.is_empty());
+
+    // Also verify the content_md5 matches MD5 of the full assembled data
+    let meta = bucket.get_meta("mpu_obj").unwrap().unwrap();
+    let full_data = bucket
+        .read_data(meta.segment_id, meta.offset, meta.length)
+        .unwrap();
+    assert_eq!(full_data, b"part one part two");
+    let expected_md5 = format!("{:x}", Md5::digest(&full_data));
+    assert_eq!(meta.content_md5.as_deref(), Some(expected_md5.as_str()));
 }

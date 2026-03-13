@@ -94,6 +94,7 @@ fn migrate_objects(
                     etag: v1.etag,
                     last_modified: v1.last_modified,
                     user_metadata: v1.user_metadata,
+                    content_md5: None,
                 };
                 let bytes = bincode::serialize(&v2).map_err(io::Error::other)?;
                 table
