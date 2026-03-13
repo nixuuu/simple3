@@ -135,6 +135,14 @@ admin_compact() {
     curl --fail-with-body -s -X POST "$ENDPOINT/_/compact/$1"
 }
 
+admin_verify() {
+    curl --fail-with-body -s "$ENDPOINT/_/verify/$1"
+}
+
+verify_errors() {
+    admin_verify "$1" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['errors']))"
+}
+
 stats_dead_bytes() {
     admin_stats "$1" | python3 -c "import sys,json; print(json.load(sys.stdin)['total_dead_bytes'])"
 }
@@ -197,6 +205,9 @@ assert_file_eq "$TEST_DATA/fill-a.bin" "$TMP/m2/fill-a.bin" "M2: fill-a.bin inta
 assert_file_eq "$TEST_DATA/fill-b.bin" "$TMP/m2/fill-b.bin" "M2: fill-b.bin intact across segments"
 assert_file_eq "$TEST_DATA/fill-c.bin" "$TMP/m2/fill-c.bin" "M2: fill-c.bin intact in segment 2"
 
+errors=$(verify_errors "$BUCKET")
+assert_eq "$errors" "0" "M2: verify — 0 integrity errors across segments"
+
 # ============================================================
 # M3: Upload seg-overflow.bin → file larger than segment (60 MB > 50 MB)
 # ============================================================
@@ -238,6 +249,9 @@ $AWS s3 cp "s3://$BUCKET/seg-overflow.bin" "$TMP/m4/seg-overflow.bin" --no-progr
 
 assert_file_eq "$TEST_DATA/fill-c.bin" "$TMP/m4/fill-c.bin" "M4: fill-c.bin intact after compacting other segment"
 assert_file_eq "$TEST_DATA/seg-overflow.bin" "$TMP/m4/seg-overflow.bin" "M4: seg-overflow.bin intact after compact"
+
+errors=$(verify_errors "$BUCKET")
+assert_eq "$errors" "0" "M4: verify — 0 integrity errors after delete + compact"
 
 # ============================================================
 # M5: Overwrite fill-c with seg-overflow content, compact
@@ -308,6 +322,9 @@ $AWS s3 cp "$TEST_DATA/fill-a.bin" "s3://$BUCKET/fill-a.bin" --no-progress
 mkdir -p "$TMP/m7"
 $AWS s3 cp "s3://$BUCKET/fill-a.bin" "$TMP/m7/fill-a.bin" --no-progress
 assert_file_eq "$TEST_DATA/fill-a.bin" "$TMP/m7/fill-a.bin" "M7: fill-a.bin works after full wipe + compact"
+
+errors=$(verify_errors "$BUCKET")
+assert_eq "$errors" "0" "M7: verify — 0 integrity errors after full wipe + re-upload"
 
 # ============================================================
 # Summary

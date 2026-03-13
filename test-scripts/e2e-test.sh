@@ -108,6 +108,18 @@ admin_compact() {
     curl --fail-with-body -s -X POST "$ADMIN_URL/_/compact/$1"
 }
 
+admin_verify() {
+    curl --fail-with-body -s "$ADMIN_URL/_/verify/$1"
+}
+
+verify_errors() {
+    admin_verify "$1" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['errors']))"
+}
+
+verify_ok_count() {
+    admin_verify "$1" | python3 -c "import sys,json; print(json.load(sys.stdin)['verified_ok'])"
+}
+
 stats_dead_bytes() {
     admin_stats "$1" | python3 -c "import sys,json; print(json.load(sys.stdin)['total_dead_bytes'])"
 }
@@ -148,6 +160,9 @@ assert_eq "$remote_count" "$local_count" "T1: object count matches local file co
 
 dead=$(stats_dead_bytes "$BUCKET")
 assert_eq "$dead" "0" "T1: dead_bytes == 0 after fresh upload"
+
+errors=$(verify_errors "$BUCKET")
+assert_eq "$errors" "0" "T1: verify — 0 integrity errors after fresh upload"
 
 # ============================================================
 # T2: s3 sync idempotent — re-sync should not create dead bytes
@@ -238,6 +253,9 @@ $AWS s3 sync "s3://$BUCKET/" "$TMP/t8-resync/" --no-progress
 
 assert_manifests_eq "$TEST_DATA" "$TMP/t8-resync" "T8: all files match after re-sync on compacted bucket"
 
+errors=$(verify_errors "$BUCKET")
+assert_eq "$errors" "0" "T8: verify — 0 integrity errors after re-sync on compacted bucket"
+
 # ============================================================
 # T9: s3 sync --exclude — selective copy
 # ============================================================
@@ -283,6 +301,9 @@ assert_eq "$dead" "0" "T10: dead_bytes == 0 after compact"
 
 $AWS s3 cp "s3://$BUCKET/overwrite-test" "$TMP/t10-overwrite.bin" --no-progress
 assert_file_eq "$TEST_DATA/large.bin" "$TMP/t10-overwrite.bin" "T10: overwritten key has new content (large.bin)"
+
+errors=$(verify_errors "$BUCKET")
+assert_eq "$errors" "0" "T10: verify — 0 integrity errors after overwrite + compact"
 
 # ============================================================
 # Summary
