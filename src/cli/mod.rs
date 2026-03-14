@@ -2,9 +2,14 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod admin_auth;
 mod compact;
 pub mod client;
-mod serve;
+pub mod config;
+pub mod keys;
+pub mod policy_cmd;
+pub mod serve;
+pub mod util;
 mod verify;
 
 #[derive(Parser)]
@@ -12,6 +17,10 @@ mod verify;
 pub struct Cli {
     #[arg(long, default_value = "./data", global = true)]
     data_dir: PathBuf,
+
+    /// Path to TOML config file (default: {data_dir}/simple3.toml)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -103,6 +112,20 @@ enum Command {
         #[command(flatten)]
         client: client::ClientArgs,
     },
+    /// Manage access keys
+    Keys {
+        #[command(subcommand)]
+        cmd: keys::KeysCommand,
+        #[command(flatten)]
+        client: client::ClientArgs,
+    },
+    /// Manage IAM policies
+    Policy {
+        #[command(subcommand)]
+        cmd: policy_cmd::PolicyCommand,
+        #[command(flatten)]
+        client: client::ClientArgs,
+    },
     /// Sync files between local filesystem and S3
     Sync {
         /// Source (local path or <s3://bucket/prefix>)
@@ -132,6 +155,8 @@ pub async fn run() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Compact { bucket }) => compact::run(&cli.data_dir, bucket),
         Some(Command::Verify { bucket }) => verify::run(&cli.data_dir, bucket),
+        Some(Command::Keys { cmd, client: args }) => keys::run(args, cmd).await,
+        Some(Command::Policy { cmd, client: args }) => policy_cmd::run(args, cmd).await,
         Some(Command::Mb { uri, client: args }) => {
             let transport = args.build_transport().await?;
             client::mb::run(&*transport, &uri).await
@@ -184,6 +209,7 @@ pub async fn run() -> anyhow::Result<()> {
                 .await
         }
         cmd => {
+            let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir);
             let (host, port, av_interval, av_threshold, max_seg_mb, grpc_port) = match cmd {
                 Some(Command::Serve {
                     host,
@@ -200,7 +226,14 @@ pub async fn run() -> anyhow::Result<()> {
                     max_segment_size_mb,
                     grpc_port,
                 ),
-                _ => ("0.0.0.0".into(), 8080, 300, 0.5, 4096, 50051),
+                _ => (
+                    cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
+                    cfg.server.port.unwrap_or(8080),
+                    cfg.storage.autovacuum_interval.unwrap_or(300),
+                    cfg.storage.autovacuum_threshold.unwrap_or(0.5),
+                    cfg.storage.max_segment_size_mb.unwrap_or(4096),
+                    cfg.server.grpc_port.unwrap_or(50051),
+                ),
             };
             serve::run(
                 &cli.data_dir,

@@ -14,17 +14,43 @@ use super::{BucketEntry, ListResult, ObjectEntry, ObjectHead, Transport};
 const CHUNK_SIZE: usize = 256 * 1024;
 
 pub struct GrpcTransport {
-    client: Simple3Client<tonic::transport::Channel>,
+    client: Simple3Client<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, AuthInterceptor>>,
 }
 
 const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
 
+#[derive(Clone)]
+struct AuthInterceptor {
+    access_key: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    secret_key: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl tonic::service::Interceptor for AuthInterceptor {
+    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(ak) = &self.access_key {
+            request.metadata_mut().insert("x-access-key", ak.clone());
+        }
+        if let Some(sk) = &self.secret_key {
+            request.metadata_mut().insert("x-secret-key", sk.clone());
+        }
+        Ok(request)
+    }
+}
+
 impl GrpcTransport {
-    pub async fn connect(endpoint: &str) -> anyhow::Result<Self> {
+    pub async fn connect(
+        endpoint: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let channel = tonic::transport::Endpoint::from_shared(endpoint.to_owned())?
             .connect()
             .await?;
-        let client = Simple3Client::new(channel)
+        let interceptor = AuthInterceptor {
+            access_key: access_key.and_then(|k| k.parse().ok()),
+            secret_key: secret_key.and_then(|k| k.parse().ok()),
+        };
+        let client = Simple3Client::with_interceptor(channel, interceptor)
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE);
         Ok(Self { client })

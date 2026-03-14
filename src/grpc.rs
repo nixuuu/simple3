@@ -1,13 +1,19 @@
-use std::io::{self, Write};
+use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use md5::{Digest, Md5};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::auth::grpc_auth::{
+    check_grpc_access, extract_credentials, extract_credentials_from_metadata,
+};
+use crate::auth::AuthStore;
+use crate::grpc_helpers::{
+    bulk_get_header, bulk_get_not_found, bulk_put_one_object, map_io_err, meta_to_proto,
+    segments_to_proto, spawn_download_stream, stream_to_tmp, TMP_COUNTER,
+};
 use crate::storage::{BucketStore, Storage};
 
 #[allow(
@@ -28,19 +34,43 @@ use proto::simple3_server::Simple3;
 #[allow(clippy::wildcard_imports)]
 use proto::*;
 
-/// Monotonic counter for unique temp file names.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Chunk size for streaming downloads (256 KB).
-const STREAM_CHUNK_SIZE: u64 = 256 * 1024;
-
 pub struct GrpcService {
     storage: Arc<Storage>,
+    auth_store: Option<Arc<AuthStore>>,
 }
 
 impl GrpcService {
-    pub const fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+    pub const fn new(storage: Arc<Storage>, auth_store: Option<Arc<AuthStore>>) -> Self {
+        Self {
+            storage,
+            auth_store,
+        }
+    }
+
+    fn check_auth<T>(
+        &self,
+        request: &Request<T>,
+        action: &str,
+        resource: &str,
+    ) -> Result<(), Status> {
+        let Some(store) = &self.auth_store else {
+            return Ok(());
+        };
+        let creds = extract_credentials(request)?;
+        check_grpc_access(store, &creds, action, resource)
+    }
+
+    fn check_auth_meta(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        action: &str,
+        resource: &str,
+    ) -> Result<(), Status> {
+        let Some(store) = &self.auth_store else {
+            return Ok(());
+        };
+        let creds = extract_credentials_from_metadata(metadata)?;
+        check_grpc_access(store, &creds, action, resource)
     }
 
     fn bucket(&self, name: &str) -> Result<Arc<BucketStore>, Status> {
@@ -49,223 +79,6 @@ impl GrpcService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(format!("bucket '{name}' not found")))
     }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn map_io_err(e: io::Error) -> Status {
-    match e.kind() {
-        io::ErrorKind::NotFound => Status::not_found(e.to_string()),
-        io::ErrorKind::AlreadyExists => Status::already_exists(e.to_string()),
-        io::ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
-        _ => Status::internal(e.to_string()),
-    }
-}
-
-fn meta_to_proto(key: &str, meta: &crate::types::ObjectMeta) -> ObjectMetadata {
-    ObjectMetadata {
-        key: key.to_owned(),
-        etag: meta.etag.clone(),
-        content_type: meta.content_type.clone().unwrap_or_default(),
-        size: meta.length,
-        last_modified: meta.last_modified,
-        user_metadata: meta.user_metadata.clone(),
-        content_md5: meta.content_md5.clone().unwrap_or_default(),
-    }
-}
-
-fn segments_to_proto(stats: Vec<crate::storage::SegmentStat>) -> Vec<proto::SegmentStat> {
-    stats
-        .into_iter()
-        .map(|s| proto::SegmentStat {
-            id: s.id,
-            size: s.size,
-            dead_bytes: s.dead_bytes,
-        })
-        .collect()
-}
-
-/// Write incoming stream chunks to a temp file, computing MD5.
-async fn stream_to_tmp(
-    stream: &mut Streaming<PutObjectRequest>,
-    tmp_path: &std::path::Path,
-) -> Result<(String, u64), Status> {
-    let path = tmp_path.to_owned();
-    let mut file =
-        std::fs::File::create(&path).map_err(|e| Status::internal(format!("create tmp: {e}")))?;
-    let mut hasher = Md5::new();
-    let mut size = 0u64;
-
-    while let Some(msg) = stream.message().await? {
-        let Some(proto::put_object_request::Request::Data(chunk)) = msg.request else {
-            return Err(Status::invalid_argument(
-                "expected data chunk after init message",
-            ));
-        };
-        file.write_all(&chunk)
-            .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
-        hasher.update(&chunk);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            size += chunk.len() as u64;
-        }
-    }
-    file.flush()
-        .map_err(|e| Status::internal(format!("flush tmp: {e}")))?;
-
-    let etag = format!("{:x}", hasher.finalize());
-    Ok((etag, size))
-}
-
-/// Stream object data in chunks via an mpsc channel.
-#[allow(clippy::needless_pass_by_value)]
-fn spawn_download_stream(
-    store: Arc<BucketStore>,
-    meta: crate::types::ObjectMeta,
-    range_offset: u64,
-    range_len: u64,
-    tx: mpsc::Sender<Result<GetObjectResponse, Status>>,
-) {
-    tokio::spawn(async move {
-        let mut pos = 0u64;
-        while pos < range_len {
-            let chunk_size = (range_len - pos).min(STREAM_CHUNK_SIZE);
-            let s = Arc::clone(&store);
-            let seg_id = meta.segment_id;
-            let offset = range_offset + pos;
-            let data = tokio::task::spawn_blocking(move || s.read_data(seg_id, offset, chunk_size))
-                .await
-                .unwrap_or_else(|e| Err(io::Error::other(format!("task panicked: {e}"))));
-
-            match data {
-                Ok(bytes) => {
-                    let resp = GetObjectResponse {
-                        response: Some(get_object_response::Response::Data(bytes)),
-                    };
-                    if tx.send(Ok(resp)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(map_io_err(e))).await;
-                    break;
-                }
-            }
-            pos += chunk_size;
-        }
-    });
-}
-
-/// Stream chunks for a single object during bulk get.
-async fn stream_object_chunks(
-    store: &Arc<BucketStore>,
-    meta: &crate::types::ObjectMeta,
-    tx: &mpsc::Sender<Result<BulkGetResponse, Status>>,
-) -> bool {
-    let mut pos = 0u64;
-    while pos < meta.length {
-        let chunk_size = (meta.length - pos).min(STREAM_CHUNK_SIZE);
-        let s = Arc::clone(store);
-        let seg_id = meta.segment_id;
-        let offset = meta.offset + pos;
-        let data =
-            tokio::task::spawn_blocking(move || s.read_data(seg_id, offset, chunk_size)).await;
-
-        match data {
-            Ok(Ok(bytes)) => {
-                let resp = BulkGetResponse {
-                    response: Some(bulk_get_response::Response::Data(bytes)),
-                };
-                if tx.send(Ok(resp)).await.is_err() {
-                    return false;
-                }
-            }
-            Ok(Err(e)) => {
-                let _ = tx.send(Err(map_io_err(e))).await;
-                return false;
-            }
-            Err(e) => {
-                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
-                return false;
-            }
-        }
-        pos += chunk_size;
-    }
-    true
-}
-
-/// Process a single object in the bulk put stream.
-async fn bulk_put_one_object(
-    init: &PutObjectInit,
-    stream: &mut Streaming<BulkPutRequest>,
-    store: &Arc<BucketStore>,
-) -> Result<(String, String, u64), Status> {
-    let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = store
-        .bucket_dir()
-        .join(format!(".tmp_grpc_{tmp_id:020}"));
-
-    let mut file = std::fs::File::create(&tmp_path)
-        .map_err(|e| Status::internal(format!("create tmp: {e}")))?;
-    let mut hasher = Md5::new();
-    let mut size = 0u64;
-
-    loop {
-        let msg = match stream.message().await {
-            Ok(Some(m)) => m,
-            Ok(None) => break,
-            Err(e) => {
-                std::fs::remove_file(&tmp_path).ok();
-                return Err(Status::internal(e.to_string()));
-            }
-        };
-
-        match msg.request {
-            Some(bulk_put_request::Request::Data(chunk)) => {
-                if let Err(e) = file.write_all(&chunk) {
-                    std::fs::remove_file(&tmp_path).ok();
-                    return Err(Status::internal(e.to_string()));
-                }
-                hasher.update(&chunk);
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    size += chunk.len() as u64;
-                }
-            }
-            Some(bulk_put_request::Request::Init(_)) => break,
-            None => {}
-        }
-    }
-
-    file.flush().map_err(|e| {
-        std::fs::remove_file(&tmp_path).ok();
-        Status::internal(format!("flush tmp: {e}"))
-    })?;
-
-    let etag = format!("{:x}", hasher.finalize());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-
-    let key = init.key.clone();
-    let content_type = if init.content_type.is_empty() {
-        None
-    } else {
-        Some(init.content_type.clone())
-    };
-    let etag_clone = etag.clone();
-    let metadata = init.user_metadata.clone();
-    let s = Arc::clone(store);
-
-    let meta = tokio::task::spawn_blocking(move || {
-        s.put_object_streamed(&key, &tmp_path, content_type, etag_clone, now, metadata)
-    })
-    .await
-    .map_err(|e| Status::internal(format!("task panicked: {e}")))?
-    .map_err(map_io_err)?;
-
-    let content_md5 = meta.content_md5.unwrap_or_default();
-    Ok((etag, content_md5, size))
 }
 
 type GrpcStream<T> = ReceiverStream<Result<T, Status>>;
@@ -282,7 +95,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<Streaming<PutObjectRequest>>,
     ) -> Result<Response<PutObjectResponse>, Status> {
-        let mut stream = request.into_inner();
+        let (metadata, _, stream) = request.into_parts();
+        let mut stream = stream;
 
         let first = stream
             .message()
@@ -292,8 +106,11 @@ impl Simple3 for GrpcService {
             return Err(Status::invalid_argument("first message must be init"));
         };
 
+        let resource = format!("arn:s3:::{}/{}", init.bucket, init.key);
+        self.check_auth_meta(&metadata, "s3:PutObject", &resource)?;
+
         let store = self.bucket(&init.bucket)?;
-        let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}"));
 
         let (etag, size) = match stream_to_tmp(&mut stream, &tmp_path).await {
@@ -335,6 +152,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
+        let resource = format!("arn:s3:::{}/{}", request.get_ref().bucket, request.get_ref().key);
+        self.check_auth(&request, "s3:GetObject", &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
@@ -376,6 +195,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<HeadObjectResponse>, Status> {
+        let resource = format!("arn:s3:::{}/{}", request.get_ref().bucket, request.get_ref().key);
+        self.check_auth(&request, "s3:GetObject", &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
@@ -395,6 +216,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<DeleteObjectRequest>,
     ) -> Result<Response<DeleteObjectResponse>, Status> {
+        let resource = format!("arn:s3:::{}/{}", request.get_ref().bucket, request.get_ref().key);
+        self.check_auth(&request, "s3:DeleteObject", &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
@@ -411,6 +234,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<DeleteObjectsRequest>,
     ) -> Result<Response<DeleteObjectsResponse>, Status> {
+        let resource = format!("arn:s3:::{}/*", request.get_ref().bucket);
+        self.check_auth(&request, "s3:DeleteObject", &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
@@ -439,6 +264,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:ListBucket", &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
@@ -510,6 +337,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<BulkGetRequest>,
     ) -> Result<Response<Self::BulkGetStream>, Status> {
+        let resource = format!("arn:s3:::{}/*", request.get_ref().bucket);
+        self.check_auth(&request, "s3:GetObject", &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
         let keys = input.keys;
@@ -526,16 +355,7 @@ impl Simple3 for GrpcService {
                 let meta = match meta_result {
                     Ok(Ok(Some(m))) => m,
                     Ok(Ok(None)) => {
-                        let header = BulkGetResponse {
-                            response: Some(bulk_get_response::Response::ObjectStart(
-                                BulkGetObjectStart {
-                                    key,
-                                    metadata: None,
-                                    not_found: true,
-                                },
-                            )),
-                        };
-                        if tx.send(Ok(header)).await.is_err() {
+                        if tx.send(Ok(bulk_get_not_found(key))).await.is_err() {
                             return;
                         }
                         continue;
@@ -550,20 +370,11 @@ impl Simple3 for GrpcService {
                     }
                 };
 
-                let header = BulkGetResponse {
-                    response: Some(bulk_get_response::Response::ObjectStart(
-                        BulkGetObjectStart {
-                            key: key.clone(),
-                            metadata: Some(meta_to_proto(&key, &meta)),
-                            not_found: false,
-                        },
-                    )),
-                };
-                if tx.send(Ok(header)).await.is_err() {
+                if tx.send(Ok(bulk_get_header(&key, &meta))).await.is_err() {
                     return;
                 }
 
-                if !stream_object_chunks(&store, &meta, &tx).await {
+                if !crate::grpc_helpers::stream_object_chunks(&store, &meta, &tx).await {
                     return;
                 }
             }
@@ -578,7 +389,11 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<Streaming<BulkPutRequest>>,
     ) -> Result<Response<Self::BulkPutStream>, Status> {
-        let mut stream = request.into_inner();
+        // For bulk_put we check auth at the request level with a wildcard resource
+        // since we don't know buckets/keys until we read the stream
+        let (metadata, _, stream) = request.into_parts();
+        self.check_auth_meta(&metadata, "s3:PutObject", "arn:s3:::*")?;
+        let mut stream = stream;
         let storage = Arc::clone(&self.storage);
 
         let (tx, rx) = mpsc::channel(8);
@@ -649,6 +464,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<CreateBucketRequest>,
     ) -> Result<Response<CreateBucketResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().name);
+        self.check_auth(&request, "s3:CreateBucket", &resource)?;
         let name = request.into_inner().name;
         let storage = Arc::clone(&self.storage);
         let existed = tokio::task::spawn_blocking(move || storage.create_bucket(&name))
@@ -665,6 +482,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<DeleteBucketRequest>,
     ) -> Result<Response<DeleteBucketResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().name);
+        self.check_auth(&request, "s3:DeleteBucket", &resource)?;
         let name = request.into_inner().name;
         let store = self.bucket(&name)?;
         let storage = Arc::clone(&self.storage);
@@ -692,8 +511,9 @@ impl Simple3 for GrpcService {
 
     async fn list_buckets(
         &self,
-        _request: Request<ListBucketsRequest>,
+        request: Request<ListBucketsRequest>,
     ) -> Result<Response<ListBucketsResponse>, Status> {
+        self.check_auth(&request, "s3:ListAllMyBuckets", "arn:s3:::*")?;
         let storage = Arc::clone(&self.storage);
         let buckets = tokio::task::spawn_blocking(move || storage.list_buckets())
             .await
@@ -711,6 +531,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<StatsRequest>,
     ) -> Result<Response<StatsResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "admin:Stats", &resource)?;
         let bucket = request.into_inner().bucket;
         let store = self.bucket(&bucket)?;
 
@@ -734,6 +556,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<CompactRequest>,
     ) -> Result<Response<CompactResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "admin:Compact", &resource)?;
         let bucket = request.into_inner().bucket;
         let store = self.bucket(&bucket)?;
 
@@ -766,6 +590,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<VerifyRequest>,
     ) -> Result<Response<VerifyResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "admin:Verify", &resource)?;
         let bucket = request.into_inner().bucket;
         let store = self.bucket(&bucket)?;
 

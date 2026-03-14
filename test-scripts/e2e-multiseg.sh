@@ -11,12 +11,9 @@ TEST_DATA="$PROJECT_DIR/test-data"
 DATA_DIR="$(mktemp -d)"
 TMP="$(mktemp -d)"
 SERVER_PID=""
+SERVER_LOG=""
 
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
 export AWS_DEFAULT_REGION=us-east-1
-
-AWS="aws --endpoint-url $ENDPOINT"
 
 # === Generate test data if missing ===
 bash "$SCRIPT_DIR/generate-test-data.sh" "$TEST_DATA"
@@ -27,19 +24,30 @@ FAILED=0
 # === Server lifecycle ===
 start_server() {
     cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml" --quiet
+    SERVER_LOG="$TMP/server.log"
     RUST_LOG=warn "$PROJECT_DIR/target/release/simple3" \
         --data-dir "$DATA_DIR" \
-        serve --port "$PORT" --autovacuum-interval 0 --max-segment-size-mb 50 &
+        serve --port "$PORT" --grpc-port 0 --autovacuum-interval 0 --max-segment-size-mb 50 \
+        2>"$SERVER_LOG" &
     SERVER_PID=$!
-    # Wait for server to be ready
-    for i in $(seq 1 30); do
-        if curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT/_/stats/nonexistent" 2>/dev/null | grep -q '404'; then
-            return 0
+    for _ in $(seq 1 30); do
+        if curl -s -o /dev/null "$ENDPOINT/" 2>/dev/null; then
+            break
         fi
         sleep 0.2
     done
-    echo "ERROR: server did not start within 6 seconds"
-    exit 1
+    # Extract bootstrapped admin credentials
+    local ak sk
+    ak=$(grep "Access Key ID:" "$SERVER_LOG" | awk '{print $NF}')
+    sk=$(grep "Secret Key:" "$SERVER_LOG" | awk '{print $NF}')
+    if [ -n "$ak" ] && [ -n "$sk" ]; then
+        export AWS_ACCESS_KEY_ID="$ak"
+        export AWS_SECRET_ACCESS_KEY="$sk"
+    else
+        echo "ERROR: could not extract admin credentials from server log"
+        cat "$SERVER_LOG"
+        exit 1
+    fi
 }
 
 stop_server() {
@@ -127,16 +135,20 @@ assert_manifests_eq() {
     fi
 }
 
+admin_auth_header() {
+    echo "Authorization: Bearer ${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
+}
+
 admin_stats() {
-    curl --fail-with-body -s "$ENDPOINT/_/stats/$1"
+    curl --fail-with-body -s -H "$(admin_auth_header)" "$ENDPOINT/_/stats/$1"
 }
 
 admin_compact() {
-    curl --fail-with-body -s -X POST "$ENDPOINT/_/compact/$1"
+    curl --fail-with-body -s -X POST -H "$(admin_auth_header)" "$ENDPOINT/_/compact/$1"
 }
 
 admin_verify() {
-    curl --fail-with-body -s "$ENDPOINT/_/verify/$1"
+    curl --fail-with-body -s -H "$(admin_auth_header)" "$ENDPOINT/_/verify/$1"
 }
 
 verify_errors() {
@@ -164,8 +176,10 @@ echo ""
 
 start_server
 echo "server started on port $PORT (PID $SERVER_PID)"
+echo "credentials: $AWS_ACCESS_KEY_ID"
 echo ""
 
+AWS="aws --endpoint-url $ENDPOINT"
 $AWS s3 mb "s3://$BUCKET" 2>/dev/null || true
 
 # ============================================================

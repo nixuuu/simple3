@@ -11,9 +11,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TEST_DATA="$PROJECT_DIR/test-data"
 TMP="$(mktemp -d)"
 
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
 AWS="aws --endpoint-url $ENDPOINT"
 
@@ -100,16 +100,20 @@ object_count() {
     $AWS s3 ls "s3://$1/" --recursive 2>/dev/null | wc -l | tr -d ' '
 }
 
+admin_auth_header() {
+    echo "Authorization: Bearer ${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
+}
+
 admin_stats() {
-    curl --fail-with-body -s "$ADMIN_URL/_/stats/$1"
+    curl --fail-with-body -s -H "$(admin_auth_header)" "$ADMIN_URL/_/stats/$1"
 }
 
 admin_compact() {
-    curl --fail-with-body -s -X POST "$ADMIN_URL/_/compact/$1"
+    curl --fail-with-body -s -X POST -H "$(admin_auth_header)" "$ADMIN_URL/_/compact/$1"
 }
 
 admin_verify() {
-    curl --fail-with-body -s "$ADMIN_URL/_/verify/$1"
+    curl --fail-with-body -s -H "$(admin_auth_header)" "$ADMIN_URL/_/verify/$1"
 }
 
 verify_errors() {

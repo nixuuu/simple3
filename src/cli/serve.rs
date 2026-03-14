@@ -5,11 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
-use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use serde::Serialize;
 use tokio::net::TcpListener;
 
+use simple3::auth::s3_auth::AuthProvider;
+use simple3::auth::types::BootstrapResult;
+use simple3::auth::AuthStore;
 use simple3::s3impl::SimpleStorage;
 use simple3::storage::Storage;
 
@@ -80,6 +82,7 @@ struct SegmentStatJson {
 struct AdminService {
     s3: S3Service,
     storage: Arc<Storage>,
+    auth_store: Arc<AuthStore>,
 }
 
 type ServiceFuture =
@@ -91,16 +94,24 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
     type Future = ServiceFuture;
 
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
-        if req.uri().path().starts_with("/_/") {
+        let path = req.uri().path().to_owned();
+        if path.starts_with("/_/keys") || path.starts_with("/_/policies") {
+            let auth_store = Arc::clone(&self.auth_store);
+            let method = req.method().clone();
+            Box::pin(async move {
+                Ok(super::admin_auth::handle_admin_auth(req, &path, &method, auth_store).await)
+            })
+        } else if path.starts_with("/_/") {
             let storage = Arc::clone(&self.storage);
-            Box::pin(async move { Ok(handle_admin(req, storage).await) })
+            let auth_store = Arc::clone(&self.auth_store);
+            Box::pin(async move { Ok(handle_admin(req, storage, auth_store).await) })
         } else {
             hyper::service::Service::call(&self.s3, req)
         }
     }
 }
 
-fn json_response(status: u16, body: &impl Serialize) -> s3s::HttpResponse {
+pub fn json_response(status: u16, body: &impl Serialize) -> s3s::HttpResponse {
     let json = serde_json::to_string(body).unwrap_or_else(|e| format!(r#"{{"error":"{e}"}}"#));
     hyper::Response::builder()
         .status(status)
@@ -123,6 +134,7 @@ fn stats_to_json(stats: &[simple3::storage::SegmentStat]) -> Vec<SegmentStatJson
 async fn handle_admin(
     req: hyper::Request<hyper::body::Incoming>,
     storage: Arc<Storage>,
+    _auth_store: Arc<AuthStore>,
 ) -> s3s::HttpResponse {
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
@@ -217,6 +229,22 @@ pub async fn run(
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
     let s3 = SimpleStorage::new(Arc::clone(&storage));
 
+    // Open auth database and bootstrap root key if needed
+    let (auth_store, bootstrap) = AuthStore::open(data_dir)?;
+    let auth_store = Arc::new(auth_store);
+    if let BootstrapResult::NewRootKey {
+        access_key_id,
+        secret_key,
+    } = bootstrap
+    {
+        eprintln!("================================================================");
+        eprintln!("  root admin key created (save this, it won't be shown again):");
+        eprintln!();
+        eprintln!("  Access Key ID: {access_key_id}");
+        eprintln!("  Secret Key:    {secret_key}");
+        eprintln!("================================================================");
+    }
+
     if autovacuum_interval > 0 {
         let av_storage = Arc::clone(&storage);
         let interval = Duration::from_secs(autovacuum_interval);
@@ -239,17 +267,21 @@ pub async fn run(
         );
     }
 
+    let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
     let mut builder = S3ServiceBuilder::new(s3);
-    builder.set_auth(SimpleAuth::from_single("test", "test"));
+    builder.set_auth(auth_provider.clone());
+    builder.set_access(auth_provider);
     let s3_service = builder.build();
 
     let service = AdminService {
         s3: s3_service,
         storage: Arc::clone(&storage),
+        auth_store: Arc::clone(&auth_store),
     };
 
     if grpc_port > 0 {
-        let grpc_svc = simple3::grpc::GrpcService::new(Arc::clone(&storage));
+        let grpc_svc =
+            simple3::grpc::GrpcService::new(Arc::clone(&storage), Some(Arc::clone(&auth_store)));
         let grpc_addr: std::net::SocketAddr = format!("{host}:{grpc_port}").parse()?;
         tokio::spawn(async move {
             if let Err(e) = tonic::transport::Server::builder()

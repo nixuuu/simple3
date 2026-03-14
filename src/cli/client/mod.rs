@@ -49,7 +49,10 @@ impl ClientArgs {
             let endpoint = self
                 .endpoint_url
                 .unwrap_or_else(|| "http://localhost:50051".into());
-            let transport = grpc::GrpcTransport::connect(&endpoint).await?;
+            let access_key = self.access_key.as_deref().or(Some("test"));
+            let secret_key = self.secret_key.as_deref().or(Some("test"));
+            let transport =
+                grpc::GrpcTransport::connect(&endpoint, access_key, secret_key).await?;
             Ok(Arc::new(transport))
         } else {
             let endpoint = self
