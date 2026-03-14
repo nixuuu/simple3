@@ -86,6 +86,9 @@ enum Command {
         /// Copy directories recursively
         #[arg(long)]
         recursive: bool,
+        /// Number of concurrent transfers
+        #[arg(long, short = 'j', default_value_t = 5)]
+        concurrency: usize,
         #[command(flatten)]
         client: client::ClientArgs,
     },
@@ -115,6 +118,9 @@ enum Command {
         /// Compare by size only, ignore timestamps
         #[arg(long)]
         size_only: bool,
+        /// Number of concurrent transfers
+        #[arg(long, short = 'j', default_value_t = 5)]
+        concurrency: usize,
         #[command(flatten)]
         client: client::ClientArgs,
     },
@@ -158,10 +164,11 @@ pub async fn run() -> anyhow::Result<()> {
             src,
             dest,
             recursive,
+            concurrency,
             client: args,
         }) => {
             let transport = args.build_transport().await?;
-            client::cp::run(&*transport, &src, &dest, recursive).await
+            client::cp::run(&*transport, &src, &dest, recursive, concurrency).await
         }
         Some(Command::Sync {
             src,
@@ -169,10 +176,12 @@ pub async fn run() -> anyhow::Result<()> {
             delete,
             dryrun,
             size_only,
+            concurrency,
             client: args,
         }) => {
             let transport = args.build_transport().await?;
-            client::sync_cmd::run(&*transport, &src, &dest, delete, dryrun, size_only).await
+            client::sync_cmd::run(&*transport, &src, &dest, delete, dryrun, size_only, concurrency)
+                .await
         }
         cmd => {
             let (host, port, av_interval, av_threshold, max_seg_mb, grpc_port) = match cmd {

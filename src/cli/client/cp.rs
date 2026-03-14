@@ -1,4 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use futures::StreamExt;
 
 use super::progress::count_bar;
 use super::{is_s3_uri, list_all_objects, S3Uri, Transport};
@@ -8,14 +11,15 @@ pub async fn run(
     src: &str,
     dest: &str,
     recursive: bool,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let src_s3 = is_s3_uri(src);
     let dest_s3 = is_s3_uri(dest);
 
     match (src_s3, dest_s3) {
-        (false, true) => upload(transport, src, dest, recursive).await,
-        (true, false) => download(transport, src, dest, recursive).await,
-        (true, true) => copy_s3_to_s3(transport, src, dest, recursive).await,
+        (false, true) => upload(transport, src, dest, recursive, concurrency).await,
+        (true, false) => download(transport, src, dest, recursive, concurrency).await,
+        (true, true) => copy_s3_to_s3(transport, src, dest, recursive, concurrency).await,
         (false, false) => anyhow::bail!("at least one path must be an s3:// URI"),
     }
 }
@@ -25,6 +29,7 @@ async fn upload(
     src: &str,
     dest: &str,
     recursive: bool,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let parsed = S3Uri::parse(dest)?;
     let bucket = parsed.bucket();
@@ -51,8 +56,10 @@ async fn upload(
 
     let entries = collect_local_files(src_path);
     let pb = count_bar(entries.len() as u64, "upload");
-    let mut errors = 0u64;
-    for (rel_key, full_path) in &entries {
+    let errors = AtomicU64::new(0);
+    futures::stream::iter(entries.iter().map(|(rel_key, full_path)| {
+        let pb = &pb;
+        let errors = &errors;
         let key = if dest_prefix.is_empty() {
             rel_key.clone()
         } else {
@@ -61,19 +68,24 @@ async fn upload(
         let ct = mime_guess::from_path(full_path)
             .first_raw()
             .unwrap_or("application/octet-stream");
-        pb.set_message(rel_key.clone());
-        if let Err(e) = transport.put_object(bucket, &key, full_path, Some(ct)).await {
-            pb.suspend(|| eprintln!("ERROR {rel_key}: {e}"));
-            errors += 1;
+        async move {
+            if let Err(e) = transport.put_object(bucket, &key, full_path, Some(ct)).await {
+                pb.suspend(|| eprintln!("ERROR {rel_key}: {e}"));
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
+            pb.inc(1);
         }
-        pb.inc(1);
-    }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<()>>()
+    .await;
     pb.finish_and_clear();
+    let err_count = errors.load(Ordering::Relaxed);
     #[allow(clippy::cast_possible_truncation)]
-    let succeeded = entries.len() - errors as usize;
-    println!("upload: {succeeded} files, {errors} errors");
-    if errors > 0 {
-        anyhow::bail!("{errors} upload(s) failed");
+    let succeeded = entries.len() - err_count as usize;
+    println!("upload: {succeeded} files, {err_count} errors");
+    if err_count > 0 {
+        anyhow::bail!("{err_count} upload(s) failed");
     }
     Ok(())
 }
@@ -83,6 +95,7 @@ async fn download(
     src: &str,
     dest: &str,
     recursive: bool,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let parsed = S3Uri::parse(src)?;
     let bucket = parsed.bucket();
@@ -108,27 +121,35 @@ async fn download(
     let objects = list_all_objects(transport, bucket, src_prefix).await?;
     let prefix_strip = src_prefix.unwrap_or_default();
     let pb = count_bar(objects.len() as u64, "download");
-    let mut errors = 0u64;
-    for obj in &objects {
+    let errors = AtomicU64::new(0);
+    futures::stream::iter(objects.iter().map(|obj| {
+        let pb = &pb;
+        let errors = &errors;
         let rel = obj.key.strip_prefix(prefix_strip).unwrap_or(&obj.key);
         let rel = rel.strip_prefix('/').unwrap_or(rel);
         let target = dest_path.join(rel);
-        pb.set_message(rel.to_owned());
-        if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        let obj_key = &obj.key;
+        async move {
+            if let Some(parent) = target.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if let Err(e) = transport.get_object(bucket, obj_key, &target).await {
+                pb.suspend(|| eprintln!("ERROR {obj_key}: {e}"));
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
+            pb.inc(1);
         }
-        if let Err(e) = transport.get_object(bucket, &obj.key, &target).await {
-            pb.suspend(|| eprintln!("ERROR {}: {e}", obj.key));
-            errors += 1;
-        }
-        pb.inc(1);
-    }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<()>>()
+    .await;
     pb.finish_and_clear();
+    let err_count = errors.load(Ordering::Relaxed);
     #[allow(clippy::cast_possible_truncation)]
-    let succeeded = objects.len() - errors as usize;
-    println!("download: {succeeded} files, {errors} errors");
-    if errors > 0 {
-        anyhow::bail!("{errors} download(s) failed");
+    let succeeded = objects.len() - err_count as usize;
+    println!("download: {succeeded} files, {err_count} errors");
+    if err_count > 0 {
+        anyhow::bail!("{err_count} download(s) failed");
     }
     Ok(())
 }
@@ -138,6 +159,7 @@ async fn copy_s3_to_s3(
     src: &str,
     dest: &str,
     recursive: bool,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let src_parsed = S3Uri::parse(src)?;
     let dest_parsed = S3Uri::parse(dest)?;
@@ -166,8 +188,10 @@ async fn copy_s3_to_s3(
     let objects = list_all_objects(transport, src_bucket, src_prefix).await?;
     let prefix_strip = src_prefix.unwrap_or_default();
     let pb = count_bar(objects.len() as u64, "copy");
-    let mut errors = 0u64;
-    for obj in &objects {
+    let errors = AtomicU64::new(0);
+    futures::stream::iter(objects.iter().map(|obj| {
+        let pb = &pb;
+        let errors = &errors;
         let rel = obj.key.strip_prefix(prefix_strip).unwrap_or(&obj.key);
         let rel = rel.strip_prefix('/').unwrap_or(rel);
         let dest_key = if dest_prefix.is_empty() {
@@ -175,31 +199,40 @@ async fn copy_s3_to_s3(
         } else {
             format!("{}/{rel}", dest_prefix.trim_end_matches('/'))
         };
-        pb.set_message(rel.to_owned());
-        let tmp = tempfile::NamedTempFile::new()?;
-        match transport.get_object(src_bucket, &obj.key, tmp.path()).await {
-            Ok(_) => {
-                if let Err(e) = transport
-                    .put_object(dest_bucket, &dest_key, tmp.path(), None)
-                    .await
-                {
-                    pb.suspend(|| eprintln!("ERROR put {dest_key}: {e}"));
-                    errors += 1;
+        async move {
+            let Ok(tmp) = tempfile::NamedTempFile::new() else {
+                errors.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                return;
+            };
+            match transport.get_object(src_bucket, &obj.key, tmp.path()).await {
+                Ok(_) => {
+                    if let Err(e) = transport
+                        .put_object(dest_bucket, &dest_key, tmp.path(), None)
+                        .await
+                    {
+                        pb.suspend(|| eprintln!("ERROR put {dest_key}: {e}"));
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    pb.suspend(|| eprintln!("ERROR get {}: {e}", obj.key));
+                    errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Err(e) => {
-                pb.suspend(|| eprintln!("ERROR get {}: {e}", obj.key));
-                errors += 1;
-            }
+            pb.inc(1);
         }
-        pb.inc(1);
-    }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<()>>()
+    .await;
     pb.finish_and_clear();
+    let err_count = errors.load(Ordering::Relaxed);
     #[allow(clippy::cast_possible_truncation)]
-    let succeeded = objects.len() - errors as usize;
-    println!("copy: {succeeded} files, {errors} errors");
-    if errors > 0 {
-        anyhow::bail!("{errors} copy(s) failed");
+    let succeeded = objects.len() - err_count as usize;
+    println!("copy: {succeeded} files, {err_count} errors");
+    if err_count > 0 {
+        anyhow::bail!("{err_count} copy(s) failed");
     }
     Ok(())
 }

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use futures::StreamExt;
 
 use super::progress::count_bar;
 use super::{is_s3_uri, list_all_objects, S3Uri, Transport};
@@ -11,14 +14,21 @@ pub async fn run(
     delete: bool,
     dryrun: bool,
     size_only: bool,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let src_s3 = is_s3_uri(src);
     let dest_s3 = is_s3_uri(dest);
 
     match (src_s3, dest_s3) {
-        (false, true) => sync_up(transport, src, dest, delete, dryrun, size_only).await,
-        (true, false) => sync_down(transport, src, dest, delete, dryrun, size_only).await,
-        (true, true) => sync_s3(transport, src, dest, delete, dryrun, size_only).await,
+        (false, true) => {
+            sync_up(transport, src, dest, delete, dryrun, size_only, concurrency).await
+        }
+        (true, false) => {
+            sync_down(transport, src, dest, delete, dryrun, size_only, concurrency).await
+        }
+        (true, true) => {
+            sync_s3(transport, src, dest, delete, dryrun, size_only, concurrency).await
+        }
         (false, false) => anyhow::bail!("at least one path must be an s3:// URI"),
     }
 }
@@ -100,6 +110,7 @@ async fn sync_up(
     delete: bool,
     dryrun: bool,
     size_only: bool,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let parsed = S3Uri::parse(dest)?;
     let bucket = parsed.bucket();
@@ -128,7 +139,7 @@ async fn sync_up(
         return Ok(());
     }
 
-    exec_uploads(transport, bucket, prefix, src_path, &to_upload).await?;
+    exec_uploads(transport, bucket, prefix, src_path, &to_upload, concurrency).await?;
     exec_remote_deletes(transport, bucket, prefix, &to_delete).await?;
     Ok(())
 }
@@ -141,6 +152,7 @@ async fn sync_down(
     delete: bool,
     dryrun: bool,
     size_only: bool,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let parsed = S3Uri::parse(src)?;
     let bucket = parsed.bucket();
@@ -173,7 +185,7 @@ async fn sync_down(
         return Ok(());
     }
 
-    exec_downloads(transport, bucket, prefix, dest_path, &to_download).await?;
+    exec_downloads(transport, bucket, prefix, dest_path, &to_download, concurrency).await?;
     exec_local_deletes(dest_path, &to_delete).await?;
     Ok(())
 }
@@ -186,6 +198,7 @@ async fn sync_s3(
     delete: bool,
     dryrun: bool,
     size_only: bool,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let src_parsed = S3Uri::parse(src)?;
     let dest_parsed = S3Uri::parse(dest)?;
@@ -217,20 +230,45 @@ async fn sync_s3(
     }
 
     let pb = count_bar(to_copy.len() as u64, "sync");
-    for key in &to_copy {
+    let errors = AtomicU64::new(0);
+    futures::stream::iter(to_copy.iter().map(|key| {
+        let pb = &pb;
+        let errors = &errors;
         let src_key = make_full_key(src_prefix, key);
         let dest_key = make_full_key(dest_prefix, key);
-        pb.set_message(key.clone());
-        let tmp = tempfile::NamedTempFile::new()?;
-        transport
-            .get_object(src_bucket, &src_key, tmp.path())
-            .await?;
-        transport
-            .put_object(dest_bucket, &dest_key, tmp.path(), None)
-            .await?;
-        pb.inc(1);
-    }
+        async move {
+            let Ok(tmp) = tempfile::NamedTempFile::new() else {
+                errors.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                return;
+            };
+            match transport.get_object(src_bucket, &src_key, tmp.path()).await {
+                Ok(_) => {
+                    if let Err(e) = transport
+                        .put_object(dest_bucket, &dest_key, tmp.path(), None)
+                        .await
+                    {
+                        pb.suspend(|| eprintln!("ERROR put {dest_key}: {e}"));
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    pb.suspend(|| eprintln!("ERROR get {src_key}: {e}"));
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            pb.inc(1);
+        }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<()>>()
+    .await;
     pb.finish_and_clear();
+
+    let err_count = errors.load(Ordering::Relaxed);
+    if err_count > 0 {
+        anyhow::bail!("{err_count} copy(s) failed");
+    }
 
     if !to_delete.is_empty() {
         let full_keys: Vec<String> = to_delete
@@ -292,21 +330,37 @@ async fn exec_uploads(
     prefix: &str,
     src_root: &Path,
     keys: &[String],
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let pb = count_bar(keys.len() as u64, "upload");
-    for key in keys {
+    let errors = AtomicU64::new(0);
+    futures::stream::iter(keys.iter().map(|key| {
+        let pb = &pb;
+        let errors = &errors;
         let full_key = make_full_key(prefix, key);
         let local_path = src_root.join(key);
         let ct = mime_guess::from_path(&local_path)
             .first_raw()
             .unwrap_or("application/octet-stream");
-        pb.set_message(key.clone());
-        transport
-            .put_object(bucket, &full_key, &local_path, Some(ct))
-            .await?;
-        pb.inc(1);
-    }
+        async move {
+            if let Err(e) = transport
+                .put_object(bucket, &full_key, &local_path, Some(ct))
+                .await
+            {
+                pb.suspend(|| eprintln!("ERROR {key}: {e}"));
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
+            pb.inc(1);
+        }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<()>>()
+    .await;
     pb.finish_and_clear();
+    let err_count = errors.load(Ordering::Relaxed);
+    if err_count > 0 {
+        anyhow::bail!("{err_count} upload(s) failed");
+    }
     Ok(())
 }
 
@@ -316,21 +370,37 @@ async fn exec_downloads(
     prefix: &str,
     dest_root: &Path,
     keys: &[String],
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     let pb = count_bar(keys.len() as u64, "download");
-    for key in keys {
+    let errors = AtomicU64::new(0);
+    futures::stream::iter(keys.iter().map(|key| {
+        let pb = &pb;
+        let errors = &errors;
         let full_key = make_full_key(prefix, key);
         let local_path = dest_root.join(key);
-        if let Some(parent) = local_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        async move {
+            if let Some(parent) = local_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if let Err(e) = transport
+                .get_object(bucket, &full_key, &local_path)
+                .await
+            {
+                pb.suspend(|| eprintln!("ERROR {key}: {e}"));
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
+            pb.inc(1);
         }
-        pb.set_message(key.clone());
-        transport
-            .get_object(bucket, &full_key, &local_path)
-            .await?;
-        pb.inc(1);
-    }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<()>>()
+    .await;
     pb.finish_and_clear();
+    let err_count = errors.load(Ordering::Relaxed);
+    if err_count > 0 {
+        anyhow::bail!("{err_count} download(s) failed");
+    }
     Ok(())
 }
 
