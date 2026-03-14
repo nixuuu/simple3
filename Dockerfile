@@ -8,6 +8,7 @@ COPY src/ src/
 COPY build.rs ./
 COPY proto/ proto/
 COPY .cargo/ .cargo/
+RUN mkdir -p benches && touch benches/storage_bench.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -19,10 +20,14 @@ COPY .cargo/ .cargo/
 COPY --from=planner /app/recipe.json recipe.json
 COPY build.rs ./
 COPY proto/ proto/
+RUN mkdir -p benches && touch benches/storage_bench.rs
 RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY proto/ proto/
 COPY src/ src/
+RUN mkdir -p benches && touch benches/storage_bench.rs
 RUN cargo build --release --bin simple3
 
 FROM debian:bookworm-slim AS runtime
