@@ -1,4 +1,7 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+};
+use std::time::Duration;
 use simple3::storage::Storage;
 use simple3::types::ObjectMeta;
 use std::collections::HashMap;
@@ -161,6 +164,7 @@ fn bench_list(c: &mut Criterion) {
 
 fn bench_delete(c: &mut Criterion) {
     let mut group = c.benchmark_group("delete");
+    group.measurement_time(Duration::from_secs(10));
 
     let cases: &[(&str, usize, usize, usize)] = &[
         ("among_1k", 1_000, KB, 30),
@@ -225,6 +229,7 @@ fn bench_overwrite(c: &mut Criterion) {
 fn bench_compact(c: &mut Criterion) {
     let mut group = c.benchmark_group("compact");
     group.sample_size(10);
+    group.measurement_time(Duration::from_secs(60));
 
     let cases: &[(&str, usize, usize)] = &[
         ("1k_x_1kb", 1_000, KB),
@@ -260,6 +265,7 @@ fn bench_compact(c: &mut Criterion) {
 fn bench_concurrent(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent");
     group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
 
     // 8 threads reading 1KB objects from 10K store
     {

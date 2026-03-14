@@ -4,6 +4,36 @@ S3-compatible storage server in Rust. Single binary, embedded database, no exter
 
 Uses segmented append-only data files with [redb](https://github.com/cberner/redb) for metadata indexing. Exposes an S3-compatible HTTP API and a gRPC API. Ships with a CLI client that accepts AWS environment variables.
 
+## Performance
+
+> Raw storage engine throughput — no network overhead. Measured with [Criterion](https://github.com/bheisler/criterion.rs) on a Hetzner EX130-R (Intel Xeon Gold 5412U 24-core, 256 GB DDR5 ECC, NVMe SSD).
+
+| Operation | Latency | Throughput |
+|-----------|--------:|-----------:|
+| **Write** 1 KB | 70 µs | 14 MiB/s |
+| **Write** 10 KB | 77 µs | 127 MiB/s |
+| **Write** 1 MB | 588 µs | 1.66 GiB/s |
+| **Write** 10 MB | 4.8 ms | 2.03 GiB/s |
+| **Write** 100 MB | 59 ms | 1.65 GiB/s |
+| **Read** 1 KB | 1.7 µs | 572 MiB/s |
+| **Read** 10 KB | 2.6 µs | 3.65 GiB/s |
+| **Read** 1 MB | 195 µs | 5.0 GiB/s |
+| **Read** 10 MB | 2.1 ms | 4.7 GiB/s |
+| **List** 10K objects | 3.4 ms | — |
+| **List** 50K objects | 17 ms | — |
+| **Delete** among 10K | 2.3 ms | — |
+| **Compact** 1K × 1 MB | 2.8 s | 321 MiB/s |
+
+**Concurrent (8 threads, 100 ops/thread):**
+
+| Workload | Latency | Throughput |
+|----------|--------:|-----------:|
+| 8× GET 1 KB | 3.2 ms | 253 MiB/s |
+| 8× GET 1 MB | 33 ms | 2.4 GiB/s |
+| 8× PUT 1 KB | 66 ms | 12 MiB/s |
+| 8× PUT 10 KB | 76 ms | 103 MiB/s |
+| Mixed 4R+4W 10 KB | 21 ms | 183 MiB/s |
+
 ## Features
 
 - S3-compatible HTTP API, works with AWS CLI and any S3 client
