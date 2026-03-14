@@ -168,7 +168,7 @@ pub async fn run() -> anyhow::Result<()> {
             client: args,
         }) => {
             let transport = args.build_transport().await?;
-            client::cp::run(&*transport, &src, &dest, recursive, concurrency).await
+            client::cp::run(transport, &src, &dest, recursive, concurrency).await
         }
         Some(Command::Sync {
             src,
@@ -180,7 +180,7 @@ pub async fn run() -> anyhow::Result<()> {
             client: args,
         }) => {
             let transport = args.build_transport().await?;
-            client::sync_cmd::run(&*transport, &src, &dest, delete, dryrun, size_only, concurrency)
+            client::sync_cmd::run(transport, &src, &dest, delete, dryrun, size_only, concurrency)
                 .await
         }
         cmd => {

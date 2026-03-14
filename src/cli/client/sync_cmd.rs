@@ -1,14 +1,15 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use futures::StreamExt;
+use tokio::sync::Semaphore;
 
 use super::progress::count_bar;
 use super::{is_s3_uri, list_all_objects, S3Uri, Transport};
 
 pub async fn run(
-    transport: &dyn Transport,
+    transport: Arc<dyn Transport>,
     src: &str,
     dest: &str,
     delete: bool,
@@ -21,13 +22,13 @@ pub async fn run(
 
     match (src_s3, dest_s3) {
         (false, true) => {
-            sync_up(transport, src, dest, delete, dryrun, size_only, concurrency).await
+            sync_up(&transport, src, dest, delete, dryrun, size_only, concurrency).await
         }
         (true, false) => {
-            sync_down(transport, src, dest, delete, dryrun, size_only, concurrency).await
+            sync_down(&transport, src, dest, delete, dryrun, size_only, concurrency).await
         }
         (true, true) => {
-            sync_s3(transport, src, dest, delete, dryrun, size_only, concurrency).await
+            sync_s3(&transport, src, dest, delete, dryrun, size_only, concurrency).await
         }
         (false, false) => anyhow::bail!("at least one path must be an s3:// URI"),
     }
@@ -104,7 +105,7 @@ const fn needs_sync(src: &FileMeta, dest: &FileMeta, size_only: bool) -> bool {
 
 /// local -> S3
 async fn sync_up(
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
     src: &str,
     dest: &str,
     delete: bool,
@@ -118,7 +119,7 @@ async fn sync_up(
     let src_path = Path::new(src);
 
     let local = local_manifest(src_path)?;
-    let remote = remote_manifest(transport, bucket, Some(prefix)).await?;
+    let remote = remote_manifest(transport.as_ref(), bucket, Some(prefix)).await?;
 
     let to_upload = compute_uploads(&local, &remote, size_only);
     let to_delete = if delete {
@@ -140,13 +141,13 @@ async fn sync_up(
     }
 
     exec_uploads(transport, bucket, prefix, src_path, &to_upload, concurrency).await?;
-    exec_remote_deletes(transport, bucket, prefix, &to_delete).await?;
+    exec_remote_deletes(transport.as_ref(), bucket, prefix, &to_delete).await?;
     Ok(())
 }
 
 /// S3 -> local
 async fn sync_down(
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
     src: &str,
     dest: &str,
     delete: bool,
@@ -159,7 +160,7 @@ async fn sync_down(
     let prefix = parsed.key().unwrap_or_default();
     let dest_path = Path::new(dest);
 
-    let remote = remote_manifest(transport, bucket, Some(prefix)).await?;
+    let remote = remote_manifest(transport.as_ref(), bucket, Some(prefix)).await?;
     let local = if dest_path.exists() {
         local_manifest(dest_path)?
     } else {
@@ -192,7 +193,7 @@ async fn sync_down(
 
 /// S3 -> S3 (same server)
 async fn sync_s3(
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
     src: &str,
     dest: &str,
     delete: bool,
@@ -207,8 +208,10 @@ async fn sync_s3(
     let src_prefix = src_parsed.key().unwrap_or_default();
     let dest_prefix = dest_parsed.key().unwrap_or_default();
 
-    let src_manifest = remote_manifest(transport, src_bucket, Some(src_prefix)).await?;
-    let dest_manifest = remote_manifest(transport, dest_bucket, Some(dest_prefix)).await?;
+    let src_manifest =
+        remote_manifest(transport.as_ref(), src_bucket, Some(src_prefix)).await?;
+    let dest_manifest =
+        remote_manifest(transport.as_ref(), dest_bucket, Some(dest_prefix)).await?;
 
     let to_copy = compute_uploads(&src_manifest, &dest_manifest, size_only);
     let to_delete = if delete {
@@ -229,40 +232,40 @@ async fn sync_s3(
         return Ok(());
     }
 
-    let pb = count_bar(to_copy.len() as u64, "sync");
-    let errors = AtomicU64::new(0);
-    futures::stream::iter(to_copy.iter().map(|key| {
-        let pb = &pb;
-        let errors = &errors;
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let pb = Arc::new(count_bar(to_copy.len() as u64, "sync"));
+    let errors = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(to_copy.len());
+
+    for key in &to_copy {
+        let permit = Arc::clone(&sem).acquire_owned().await?;
+        let transport = Arc::clone(transport);
+        let pb = Arc::clone(&pb);
+        let errors = Arc::clone(&errors);
         let src_key = make_full_key(src_prefix, key);
         let dest_key = make_full_key(dest_prefix, key);
-        async move {
-            let Ok(tmp) = tempfile::NamedTempFile::new() else {
+        let src_bucket = src_bucket.to_owned();
+        let dest_bucket = dest_bucket.to_owned();
+
+        handles.push(tokio::spawn(async move {
+            let result = async {
+                let tmp = tempfile::NamedTempFile::new()?;
+                transport.get_object(&src_bucket, &src_key, tmp.path()).await?;
+                transport.put_object(&dest_bucket, &dest_key, tmp.path(), None).await?;
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                pb.suspend(|| eprintln!("ERROR {src_key}: {e}"));
                 errors.fetch_add(1, Ordering::Relaxed);
-                pb.inc(1);
-                return;
-            };
-            match transport.get_object(src_bucket, &src_key, tmp.path()).await {
-                Ok(_) => {
-                    if let Err(e) = transport
-                        .put_object(dest_bucket, &dest_key, tmp.path(), None)
-                        .await
-                    {
-                        pb.suspend(|| eprintln!("ERROR put {dest_key}: {e}"));
-                        errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    pb.suspend(|| eprintln!("ERROR get {src_key}: {e}"));
-                    errors.fetch_add(1, Ordering::Relaxed);
-                }
             }
             pb.inc(1);
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<()>>()
-    .await;
+            drop(permit);
+        }));
+    }
+    for handle in handles {
+        handle.await?;
+    }
     pb.finish_and_clear();
 
     let err_count = errors.load(Ordering::Relaxed);
@@ -325,37 +328,47 @@ fn make_full_key(prefix: &str, rel: &str) -> String {
 }
 
 async fn exec_uploads(
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
     bucket: &str,
     prefix: &str,
     src_root: &Path,
     keys: &[String],
     concurrency: usize,
 ) -> anyhow::Result<()> {
-    let pb = count_bar(keys.len() as u64, "upload");
-    let errors = AtomicU64::new(0);
-    futures::stream::iter(keys.iter().map(|key| {
-        let pb = &pb;
-        let errors = &errors;
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let pb = Arc::new(count_bar(keys.len() as u64, "upload"));
+    let errors = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        let permit = Arc::clone(&sem).acquire_owned().await?;
+        let transport = Arc::clone(transport);
+        let pb = Arc::clone(&pb);
+        let errors = Arc::clone(&errors);
         let full_key = make_full_key(prefix, key);
         let local_path = src_root.join(key);
         let ct = mime_guess::from_path(&local_path)
             .first_raw()
-            .unwrap_or("application/octet-stream");
-        async move {
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let bucket = bucket.to_owned();
+        let key = key.clone();
+
+        handles.push(tokio::spawn(async move {
             if let Err(e) = transport
-                .put_object(bucket, &full_key, &local_path, Some(ct))
+                .put_object(&bucket, &full_key, &local_path, Some(&ct))
                 .await
             {
                 pb.suspend(|| eprintln!("ERROR {key}: {e}"));
                 errors.fetch_add(1, Ordering::Relaxed);
             }
             pb.inc(1);
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<()>>()
-    .await;
+            drop(permit);
+        }));
+    }
+    for handle in handles {
+        handle.await?;
+    }
     pb.finish_and_clear();
     let err_count = errors.load(Ordering::Relaxed);
     if err_count > 0 {
@@ -365,37 +378,46 @@ async fn exec_uploads(
 }
 
 async fn exec_downloads(
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
     bucket: &str,
     prefix: &str,
     dest_root: &Path,
     keys: &[String],
     concurrency: usize,
 ) -> anyhow::Result<()> {
-    let pb = count_bar(keys.len() as u64, "download");
-    let errors = AtomicU64::new(0);
-    futures::stream::iter(keys.iter().map(|key| {
-        let pb = &pb;
-        let errors = &errors;
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let pb = Arc::new(count_bar(keys.len() as u64, "download"));
+    let errors = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        let permit = Arc::clone(&sem).acquire_owned().await?;
+        let transport = Arc::clone(transport);
+        let pb = Arc::clone(&pb);
+        let errors = Arc::clone(&errors);
         let full_key = make_full_key(prefix, key);
-        let local_path = dest_root.join(key);
-        async move {
+        let local_path: PathBuf = dest_root.join(key);
+        let bucket = bucket.to_owned();
+        let key = key.clone();
+
+        handles.push(tokio::spawn(async move {
             if let Some(parent) = local_path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
             if let Err(e) = transport
-                .get_object(bucket, &full_key, &local_path)
+                .get_object(&bucket, &full_key, &local_path)
                 .await
             {
                 pb.suspend(|| eprintln!("ERROR {key}: {e}"));
                 errors.fetch_add(1, Ordering::Relaxed);
             }
             pb.inc(1);
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<()>>()
-    .await;
+            drop(permit);
+        }));
+    }
+    for handle in handles {
+        handle.await?;
+    }
     pb.finish_and_clear();
     let err_count = errors.load(Ordering::Relaxed);
     if err_count > 0 {

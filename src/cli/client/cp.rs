@@ -1,13 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use futures::StreamExt;
+use tokio::sync::Semaphore;
 
 use super::progress::count_bar;
 use super::{is_s3_uri, list_all_objects, S3Uri, Transport};
 
 pub async fn run(
-    transport: &dyn Transport,
+    transport: Arc<dyn Transport>,
     src: &str,
     dest: &str,
     recursive: bool,
@@ -17,15 +18,15 @@ pub async fn run(
     let dest_s3 = is_s3_uri(dest);
 
     match (src_s3, dest_s3) {
-        (false, true) => upload(transport, src, dest, recursive, concurrency).await,
-        (true, false) => download(transport, src, dest, recursive, concurrency).await,
-        (true, true) => copy_s3_to_s3(transport, src, dest, recursive, concurrency).await,
+        (false, true) => upload(&transport, src, dest, recursive, concurrency).await,
+        (true, false) => download(&transport, src, dest, recursive, concurrency).await,
+        (true, true) => copy_s3_to_s3(&transport, src, dest, recursive, concurrency).await,
         (false, false) => anyhow::bail!("at least one path must be an s3:// URI"),
     }
 }
 
 async fn upload(
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
     src: &str,
     dest: &str,
     recursive: bool,
@@ -55,11 +56,17 @@ async fn upload(
     }
 
     let entries = collect_local_files(src_path);
-    let pb = count_bar(entries.len() as u64, "upload");
-    let errors = AtomicU64::new(0);
-    futures::stream::iter(entries.iter().map(|(rel_key, full_path)| {
-        let pb = &pb;
-        let errors = &errors;
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let pb = Arc::new(count_bar(entries.len() as u64, "upload"));
+    let errors = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(entries.len());
+
+    for (rel_key, full_path) in &entries {
+        let permit = Arc::clone(&sem).acquire_owned().await?;
+        let transport = Arc::clone(transport);
+        let pb = Arc::clone(&pb);
+        let errors = Arc::clone(&errors);
+        let bucket = bucket.to_owned();
         let key = if dest_prefix.is_empty() {
             rel_key.clone()
         } else {
@@ -67,18 +74,23 @@ async fn upload(
         };
         let ct = mime_guess::from_path(full_path)
             .first_raw()
-            .unwrap_or("application/octet-stream");
-        async move {
-            if let Err(e) = transport.put_object(bucket, &key, full_path, Some(ct)).await {
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let full_path = full_path.clone();
+        let rel_key = rel_key.clone();
+
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = transport.put_object(&bucket, &key, &full_path, Some(&ct)).await {
                 pb.suspend(|| eprintln!("ERROR {rel_key}: {e}"));
                 errors.fetch_add(1, Ordering::Relaxed);
             }
             pb.inc(1);
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<()>>()
-    .await;
+            drop(permit);
+        }));
+    }
+    for handle in handles {
+        handle.await?;
+    }
     pb.finish_and_clear();
     let err_count = errors.load(Ordering::Relaxed);
     #[allow(clippy::cast_possible_truncation)]
@@ -91,7 +103,7 @@ async fn upload(
 }
 
 async fn download(
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
     src: &str,
     dest: &str,
     recursive: bool,
@@ -118,31 +130,39 @@ async fn download(
         return Ok(());
     }
 
-    let objects = list_all_objects(transport, bucket, src_prefix).await?;
-    let prefix_strip = src_prefix.unwrap_or_default();
-    let pb = count_bar(objects.len() as u64, "download");
-    let errors = AtomicU64::new(0);
-    futures::stream::iter(objects.iter().map(|obj| {
-        let pb = &pb;
-        let errors = &errors;
-        let rel = obj.key.strip_prefix(prefix_strip).unwrap_or(&obj.key);
+    let objects = list_all_objects(transport.as_ref(), bucket, src_prefix).await?;
+    let prefix_strip = src_prefix.unwrap_or_default().to_owned();
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let pb = Arc::new(count_bar(objects.len() as u64, "download"));
+    let errors = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(objects.len());
+
+    for obj in &objects {
+        let permit = Arc::clone(&sem).acquire_owned().await?;
+        let transport = Arc::clone(transport);
+        let pb = Arc::clone(&pb);
+        let errors = Arc::clone(&errors);
+        let bucket = bucket.to_owned();
+        let obj_key = obj.key.clone();
+        let rel = obj.key.strip_prefix(&prefix_strip).unwrap_or(&obj.key);
         let rel = rel.strip_prefix('/').unwrap_or(rel);
-        let target = dest_path.join(rel);
-        let obj_key = &obj.key;
-        async move {
+        let target: PathBuf = dest_path.join(rel);
+
+        handles.push(tokio::spawn(async move {
             if let Some(parent) = target.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
-            if let Err(e) = transport.get_object(bucket, obj_key, &target).await {
+            if let Err(e) = transport.get_object(&bucket, &obj_key, &target).await {
                 pb.suspend(|| eprintln!("ERROR {obj_key}: {e}"));
                 errors.fetch_add(1, Ordering::Relaxed);
             }
             pb.inc(1);
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<()>>()
-    .await;
+            drop(permit);
+        }));
+    }
+    for handle in handles {
+        handle.await?;
+    }
     pb.finish_and_clear();
     let err_count = errors.load(Ordering::Relaxed);
     #[allow(clippy::cast_possible_truncation)]
@@ -155,7 +175,7 @@ async fn download(
 }
 
 async fn copy_s3_to_s3(
-    transport: &dyn Transport,
+    transport: &Arc<dyn Transport>,
     src: &str,
     dest: &str,
     recursive: bool,
@@ -185,47 +205,50 @@ async fn copy_s3_to_s3(
         return Ok(());
     }
 
-    let objects = list_all_objects(transport, src_bucket, src_prefix).await?;
-    let prefix_strip = src_prefix.unwrap_or_default();
-    let pb = count_bar(objects.len() as u64, "copy");
-    let errors = AtomicU64::new(0);
-    futures::stream::iter(objects.iter().map(|obj| {
-        let pb = &pb;
-        let errors = &errors;
-        let rel = obj.key.strip_prefix(prefix_strip).unwrap_or(&obj.key);
+    let objects = list_all_objects(transport.as_ref(), src_bucket, src_prefix).await?;
+    let prefix_strip = src_prefix.unwrap_or_default().to_owned();
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let pb = Arc::new(count_bar(objects.len() as u64, "copy"));
+    let errors = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(objects.len());
+
+    for obj in &objects {
+        let permit = Arc::clone(&sem).acquire_owned().await?;
+        let transport = Arc::clone(transport);
+        let pb = Arc::clone(&pb);
+        let errors = Arc::clone(&errors);
+        let src_bucket = src_bucket.to_owned();
+        let dest_bucket = dest_bucket.to_owned();
+        let obj_key = obj.key.clone();
+        let rel = obj.key.strip_prefix(&prefix_strip).unwrap_or(&obj.key);
         let rel = rel.strip_prefix('/').unwrap_or(rel);
         let dest_key = if dest_prefix.is_empty() {
             rel.to_owned()
         } else {
             format!("{}/{rel}", dest_prefix.trim_end_matches('/'))
         };
-        async move {
-            let Ok(tmp) = tempfile::NamedTempFile::new() else {
+
+        handles.push(tokio::spawn(async move {
+            let result = async {
+                let tmp = tempfile::NamedTempFile::new()?;
+                transport.get_object(&src_bucket, &obj_key, tmp.path()).await?;
+                transport
+                    .put_object(&dest_bucket, &dest_key, tmp.path(), None)
+                    .await?;
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                pb.suspend(|| eprintln!("ERROR {obj_key}: {e}"));
                 errors.fetch_add(1, Ordering::Relaxed);
-                pb.inc(1);
-                return;
-            };
-            match transport.get_object(src_bucket, &obj.key, tmp.path()).await {
-                Ok(_) => {
-                    if let Err(e) = transport
-                        .put_object(dest_bucket, &dest_key, tmp.path(), None)
-                        .await
-                    {
-                        pb.suspend(|| eprintln!("ERROR put {dest_key}: {e}"));
-                        errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    pb.suspend(|| eprintln!("ERROR get {}: {e}", obj.key));
-                    errors.fetch_add(1, Ordering::Relaxed);
-                }
             }
             pb.inc(1);
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<()>>()
-    .await;
+            drop(permit);
+        }));
+    }
+    for handle in handles {
+        handle.await?;
+    }
     pb.finish_and_clear();
     let err_count = errors.load(Ordering::Relaxed);
     #[allow(clippy::cast_possible_truncation)]

@@ -9,6 +9,7 @@ pub mod rm;
 pub mod sync_cmd;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use clap::Args;
@@ -38,7 +39,7 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
-    pub async fn build_transport(self) -> anyhow::Result<Box<dyn Transport>> {
+    pub async fn build_transport(self) -> anyhow::Result<Arc<dyn Transport>> {
         let region = self
             .region
             .or_else(|| std::env::var("AWS_REGION").ok())
@@ -49,7 +50,7 @@ impl ClientArgs {
                 .endpoint_url
                 .unwrap_or_else(|| "http://localhost:50051".into());
             let transport = grpc::GrpcTransport::connect(&endpoint).await?;
-            Ok(Box::new(transport))
+            Ok(Arc::new(transport))
         } else {
             let endpoint = self
                 .endpoint_url
@@ -58,7 +59,7 @@ impl ClientArgs {
             let secret_key = self.secret_key.unwrap_or_else(|| "test".into());
             let transport =
                 http::HttpTransport::new(&endpoint, &access_key, &secret_key, &region);
-            Ok(Box::new(transport))
+            Ok(Arc::new(transport))
         }
     }
 }

@@ -54,18 +54,19 @@ impl SimpleStorage {
 
 /// Stream request body to a temp file, returning the MD5 hex digest.
 async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<String> {
-    let mut tmp_file =
-        std::fs::File::create(tmp_path).map_err(|e| { tracing::error!("create tmp file: {e}"); s3_error!(e, InternalError) })?;
+    let file = std::fs::File::create(tmp_path)
+        .map_err(|e| { tracing::error!("create tmp file: {e}"); s3_error!(e, InternalError) })?;
+    let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
     let mut hasher = Md5::new();
     let mut stream = body;
 
     while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("read request body: {e}"); s3_error!(InternalError) })? {
-        tmp_file
+        writer
             .write_all(&chunk)
             .map_err(|e| { tracing::error!("write tmp file: {e}"); s3_error!(e, InternalError) })?;
         hasher.update(&chunk);
     }
-    tmp_file.flush().map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
+    writer.flush().map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
 
     Ok(format!("{:x}", hasher.finalize()))
 }

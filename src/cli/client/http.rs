@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 
@@ -25,6 +26,7 @@ impl HttpTransport {
             .region(aws_sdk_s3::config::Region::new(region.to_owned()))
             .force_path_style(true)
             .behavior_version_latest()
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .build();
         let client = aws_sdk_s3::Client::from_conf(config);
         Self { client }
