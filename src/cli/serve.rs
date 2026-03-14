@@ -254,7 +254,9 @@ pub async fn run(
         tokio::spawn(async move {
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(
-                    simple3::grpc::proto::simple3_server::Simple3Server::new(grpc_svc),
+                    simple3::grpc::proto::simple3_server::Simple3Server::new(grpc_svc)
+                        .max_decoding_message_size(64 * 1024 * 1024)
+                        .max_encoding_message_size(64 * 1024 * 1024),
                 )
                 .serve(grpc_addr)
                 .await

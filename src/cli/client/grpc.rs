@@ -17,9 +17,16 @@ pub struct GrpcTransport {
     client: Simple3Client<tonic::transport::Channel>,
 }
 
+const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
+
 impl GrpcTransport {
     pub async fn connect(endpoint: &str) -> anyhow::Result<Self> {
-        let client = Simple3Client::connect(endpoint.to_owned()).await?;
+        let channel = tonic::transport::Endpoint::from_shared(endpoint.to_owned())?
+            .connect()
+            .await?;
+        let client = Simple3Client::new(channel)
+            .max_decoding_message_size(MAX_MSG_SIZE)
+            .max_encoding_message_size(MAX_MSG_SIZE);
         Ok(Self { client })
     }
 }
@@ -214,13 +221,18 @@ impl Transport for GrpcTransport {
     }
 
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> anyhow::Result<()> {
-        self.client
-            .clone()
-            .delete_objects(DeleteObjectsRequest {
-                bucket: bucket.to_owned(),
-                keys: keys.to_vec(),
-            })
-            .await?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for chunk in keys.chunks(1000) {
+            self.client
+                .clone()
+                .delete_objects(DeleteObjectsRequest {
+                    bucket: bucket.to_owned(),
+                    keys: chunk.to_vec(),
+                })
+                .await?;
+        }
         Ok(())
     }
 }
