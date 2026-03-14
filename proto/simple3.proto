@@ -1,0 +1,250 @@
+syntax = "proto3";
+package simple3;
+
+service Simple3 {
+  // --- Object operations ---
+  rpc PutObject(stream PutObjectRequest) returns (PutObjectResponse);
+  rpc GetObject(GetObjectRequest) returns (stream GetObjectResponse);
+  rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+  rpc DeleteObjects(DeleteObjectsRequest) returns (DeleteObjectsResponse);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+
+  // --- Bulk streaming ---
+  rpc BulkGet(BulkGetRequest) returns (stream BulkGetResponse);
+  rpc BulkPut(stream BulkPutRequest) returns (stream BulkPutResponse);
+
+  // --- Bucket management ---
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
+  rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
+
+  // --- Admin ---
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  rpc Compact(CompactRequest) returns (CompactResponse);
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
+}
+
+// ============================================================
+// Object operations
+// ============================================================
+
+// PutObject — client-streaming upload.
+// First message MUST contain `init`, subsequent messages contain `data` chunks.
+message PutObjectRequest {
+  oneof request {
+    PutObjectInit init = 1;
+    bytes data = 2;
+  }
+}
+
+message PutObjectInit {
+  string bucket = 1;
+  string key = 2;
+  string content_type = 3;
+  map<string, string> user_metadata = 4;
+}
+
+message PutObjectResponse {
+  string etag = 1;
+  string content_md5 = 2;
+  uint64 size = 3;
+}
+
+// GetObject — server-streaming download.
+// First response contains `metadata`, subsequent responses contain `data` chunks.
+message GetObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  optional uint64 range_start = 3;
+  optional uint64 range_end = 4;
+}
+
+message GetObjectResponse {
+  oneof response {
+    ObjectMetadata metadata = 1;
+    bytes data = 2;
+  }
+}
+
+message ObjectMetadata {
+  string key = 1;
+  string etag = 2;
+  string content_type = 3;
+  uint64 size = 4;
+  uint64 last_modified = 5;
+  map<string, string> user_metadata = 6;
+  string content_md5 = 7;
+}
+
+// HeadObject
+message HeadObjectRequest {
+  string bucket = 1;
+  string key = 2;
+}
+
+message HeadObjectResponse {
+  ObjectMetadata metadata = 1;
+}
+
+// DeleteObject
+message DeleteObjectRequest {
+  string bucket = 1;
+  string key = 2;
+}
+
+message DeleteObjectResponse {}
+
+// DeleteObjects — batch delete
+message DeleteObjectsRequest {
+  string bucket = 1;
+  repeated string keys = 2;
+}
+
+message DeleteObjectsResponse {
+  repeated string deleted = 1;
+  repeated DeleteError errors = 2;
+}
+
+message DeleteError {
+  string key = 1;
+  string message = 2;
+}
+
+// ListObjects
+message ListObjectsRequest {
+  string bucket = 1;
+  string prefix = 2;
+  string delimiter = 3;
+  int32 max_keys = 4;
+  string continuation_token = 5;
+}
+
+message ListObjectsResponse {
+  repeated ObjectInfo objects = 1;
+  repeated string common_prefixes = 2;
+  bool is_truncated = 3;
+  string next_continuation_token = 4;
+}
+
+message ObjectInfo {
+  string key = 1;
+  uint64 size = 2;
+  string etag = 3;
+  uint64 last_modified = 4;
+}
+
+// ============================================================
+// Bulk streaming
+// ============================================================
+
+// BulkGet — request multiple keys, server streams back objects.
+// Each object starts with `object_start`, followed by `data` chunks.
+message BulkGetRequest {
+  string bucket = 1;
+  repeated string keys = 2;
+}
+
+message BulkGetResponse {
+  oneof response {
+    BulkGetObjectStart object_start = 1;
+    bytes data = 2;
+  }
+}
+
+message BulkGetObjectStart {
+  string key = 1;
+  ObjectMetadata metadata = 2;  // null if not_found
+  bool not_found = 3;
+}
+
+// BulkPut — bidirectional streaming. Client sends objects sequentially:
+// init message per object followed by data chunks.
+// Server responds with a result after each object is written.
+message BulkPutRequest {
+  oneof request {
+    PutObjectInit init = 1;
+    bytes data = 2;
+  }
+}
+
+message BulkPutResponse {
+  string key = 1;
+  string etag = 2;
+  string content_md5 = 3;
+  uint64 size = 4;
+}
+
+// ============================================================
+// Bucket management
+// ============================================================
+
+message CreateBucketRequest {
+  string name = 1;
+}
+
+message CreateBucketResponse {
+  bool already_existed = 1;
+}
+
+message DeleteBucketRequest {
+  string name = 1;
+}
+
+message DeleteBucketResponse {}
+
+message ListBucketsRequest {}
+
+message ListBucketsResponse {
+  repeated string buckets = 1;
+}
+
+// ============================================================
+// Admin
+// ============================================================
+
+message StatsRequest {
+  string bucket = 1;
+}
+
+message StatsResponse {
+  string bucket = 1;
+  repeated SegmentStat segments = 2;
+  uint64 total_size = 3;
+  uint64 total_dead_bytes = 4;
+}
+
+message SegmentStat {
+  uint32 id = 1;
+  uint64 size = 2;
+  uint64 dead_bytes = 3;
+}
+
+message CompactRequest {
+  string bucket = 1;
+}
+
+message CompactResponse {
+  string bucket = 1;
+  bool compacted = 2;
+  repeated SegmentStat segments_before = 3;
+  repeated SegmentStat segments_after = 4;
+}
+
+message VerifyRequest {
+  string bucket = 1;
+}
+
+message VerifyResponse {
+  uint64 total_objects = 1;
+  uint64 verified_ok = 2;
+  uint64 checksum_errors = 3;
+  uint64 read_errors = 4;
+  repeated VerifyError errors = 5;
+}
+
+message VerifyError {
+  string key = 1;
+  string kind = 2;
+  string detail = 3;
+}

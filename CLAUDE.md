@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-simple3 is an S3-compatible storage service in Rust. It uses segmented append-only data files per bucket with redb embedded database for metadata indexing. Supports single and multipart uploads, crash-safe compaction, and autovacuum. Existing sled databases are auto-migrated to redb on first startup.
+simple3 is an S3-compatible storage service in Rust. It uses segmented append-only data files per bucket with redb embedded database for metadata indexing. Supports single and multipart uploads, crash-safe compaction, autovacuum, and data integrity verification. Exposes two server interfaces: S3-compatible HTTP and gRPC (tonic). Includes an AWS-CLI-compatible client (`mb`, `rb`, `ls`, `cp`, `sync`) that works over both HTTP and gRPC transports. Existing sled databases are auto-migrated to redb on first startup.
 
 ## Commands
 
@@ -16,9 +16,21 @@ cargo test test_name               # Run single test
 cargo lint                         # Clippy with nursery checks (custom alias)
 cargo fix-lint                     # Auto-fix clippy issues (custom alias)
 cargo bench                        # Run criterion benchmarks
-cargo run -- serve                 # Start server (default 0.0.0.0:8080)
+cargo run -- serve                 # Start server (S3 on :8080, gRPC on :50051)
+cargo run -- serve --grpc-port 0   # Start with gRPC disabled
 cargo run -- compact [bucket]      # Manual compaction
+cargo run -- verify [bucket]       # Verify data integrity
+cargo run -- mb s3://bucket        # Create bucket (via HTTP)
+cargo run -- rb s3://bucket        # Remove bucket
+cargo run -- ls [s3://bucket]      # List buckets/objects
+cargo run -- cp src dest           # Copy files to/from S3
+cargo run -- sync src dest         # Sync local <-> S3
+cargo run -- ls s3://b --grpc      # Any client cmd via gRPC
 ```
+
+Client commands support `--grpc` flag and AWS env vars (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+
+Build requires `protoc` (protobuf compiler) for gRPC proto compilation: `brew install protobuf`.
 
 ## Lint Configuration
 
@@ -28,11 +40,28 @@ No `unwrap()` in library code — use `Result`/`Option` propagation. `unwrap()` 
 
 ## Architecture
 
-Three modules exported from `lib.rs`:
+### Binary crate (`main.rs` + `cli/`)
 
-- **`storage.rs`** — Segmented append-only storage engine. `Storage` manages buckets (lazy-loaded, `RwLock<HashMap>`). `BucketStore` owns segmented data files + redb DB (three typed tables: `objects` for `ObjectMeta`, `seg_dead` for per-segment dead bytes, `seg_compacting` for compaction flags). Cross-table atomic transactions for delete/put/compaction. Supports multipart uploads via temporary `.mpu_*` files. Auto-migrates from sled (v1/v2) to redb on first open.
+CLI is split into modules under `src/cli/`:
+- **`cli/mod.rs`** — `Cli` struct, `Command` enum (Serve, Compact, Verify, Mb, Rb, Ls, Cp, Sync), async `run()` dispatch.
+- **`cli/serve.rs`** — Server startup, autovacuum, `AdminService` (HTTP admin endpoints under `/_/`).
+- **`cli/compact.rs`** — Compact command (direct storage access).
+- **`cli/verify.rs`** — Verify command (direct storage access).
+- **`cli/client/`** — Client commands that connect to a running server:
+  - `mod.rs` — `ClientArgs` (clap flatten with `--grpc`, `--endpoint-url`, `--access-key`, `--secret-key`), `S3Uri` parser, `Transport` trait, `list_all_objects` helper.
+  - `http.rs` — `HttpTransport` using `aws-sdk-s3` (path-style, custom endpoint, SigV4).
+  - `grpc.rs` — `GrpcTransport` using generated tonic client stubs.
+  - `mb.rs`, `rb.rs`, `ls.rs`, `cp.rs`, `sync_cmd.rs` — Individual command implementations.
+  - `progress.rs` — `indicatif` progress bar helpers.
+
+### Library crate (`lib.rs`)
+
+Four modules exported from `lib.rs`:
+
+- **`storage/`** — Segmented append-only storage engine. `Storage` manages buckets (lazy-loaded, `RwLock<HashMap>`). `BucketStore` owns segmented data files + redb DB (three typed tables: `objects` for `ObjectMeta`, `seg_dead` for per-segment dead bytes, `seg_compacting` for compaction flags). Cross-table atomic transactions for delete/put/compaction. Supports multipart uploads via temporary `.mpu_*` files. Auto-migrates from sled (v1/v2) to redb on first open. Sub-modules: `compaction.rs`, `multipart.rs`, `verify.rs`, `migration.rs`.
 - **`s3impl.rs`** — Implements `s3s::S3` trait on `SimpleStorage(Arc<Storage>)`. Maps storage operations to S3 API (CreateBucket, PutObject, GetObject, ListObjectsV2, multipart, etc.). Streams request bodies to temp files, computes MD5 ETags.
-- **`types.rs`** — `ObjectMeta` struct (segment_id, offset, length, content_type, etag, last_modified, user_metadata). Serialized with bincode for redb storage.
+- **`grpc.rs`** — gRPC server (tonic 0.14). Implements 14 RPCs: object ops (PutObject streaming upload, GetObject streaming download, HeadObject, DeleteObject, DeleteObjects, ListObjects), bulk ops (BulkGet, BulkPut bidirectional streaming), bucket management (Create/Delete/ListBuckets), admin (Stats, Compact, Verify). Proto definition in `proto/simple3.proto`, compiled via `build.rs` using `tonic-prost-build`.
+- **`types.rs`** — `ObjectMeta` struct (segment_id, offset, length, content_type, etag, last_modified, user_metadata, content_md5). Serialized with bincode for redb storage. Backward-compatible deserialization via `ObjectMeta::from_bytes()` (handles old layout without content_md5).
 
 ### Per-bucket file layout
 
@@ -51,7 +80,9 @@ Three modules exported from `lib.rs`:
 - **Crash safety**: Append-only writes + redb ACID transactions. Compaction sets `seg_compacting` flag before atomic rename; recovery rebuilds if flag found. Orphan temp files cleaned on startup. `truncate_orphans()` trims active segment to last known object.
 - **Dead space tracking**: Overwrite/delete atomically increments per-segment dead bytes in `seg_dead` table (same transaction as metadata update). Autovacuum triggers compaction when `dead_bytes / file_size > threshold`.
 - **Locking**: `RwLock` on buckets map, `Mutex` on active writer, per-segment `RwLock<File>` for concurrent reads. redb handles its own write serialization.
-- **Error handling**: `anyhow` for application errors, `s3_error!` macro maps `io::Error` to S3 error codes.
+- **Error handling**: `anyhow` for application errors, `s3_error!` macro maps `io::Error` to S3 error codes. gRPC uses `tonic::Status` with `map_io_err` helper.
+- **Data integrity**: `content_md5` field in `ObjectMeta` stores whole-object MD5 for all uploads (single-part and multipart). `verify_integrity()` reads every object from segments and validates against stored hash. CLI: `simple3 verify`, HTTP: `GET /_/verify/{bucket}`, gRPC: `Verify` RPC.
+- **gRPC streaming**: Downloads read 256 KB chunks via `read_data()` through mpsc channels (never loads full object into memory). Uploads stream to temp files with MD5 hasher, then call `put_object_streamed`. Generated proto code requires `#![allow(clippy::...)]` suppression for doc_markdown, derive_partial_eq_without_eq, default_trait_access, too_many_lines.
 
 ## Code Style
 
