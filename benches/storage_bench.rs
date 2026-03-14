@@ -14,6 +14,7 @@ fn make_meta(segment_id: u32, offset: u64, length: u64) -> ObjectMeta {
         etag: "bench".into(),
         last_modified: 0,
         user_metadata: HashMap::new(),
+        content_md5: None,
     }
 }
 
