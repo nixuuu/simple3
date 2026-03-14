@@ -1,5 +1,4 @@
 mod compaction;
-mod migration;
 mod multipart;
 mod verify;
 
@@ -122,7 +121,6 @@ impl BucketStore {
     fn open(bucket_dir: &Path, max_segment_size: u64) -> io::Result<Self> {
         fs::create_dir_all(bucket_dir)?;
         cleanup_temp_files(bucket_dir)?;
-        migration::migrate_sled_to_redb(bucket_dir)?;
 
         let redb_path = bucket_dir.join("index.redb");
         let db = Database::create(&redb_path).map_err(io::Error::other)?;

@@ -4,8 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-simple3 is an S3-compatible storage service in Rust. It uses segmented append-only data files per bucket with redb embedded database for metadata indexing. Supports single and multipart uploads, crash-safe compaction, autovacuum, and data integrity verification. Exposes two server interfaces: S3-compatible HTTP and gRPC (tonic). Includes an AWS-CLI-compatible client (`mb`, `rb`, `ls`, `cp`, `sync`) that works over both HTTP and gRPC transports. Features IAM-style access policies with multi-key authentication, managed via CLI or admin HTTP endpoints. Existing sled databases are auto-migrated to redb on first startup.
-
+simple3 is an S3-compatible storage service in Rust. It uses segmented append-only data files per bucket with redb embedded database for metadata indexing. Supports single and multipart uploads, crash-safe compaction, autovacuum, and data integrity verification. Exposes two server interfaces: S3-compatible HTTP and gRPC (tonic). Includes an AWS-CLI-compatible client (`mb`, `rb`, `ls`, `cp`, `sync`) that works over both HTTP and gRPC transports. Features IAM-style access policies with multi-key authentication, managed via CLI or admin HTTP endpoints.
 ## Commands
 
 ```bash
@@ -68,7 +67,7 @@ CLI is split into modules under `src/cli/`:
 Six modules exported from `lib.rs`:
 
 - **`auth/`** — IAM-style authentication and authorization. `AuthStore` manages access keys and policies in `_auth.redb` (three tables: `auth_keys`, `auth_policies`, `auth_key_policies`). Data serialized as JSON (not bincode) for serde rename compatibility. Sub-modules: `types.rs` (KeyRecord, PolicyRecord), `policy.rs` (PolicyDocument with Effect/Action/Resource evaluation), `s3_auth.rs` (S3Auth impl for secret key lookup), `s3_access.rs` (S3Access impl for per-request policy evaluation), `grpc_auth.rs` (gRPC credential extraction and access check).
-- **`storage/`** — Segmented append-only storage engine. `Storage` manages buckets (lazy-loaded, `RwLock<HashMap>`). `BucketStore` owns segmented data files + redb DB (three typed tables: `objects` for `ObjectMeta`, `seg_dead` for per-segment dead bytes, `seg_compacting` for compaction flags). Cross-table atomic transactions for delete/put/compaction. Supports multipart uploads via temporary `.mpu_*` files. Auto-migrates from sled (v1/v2) to redb on first open. Sub-modules: `compaction.rs`, `multipart.rs`, `verify.rs`, `migration.rs`.
+- **`storage/`** — Segmented append-only storage engine. `Storage` manages buckets (lazy-loaded, `RwLock<HashMap>`). `BucketStore` owns segmented data files + redb DB (three typed tables: `objects` for `ObjectMeta`, `seg_dead` for per-segment dead bytes, `seg_compacting` for compaction flags). Cross-table atomic transactions for delete/put/compaction. Supports multipart uploads via temporary `.mpu_*` files. Sub-modules: `compaction.rs`, `multipart.rs`, `verify.rs`.
 - **`s3impl.rs`** — Implements `s3s::S3` trait on `SimpleStorage(Arc<Storage>)`. Maps storage operations to S3 API (CreateBucket, PutObject, GetObject, ListObjectsV2, multipart, etc.). Streams request bodies to temp files, computes MD5 ETags.
 - **`grpc.rs`** — gRPC server (tonic 0.14). Implements 14 RPCs with per-RPC auth checks. Helper functions extracted to `grpc_helpers.rs`.
 - **`grpc_helpers.rs`** — Extracted gRPC helper functions (streaming, temp file handling, proto conversions).

@@ -772,7 +772,7 @@ fn test_recovery_truncates_orphans() {
     let seg_path = dir.path().join("b").join("seg_000000.bin");
     assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 5);
 
-    // Simulate orphaned bytes (crashed append without sled update)
+    // Simulate orphaned bytes (crashed append without metadata update)
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -844,103 +844,6 @@ fn test_recovery_after_interrupted_compaction() {
             .unwrap(),
         b"BBBB"
     );
-}
-
-// === V1 migration ===
-
-#[test]
-fn test_v1_migration() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // Create a v1-format bucket manually
-    let bucket_dir = dir.path().join("mybucket");
-    std::fs::create_dir_all(&bucket_dir).unwrap();
-
-    // Write data.bin with some data
-    std::fs::write(bucket_dir.join("data.bin"), b"HELLOWORLD").unwrap();
-
-    // Create sled DB with v1-format entries
-    let db = sled::open(bucket_dir.join("index.db")).unwrap();
-    let objects = db.open_tree("objects").unwrap();
-    let meta = db.open_tree("meta").unwrap();
-
-    // V1 ObjectMeta: no segment_id
-    #[derive(serde::Serialize)]
-    struct V1Meta {
-        offset: u64,
-        length: u64,
-        content_type: Option<String>,
-        etag: String,
-        last_modified: u64,
-        user_metadata: HashMap<String, String>,
-    }
-
-    let v1_a = V1Meta {
-        offset: 0,
-        length: 5,
-        content_type: None,
-        etag: "ea".into(),
-        last_modified: 100,
-        user_metadata: HashMap::new(),
-    };
-    let v1_b = V1Meta {
-        offset: 5,
-        length: 5,
-        content_type: None,
-        etag: "eb".into(),
-        last_modified: 200,
-        user_metadata: HashMap::new(),
-    };
-
-    objects
-        .insert(b"a", bincode::serialize(&v1_a).unwrap())
-        .unwrap();
-    objects
-        .insert(b"b", bincode::serialize(&v1_b).unwrap())
-        .unwrap();
-
-    // Set dead bytes in old format
-    meta.insert(b"__dead_bytes__", &3u64.to_le_bytes())
-        .unwrap();
-
-    drop(objects);
-    drop(meta);
-    drop(db);
-
-    // Open with Storage — should trigger migration
-    let storage = Storage::open(dir.path()).unwrap();
-    let bucket = storage.get_bucket("mybucket").unwrap().unwrap();
-
-    // data.bin should be gone, seg_000000.bin should exist
-    assert!(!bucket_dir.join("data.bin").exists());
-    assert!(bucket_dir.join("seg_000000.bin").exists());
-
-    // sled dir backed up, redb file created
-    assert!(bucket_dir.join("index.redb").exists());
-    assert!(bucket_dir.join("index.db.bak").exists());
-    assert!(!bucket_dir.join("index.db").exists());
-
-    // Objects readable with segment_id = 0
-    let meta_a = bucket.get_meta("a").unwrap().unwrap();
-    assert_eq!(meta_a.segment_id, 0);
-    assert_eq!(meta_a.offset, 0);
-    assert_eq!(meta_a.length, 5);
-    let data_a = bucket
-        .read_data(meta_a.segment_id, meta_a.offset, meta_a.length)
-        .unwrap();
-    assert_eq!(data_a, b"HELLO");
-
-    let meta_b = bucket.get_meta("b").unwrap().unwrap();
-    assert_eq!(meta_b.segment_id, 0);
-    assert_eq!(
-        bucket
-            .read_data(meta_b.segment_id, meta_b.offset, meta_b.length)
-            .unwrap(),
-        b"WORLD"
-    );
-
-    // Dead bytes migrated to segment 0
-    assert_eq!(bucket.dead_bytes(), 3);
 }
 
 // === Segment stats ===

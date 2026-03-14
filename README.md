@@ -17,7 +17,6 @@ Uses segmented append-only data files with [redb](https://github.com/cberner/red
 - Client commands work over HTTP or gRPC (`--grpc` flag)
 - Range GET via HTTP Range headers
 - TOML config file support
-- Auto-migration from sled to redb on first startup
 
 ## Quick start
 
