@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-simple3 is an S3-compatible storage service in Rust. It uses segmented append-only data files per bucket with redb embedded database for metadata indexing. Supports single and multipart uploads, crash-safe compaction, autovacuum, and data integrity verification. Exposes two server interfaces: S3-compatible HTTP and gRPC (tonic). Includes an AWS-CLI-compatible client (`mb`, `rb`, `ls`, `cp`, `sync`) that works over both HTTP and gRPC transports. Existing sled databases are auto-migrated to redb on first startup.
+simple3 is an S3-compatible storage service in Rust. It uses segmented append-only data files per bucket with redb embedded database for metadata indexing. Supports single and multipart uploads, crash-safe compaction, autovacuum, and data integrity verification. Exposes two server interfaces: S3-compatible HTTP and gRPC (tonic). Includes an AWS-CLI-compatible client (`mb`, `rb`, `ls`, `cp`, `sync`) that works over both HTTP and gRPC transports. Features IAM-style access policies with multi-key authentication, managed via CLI or admin HTTP endpoints. Existing sled databases are auto-migrated to redb on first startup.
 
 ## Commands
 
@@ -26,9 +26,14 @@ cargo run -- ls [s3://bucket]      # List buckets/objects
 cargo run -- cp src dest           # Copy files to/from S3
 cargo run -- sync src dest         # Sync local <-> S3
 cargo run -- ls s3://b --grpc      # Any client cmd via gRPC
+cargo run -- keys list             # List access keys (via admin HTTP API)
+cargo run -- keys create           # Create access key
+cargo run -- policy list           # List IAM policies
+cargo run -- policy create name --document policy.json  # Create policy
+cargo run -- policy attach name AKXXX  # Attach policy to key
 ```
 
-Client commands support `--grpc` flag and AWS env vars (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+Client commands support `--grpc` flag and AWS env vars (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). Key and policy commands require admin credentials and talk to the running server via HTTP admin endpoints.
 
 Build requires `protoc` (protobuf compiler) for gRPC proto compilation: `brew install protobuf`.
 
@@ -43,24 +48,30 @@ No `unwrap()` in library code — use `Result`/`Option` propagation. `unwrap()` 
 ### Binary crate (`main.rs` + `cli/`)
 
 CLI is split into modules under `src/cli/`:
-- **`cli/mod.rs`** — `Cli` struct, `Command` enum (Serve, Compact, Verify, Mb, Rb, Ls, Cp, Sync), async `run()` dispatch.
-- **`cli/serve.rs`** — Server startup, autovacuum, `AdminService` (HTTP admin endpoints under `/_/`).
+- **`cli/mod.rs`** — `Cli` struct, `Command` enum (Serve, Compact, Verify, Mb, Rb, Ls, Cp, Sync, Keys, Policy), async `run()` dispatch, TOML config loading.
+- **`cli/serve.rs`** — Server startup, autovacuum, `AdminService` (HTTP admin endpoints under `/_/`), auth bootstrap.
+- **`cli/admin_auth.rs`** — Admin HTTP endpoints for key/policy management (`/_/keys`, `/_/policies`), Bearer auth check.
+- **`cli/keys.rs`** — `keys` CLI subcommands (create/list/show/delete/enable/disable). Operates over HTTP admin API.
+- **`cli/policy_cmd.rs`** — `policy` CLI subcommands (create/list/show/delete/attach/detach). Operates over HTTP admin API.
+- **`cli/config.rs`** — TOML config file loading and merge with CLI args.
 - **`cli/compact.rs`** — Compact command (direct storage access).
 - **`cli/verify.rs`** — Verify command (direct storage access).
 - **`cli/client/`** — Client commands that connect to a running server:
   - `mod.rs` — `ClientArgs` (clap flatten with `--grpc`, `--endpoint-url`, `--access-key`, `--secret-key`), `S3Uri` parser, `Transport` trait, `list_all_objects` helper.
   - `http.rs` — `HttpTransport` using `aws-sdk-s3` (path-style, custom endpoint, SigV4).
-  - `grpc.rs` — `GrpcTransport` using generated tonic client stubs.
+  - `grpc.rs` — `GrpcTransport` using generated tonic client stubs with auth metadata interceptor.
   - `mb.rs`, `rb.rs`, `ls.rs`, `cp.rs`, `sync_cmd.rs` — Individual command implementations.
   - `progress.rs` — `indicatif` progress bar helpers.
 
 ### Library crate (`lib.rs`)
 
-Four modules exported from `lib.rs`:
+Six modules exported from `lib.rs`:
 
+- **`auth/`** — IAM-style authentication and authorization. `AuthStore` manages access keys and policies in `_auth.redb` (three tables: `auth_keys`, `auth_policies`, `auth_key_policies`). Data serialized as JSON (not bincode) for serde rename compatibility. Sub-modules: `types.rs` (KeyRecord, PolicyRecord), `policy.rs` (PolicyDocument with Effect/Action/Resource evaluation), `s3_auth.rs` (S3Auth impl for secret key lookup), `s3_access.rs` (S3Access impl for per-request policy evaluation), `grpc_auth.rs` (gRPC credential extraction and access check).
 - **`storage/`** — Segmented append-only storage engine. `Storage` manages buckets (lazy-loaded, `RwLock<HashMap>`). `BucketStore` owns segmented data files + redb DB (three typed tables: `objects` for `ObjectMeta`, `seg_dead` for per-segment dead bytes, `seg_compacting` for compaction flags). Cross-table atomic transactions for delete/put/compaction. Supports multipart uploads via temporary `.mpu_*` files. Auto-migrates from sled (v1/v2) to redb on first open. Sub-modules: `compaction.rs`, `multipart.rs`, `verify.rs`, `migration.rs`.
 - **`s3impl.rs`** — Implements `s3s::S3` trait on `SimpleStorage(Arc<Storage>)`. Maps storage operations to S3 API (CreateBucket, PutObject, GetObject, ListObjectsV2, multipart, etc.). Streams request bodies to temp files, computes MD5 ETags.
-- **`grpc.rs`** — gRPC server (tonic 0.14). Implements 14 RPCs: object ops (PutObject streaming upload, GetObject streaming download, HeadObject, DeleteObject, DeleteObjects, ListObjects), bulk ops (BulkGet, BulkPut bidirectional streaming), bucket management (Create/Delete/ListBuckets), admin (Stats, Compact, Verify). Proto definition in `proto/simple3.proto`, compiled via `build.rs` using `tonic-prost-build`.
+- **`grpc.rs`** — gRPC server (tonic 0.14). Implements 14 RPCs with per-RPC auth checks. Helper functions extracted to `grpc_helpers.rs`.
+- **`grpc_helpers.rs`** — Extracted gRPC helper functions (streaming, temp file handling, proto conversions).
 - **`types.rs`** — `ObjectMeta` struct (segment_id, offset, length, content_type, etag, last_modified, user_metadata, content_md5). Serialized with bincode for redb storage. Backward-compatible deserialization via `ObjectMeta::from_bytes()` (handles old layout without content_md5).
 
 ### Per-bucket file layout
@@ -83,6 +94,7 @@ Four modules exported from `lib.rs`:
 - **Error handling**: `anyhow` for application errors, `s3_error!` macro maps `io::Error` to S3 error codes. gRPC uses `tonic::Status` with `map_io_err` helper.
 - **Data integrity**: `content_md5` field in `ObjectMeta` stores whole-object MD5 for all uploads (single-part and multipart). `verify_integrity()` reads every object from segments and validates against stored hash. CLI: `simple3 verify`, HTTP: `GET /_/verify/{bucket}`, gRPC: `Verify` RPC.
 - **gRPC streaming**: Downloads read 256 KB chunks via `read_data()` through mpsc channels (never loads full object into memory). Uploads stream to temp files with MD5 hasher, then call `put_object_streamed`. Generated proto code requires `#![allow(clippy::...)]` suppression for doc_markdown, derive_partial_eq_without_eq, default_trait_access, too_many_lines.
+- **Auth**: `AuthStore` in `_auth.redb` at data_dir root. S3 HTTP uses `S3Auth` + `S3Access` traits from s3s. gRPC uses `x-access-key`/`x-secret-key` metadata with per-RPC checks. Admin endpoints use `Authorization: Bearer {ak}:{sk}`. Root key auto-created on first startup. IAM policy evaluation: explicit deny > explicit allow > implicit deny. CLI `keys` and `policy` commands operate over HTTP admin API (not direct DB access, since redb is locked by the server).
 
 ## Code Style
 

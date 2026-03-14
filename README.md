@@ -8,13 +8,15 @@ Uses segmented append-only data files with [redb](https://github.com/cberner/red
 
 - S3-compatible HTTP API, works with AWS CLI and any S3 client
 - gRPC API with 14 RPCs, including bidirectional streaming for bulk transfers
+- IAM-style access policies with multi-key authentication and Effect/Action/Resource matching
 - Segmented append-only storage with ACID metadata transactions
 - Background autovacuum that compacts segments when dead space exceeds a threshold
 - MD5 checksums per object, full-bucket integrity verification via CLI, HTTP, or gRPC
 - S3-compatible multipart uploads
-- Built-in CLI: `mb`, `rb`, `ls`, `cp`, `rm`, `sync` with concurrent transfers
+- Built-in CLI: `mb`, `rb`, `ls`, `cp`, `rm`, `sync`, `keys`, `policy` with concurrent transfers
 - Client commands work over HTTP or gRPC (`--grpc` flag)
 - Range GET via HTTP Range headers
+- TOML config file support
 - Auto-migration from sled to redb on first startup
 
 ## Quick start
@@ -33,6 +35,7 @@ cargo build --release
 
 ```bash
 # S3 HTTP on :8080, gRPC on :50051
+# On first start, prints a root admin access key to stderr
 ./target/release/simple3 serve
 
 # Custom ports
@@ -49,8 +52,9 @@ cargo build --release
 
 ```bash
 export AWS_ENDPOINT_URL=http://localhost:8080
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
+# Use the access key printed on first server startup
+export AWS_ACCESS_KEY_ID=AKxxxxxxxxxxxxxxxxxx
+export AWS_SECRET_ACCESS_KEY=SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 aws s3 mb s3://my-bucket
 aws s3 cp file.txt s3://my-bucket/
@@ -84,17 +88,75 @@ simple3 ls s3://my-bucket --grpc
 simple3 sync ./local s3://my-bucket/ --grpc -j 10
 ```
 
+## Authentication
+
+On first startup the server creates a root admin access key and prints it to stderr. Save these credentials, they won't be shown again.
+
+Access keys and IAM-style policies are managed via CLI commands that talk to the running server:
+
+```bash
+# key management (requires admin credentials)
+simple3 keys list --access-key AKROOT --secret-key SKROOT
+simple3 keys create --description "deploy bot" --access-key AKROOT --secret-key SKROOT
+simple3 keys disable AKXXXXXXXXXX --access-key AKROOT --secret-key SKROOT
+
+# policy management
+simple3 policy create readonly --document policy.json --access-key AKROOT --secret-key SKROOT
+simple3 policy attach readonly AKXXXXXXXXXX --access-key AKROOT --secret-key SKROOT
+simple3 policy detach readonly AKXXXXXXXXXX --access-key AKROOT --secret-key SKROOT
+```
+
+Policy documents follow the AWS IAM format with Effect, Action, and Resource fields:
+
+```json
+{
+    "Version": "2024-01-01",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": ["s3:GetObject", "s3:ListBucket", "s3:ListAllMyBuckets"],
+            "Resource": "arn:s3:::*"
+        }
+    ]
+}
+```
+
+Supported actions: `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`, `s3:CreateBucket`, `s3:DeleteBucket`, `s3:ListAllMyBuckets`, `s3:*`, `admin:Stats`, `admin:Compact`, `admin:Verify`, `admin:*`, `*`.
+
+Resources use the format `arn:s3:::{bucket}` or `arn:s3:::{bucket}/{key}` with `*` glob matching.
+
+Admin keys bypass all policy checks. Non-admin keys are denied by default and need explicit Allow policies. Explicit Deny always overrides Allow.
+
+gRPC authentication uses `x-access-key` and `x-secret-key` metadata headers. The built-in CLI sends these automatically when `--access-key` and `--secret-key` are provided.
+
 ## Server configuration
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--data-dir` | `./data` | Storage directory |
+| `--config` | `{data-dir}/simple3.toml` | TOML config file path |
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8080` | S3 HTTP port |
 | `--grpc-port` | `50051` | gRPC port, 0 to disable |
 | `--autovacuum-interval` | `300` | Autovacuum interval in seconds, 0 to disable |
 | `--autovacuum-threshold` | `0.5` | Compact when dead bytes exceed this fraction of file size |
 | `--max-segment-size-mb` | `4096` | Max segment file size in MB |
+
+Settings can also be specified in a TOML config file at `{data-dir}/simple3.toml`:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 8080
+grpc_port = 50051
+
+[storage]
+max_segment_size_mb = 4096
+autovacuum_interval = 300
+autovacuum_threshold = 0.5
+```
+
+CLI flags override config file values.
 
 ## Client configuration
 
@@ -111,9 +173,11 @@ The CLI client reads standard AWS environment variables:
 
 ```
 data/
+├── _auth.redb               # access keys and IAM policies
+├── simple3.toml              # optional config file
 └── my-bucket/
-    ├── index.redb           # redb database (objects, dead bytes, compaction state)
-    ├── seg_000000.bin        # append-only data segments
+    ├── index.redb            # redb database (objects, dead bytes, compaction state)
+    ├── seg_000000.bin         # append-only data segments
     ├── seg_000001.bin
     └── seg_000002.bin
 ```
@@ -128,11 +192,30 @@ On startup, orphan temp files are cleaned up and incomplete writes at the end of
 
 ## Admin endpoints
 
+Storage endpoints:
+
 ```
-GET  /_/stats              # storage statistics (JSON)
 GET  /_/stats/{bucket}     # per-bucket statistics
 POST /_/compact/{bucket}   # trigger compaction
 GET  /_/verify/{bucket}    # verify data integrity
+```
+
+Key and policy management (require `Authorization: Bearer {access_key}:{secret_key}` with an admin key):
+
+```
+GET    /_/keys                              # list access keys
+POST   /_/keys                              # create key
+GET    /_/keys/{id}                         # show key details
+DELETE /_/keys/{id}                         # delete key
+POST   /_/keys/{id}/enable                  # enable key
+POST   /_/keys/{id}/disable                 # disable key
+
+GET    /_/policies                           # list policies
+POST   /_/policies                           # create policy
+GET    /_/policies/{name}                    # show policy document
+DELETE /_/policies/{name}                    # delete policy
+POST   /_/policies/{name}/attach/{key_id}   # attach policy to key
+DELETE /_/policies/{name}/attach/{key_id}   # detach policy from key
 ```
 
 ## Offline tools
