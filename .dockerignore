@@ -1,0 +1,8 @@
+target/
+data/
+test-data/
+test-scripts/
+.git/
+*.md
+benches/
+tests/
