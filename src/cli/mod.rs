@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 mod admin_auth;
 mod compact;
+mod health;
 pub mod client;
 pub mod config;
 pub mod keys;
@@ -52,7 +53,12 @@ enum Command {
         /// Graceful shutdown timeout in seconds
         #[arg(long)]
         shutdown_timeout: Option<u64>,
+        /// Minimum free disk space in MB; /ready returns 503 below this (0 = disabled)
+        #[arg(long)]
+        min_disk_free_mb: Option<u64>,
     },
+    /// Check if the running server is healthy
+    Health,
     /// Compact buckets to reclaim dead space
     Compact {
         /// Compact only this bucket (default: all buckets)
@@ -160,6 +166,7 @@ pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Health) => health::run(&cli.data_dir, cli.config.as_deref()).await,
         Some(Command::Compact { bucket }) => compact::run(&cli.data_dir, bucket),
         Some(Command::Verify { bucket }) => verify::run(&cli.data_dir, bucket),
         Some(Command::Keys { cmd, client: args }) => keys::run(args, cmd).await,
@@ -226,6 +233,7 @@ pub async fn run() -> anyhow::Result<()> {
                 grpc_port,
                 scrub_interval,
                 shutdown_timeout,
+                min_disk_free_mb,
             ) = match cmd {
                 Some(Command::Serve {
                     host,
@@ -236,6 +244,7 @@ pub async fn run() -> anyhow::Result<()> {
                     grpc_port,
                     scrub_interval,
                     shutdown_timeout,
+                    min_disk_free_mb,
                 }) => (
                     host,
                     port,
@@ -247,6 +256,9 @@ pub async fn run() -> anyhow::Result<()> {
                     shutdown_timeout
                         .or(cfg.server.shutdown_timeout)
                         .unwrap_or(30),
+                    min_disk_free_mb
+                        .or(cfg.storage.min_disk_free_mb)
+                        .unwrap_or(0),
                 ),
                 _ => (
                     cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
@@ -257,6 +269,7 @@ pub async fn run() -> anyhow::Result<()> {
                     cfg.server.grpc_port.unwrap_or(50051),
                     cfg.storage.scrub_interval.unwrap_or(3600),
                     cfg.server.shutdown_timeout.unwrap_or(30),
+                    cfg.storage.min_disk_free_mb.unwrap_or(0),
                 ),
             };
             serve::run(
@@ -269,6 +282,7 @@ pub async fn run() -> anyhow::Result<()> {
                 max_seg_mb,
                 scrub_interval,
                 shutdown_timeout,
+                min_disk_free_mb,
             )
             .await
         }

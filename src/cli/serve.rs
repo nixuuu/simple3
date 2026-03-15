@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -115,6 +116,7 @@ struct AdminService {
     s3: S3Service,
     storage: Arc<Storage>,
     auth_store: Arc<AuthStore>,
+    min_disk_free_mb: u64,
 }
 
 type ServiceFuture =
@@ -127,7 +129,21 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
 
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let path = req.uri().path().to_owned();
-        if path.starts_with("/_/keys") || path.starts_with("/_/policies") {
+        if *req.method() == hyper::Method::GET && path == "/health" {
+            Box::pin(async {
+                Ok(json_response(200, &serde_json::json!({"status": "ok"})))
+            })
+        } else if *req.method() == hyper::Method::GET && path == "/ready" {
+            let storage = Arc::clone(&self.storage);
+            let min_free = self.min_disk_free_mb;
+            Box::pin(async move {
+                Ok(tokio::task::spawn_blocking(move || handle_ready(&storage, min_free))
+                    .await
+                    .unwrap_or_else(|e| {
+                        json_response(500, &serde_json::json!({"error": e.to_string()}))
+                    }))
+            })
+        } else if path.starts_with("/_/keys") || path.starts_with("/_/policies") {
             let auth_store = Arc::clone(&self.auth_store);
             let method = req.method().clone();
             Box::pin(async move {
@@ -223,6 +239,8 @@ fn admin_compact(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
     };
     let before = store.segment_stats().unwrap_or_default();
     let before_json = stats_to_json(&before);
+    storage.begin_compacting();
+    let _guard = CompactingGuard(storage);
     if let Err(e) = store.compact() {
         return json_response(500, &serde_json::json!({"error": e.to_string()}));
     }
@@ -245,6 +263,96 @@ fn admin_verify(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
     match store.verify_integrity() {
         Ok(result) => json_response(200, &result),
         Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+struct ReadyMetrics {
+    bucket_count: usize,
+    total_size: u64,
+    total_dead: u64,
+    compaction_running: bool,
+}
+
+fn collect_ready_metrics(storage: &Storage) -> io::Result<ReadyMetrics> {
+    let buckets = storage.list_buckets()?;
+    let mut total_size: u64 = 0;
+    let mut total_dead: u64 = 0;
+    for name in &buckets {
+        let store = storage
+            .get_bucket(name)?
+            .ok_or_else(|| io::Error::other(format!("bucket disappeared: {name}")))?;
+        total_dead += store.dead_bytes();
+        total_size += store.data_file_size()?;
+    }
+    Ok(ReadyMetrics {
+        bucket_count: buckets.len(),
+        total_size,
+        total_dead,
+        compaction_running: storage.is_compacting(),
+    })
+}
+
+fn handle_ready(storage: &Storage, min_disk_free_mb: u64) -> s3s::HttpResponse {
+    let metrics = match collect_ready_metrics(storage) {
+        Ok(m) => m,
+        Err(e) => {
+            let msg = format!("storage not accessible: {e}");
+            return json_response(
+                503,
+                &serde_json::json!({"status": "unavailable", "error": msg}),
+            );
+        }
+    };
+
+    #[allow(clippy::cast_precision_loss)] // u64 -> f64 for ratio; sub-ULP precision irrelevant
+    let dead_ratio = if metrics.total_size > 0 {
+        metrics.total_dead as f64 / metrics.total_size as f64
+    } else {
+        0.0
+    };
+
+    let disk_free_bytes = disk_free(storage.data_dir());
+    let min_free_bytes = min_disk_free_mb.saturating_mul(1024 * 1024);
+
+    let degraded = min_free_bytes > 0 && disk_free_bytes < min_free_bytes;
+    let (status_code, status) = if degraded { (503, "unavailable") } else { (200, "ok") };
+
+    let mut body = serde_json::json!({
+        "status": status,
+        "bucket_count": metrics.bucket_count,
+        "total_size_bytes": metrics.total_size,
+        "total_dead_bytes": metrics.total_dead,
+        "dead_space_ratio": (dead_ratio * 10000.0).round() / 10000.0,
+        "disk_free_bytes": disk_free_bytes,
+        "compaction_running": metrics.compaction_running,
+    });
+    if degraded {
+        body["error"] = serde_json::json!(format!(
+            "disk free {}MB < minimum {}MB",
+            disk_free_bytes / (1024 * 1024),
+            min_disk_free_mb
+        ));
+    }
+
+    json_response(status_code, &body)
+}
+
+fn disk_free(path: &Path) -> u64 {
+    match nix::sys::statvfs::statvfs(path) {
+        #[allow(clippy::useless_conversion)] // blocks_available() is u32 on macOS, u64 on Linux
+        Ok(s) => u64::from(s.blocks_available()) * s.fragment_size(),
+        Err(e) => {
+            tracing::warn!("statvfs failed for {}: {e}", path.display());
+            0
+        }
+    }
+}
+
+struct CompactingGuard<'a>(&'a Storage);
+
+impl Drop for CompactingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.end_compacting();
     }
 }
 
@@ -284,12 +392,15 @@ fn spawn_autovacuum(
                 () = tokio::time::sleep(interval) => {}
                 _ = rx.changed() => break,
             }
+            av_storage.begin_compacting();
+            let guard = CompactingGuard(&av_storage);
             let storage = Arc::clone(&av_storage);
             if let Err(e) =
                 tokio::task::spawn_blocking(move || run_autovacuum(&storage, threshold)).await
             {
                 tracing::error!("autovacuum task panicked: {e}");
             }
+            drop(guard);
         }
     });
     tracing::info!(
@@ -404,6 +515,7 @@ pub async fn run(
     max_segment_size_mb: u64,
     scrub_interval: u64,
     shutdown_timeout: u64,
+    min_disk_free_mb: u64,
 ) -> anyhow::Result<()> {
     let max_seg_bytes = max_segment_size_mb * 1024 * 1024;
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
@@ -452,6 +564,7 @@ pub async fn run(
         s3: s3_service,
         storage: Arc::clone(&storage),
         auth_store: Arc::clone(&auth_store),
+        min_disk_free_mb,
     };
 
     if grpc_port > 0 {
@@ -514,4 +627,60 @@ pub async fn run(
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ready_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.create_bucket("test-bucket").unwrap();
+        let resp = handle_ready(&storage, 0);
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn test_ready_disk_low() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let resp = handle_ready(&storage, u64::MAX / (1024 * 1024));
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[test]
+    fn test_collect_ready_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.create_bucket("b1").unwrap();
+        storage.create_bucket("b2").unwrap();
+        let m = collect_ready_metrics(&storage).unwrap();
+        assert_eq!(m.bucket_count, 2);
+        assert_eq!(m.total_size, 0);
+        assert_eq!(m.total_dead, 0);
+        assert!(!m.compaction_running);
+    }
+
+    #[test]
+    fn test_disk_free_nonzero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(disk_free(dir.path()) > 0);
+    }
+
+    #[test]
+    fn test_compacting_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        assert!(!storage.is_compacting());
+        storage.begin_compacting();
+        assert!(storage.is_compacting());
+        storage.begin_compacting();
+        assert!(storage.is_compacting());
+        storage.end_compacting();
+        assert!(storage.is_compacting());
+        storage.end_compacting();
+        assert!(!storage.is_compacting());
+    }
 }
