@@ -19,6 +19,7 @@ pub struct ServerConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub grpc_port: Option<u16>,
+    pub shutdown_timeout: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]

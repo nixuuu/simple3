@@ -372,6 +372,15 @@ impl BucketStore {
         Ok(stats)
     }
 
+    /// Fsync the active writer segment to disk.
+    pub fn sync_active_segment(&self) -> io::Result<()> {
+        let w = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("writer lock poisoned"))?;
+        w.file.sync_all()
+    }
+
     // === Data operations ===
 
     pub fn read_data(&self, segment_id: u32, offset: u64, length: u64) -> io::Result<Vec<u8>> {
@@ -802,5 +811,21 @@ impl Storage {
         let mut names: Vec<String> = self.read_buckets()?.keys().cloned().collect();
         names.sort();
         Ok(names)
+    }
+
+    /// Fsync the active segment of every loaded bucket.
+    pub fn sync_all(&self) -> io::Result<()> {
+        let stores: Vec<(String, Arc<BucketStore>)> = self
+            .read_buckets()?
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        for (name, store) in &stores {
+            if let Err(e) = store.sync_active_segment() {
+                tracing::error!("sync_all: {name} — {e}");
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 }

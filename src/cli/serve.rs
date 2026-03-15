@@ -8,6 +8,9 @@ use hyper_util::rt::TokioIo;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tokio::signal::unix::SignalKind;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use simple3::auth::s3_auth::AuthProvider;
 use simple3::auth::types::BootstrapResult;
@@ -245,6 +248,124 @@ fn admin_verify(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
     }
 }
 
+fn spawn_signal_handler(
+    mut sigterm: tokio::signal::unix::Signal,
+    mut sigint: tokio::signal::unix::Signal,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+            _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
+        }
+        let _ = shutdown_tx.send(true);
+    });
+}
+
+fn spawn_autovacuum(
+    storage: &Arc<Storage>,
+    interval_secs: u64,
+    threshold: f64,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let av_storage = Arc::clone(storage);
+    let interval = Duration::from_secs(interval_secs);
+    let mut rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                _ = rx.changed() => break,
+            }
+            let storage = Arc::clone(&av_storage);
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || run_autovacuum(&storage, threshold)).await
+            {
+                tracing::error!("autovacuum task panicked: {e}");
+            }
+        }
+    });
+    tracing::info!(
+        "autovacuum enabled: interval={}s, threshold={:.0}%",
+        interval_secs,
+        threshold * 100.0
+    );
+}
+
+fn spawn_scrub(
+    storage: &Arc<Storage>,
+    interval_secs: u64,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let scrub_storage = Arc::clone(storage);
+    let interval = Duration::from_secs(interval_secs);
+    let mut rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                _ = rx.changed() => break,
+            }
+            let storage = Arc::clone(&scrub_storage);
+            if let Err(e) = tokio::task::spawn_blocking(move || run_scrub(&storage)).await {
+                tracing::error!("scrub task panicked: {e}");
+            }
+        }
+    });
+    tracing::info!("background scrub enabled: interval={}s", interval_secs);
+}
+
+fn spawn_grpc(
+    storage: &Arc<Storage>,
+    auth_store: &Arc<AuthStore>,
+    host: &str,
+    port: u16,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let grpc_svc =
+        simple3::grpc::GrpcService::new(Arc::clone(storage), Some(Arc::clone(auth_store)));
+    let grpc_addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    let mut rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(
+                simple3::grpc::proto::simple3_server::Simple3Server::new(grpc_svc)
+                    .max_decoding_message_size(64 * 1024 * 1024)
+                    .max_encoding_message_size(64 * 1024 * 1024),
+            )
+            .serve_with_shutdown(grpc_addr, async move {
+                let _ = rx.changed().await;
+            })
+            .await
+        {
+            tracing::error!("gRPC server error: {e}");
+        }
+    });
+    tracing::info!("gRPC listening on {}:{}", host, port);
+    Ok(())
+}
+
+async fn drain_connections(connections: &mut JoinSet<()>, timeout_secs: u64) {
+    tracing::info!(
+        "draining {} in-flight connection(s) (timeout {}s)",
+        connections.len(),
+        timeout_secs
+    );
+    let timeout = Duration::from_secs(timeout_secs);
+    if tokio::time::timeout(timeout, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            "shutdown timeout reached, dropping {} connection(s)",
+            connections.len()
+        );
+        connections.shutdown().await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // server config values passed through; a struct would add indirection without benefit
 pub async fn run(
     data_dir: &Path,
@@ -255,6 +376,7 @@ pub async fn run(
     autovacuum_threshold: f64,
     max_segment_size_mb: u64,
     scrub_interval: u64,
+    shutdown_timeout: u64,
 ) -> anyhow::Result<()> {
     let max_seg_bytes = max_segment_size_mb * 1024 * 1024;
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
@@ -276,41 +398,17 @@ pub async fn run(
         eprintln!("================================================================");
     }
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let sigterm = tokio::signal::unix::signal(SignalKind::terminate())?;
+    let sigint = tokio::signal::unix::signal(SignalKind::interrupt())?;
+    spawn_signal_handler(sigterm, sigint, shutdown_tx);
+
     if autovacuum_interval > 0 {
-        let av_storage = Arc::clone(&storage);
-        let interval = Duration::from_secs(autovacuum_interval);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let st = Arc::clone(&av_storage);
-                let threshold = autovacuum_threshold;
-                if let Err(e) =
-                    tokio::task::spawn_blocking(move || run_autovacuum(&st, threshold)).await
-                {
-                    tracing::error!("autovacuum task panicked: {e}");
-                }
-            }
-        });
-        tracing::info!(
-            "autovacuum enabled: interval={}s, threshold={:.0}%",
-            autovacuum_interval,
-            autovacuum_threshold * 100.0
-        );
+        spawn_autovacuum(&storage, autovacuum_interval, autovacuum_threshold, &shutdown_rx);
     }
 
     if scrub_interval > 0 {
-        let scrub_storage = Arc::clone(&storage);
-        let interval = Duration::from_secs(scrub_interval);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let st = Arc::clone(&scrub_storage);
-                if let Err(e) = tokio::task::spawn_blocking(move || run_scrub(&st)).await {
-                    tracing::error!("scrub task panicked: {e}");
-                }
-            }
-        });
-        tracing::info!("background scrub enabled: interval={}s", scrub_interval);
+        spawn_scrub(&storage, scrub_interval, &shutdown_rx);
     }
 
     let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
@@ -326,39 +424,52 @@ pub async fn run(
     };
 
     if grpc_port > 0 {
-        let grpc_svc =
-            simple3::grpc::GrpcService::new(Arc::clone(&storage), Some(Arc::clone(&auth_store)));
-        let grpc_addr: std::net::SocketAddr = format!("{host}:{grpc_port}").parse()?;
-        tokio::spawn(async move {
-            if let Err(e) = tonic::transport::Server::builder()
-                .add_service(
-                    simple3::grpc::proto::simple3_server::Simple3Server::new(grpc_svc)
-                        .max_decoding_message_size(64 * 1024 * 1024)
-                        .max_encoding_message_size(64 * 1024 * 1024),
-                )
-                .serve(grpc_addr)
-                .await
-            {
-                tracing::error!("gRPC server error: {e}");
-            }
-        });
-        tracing::info!("gRPC listening on {}:{}", host, grpc_port);
+        spawn_grpc(&storage, &auth_store, host, grpc_port, &shutdown_rx)?;
     }
 
     let listener = TcpListener::bind((host, port)).await?;
     tracing::info!("S3 HTTP listening on {}:{}", host, port);
 
+    let mut connections: JoinSet<()> = JoinSet::new();
+    let mut shutdown_rx_accept = shutdown_rx.clone();
+
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let svc = service.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, svc)
-                .await
-            {
-                tracing::error!("connection error: {e}");
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = result?;
+                let svc = service.clone();
+                let mut rx = shutdown_rx.clone();
+                connections.spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let conn = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        result = conn.as_mut() => {
+                            if let Err(e) = result {
+                                tracing::error!("connection error: {e}");
+                            }
+                        }
+                        _ = rx.changed() => {
+                            conn.as_mut().graceful_shutdown();
+                            if let Err(e) = conn.await {
+                                tracing::error!("connection error during drain: {e}");
+                            }
+                        }
+                    }
+                });
             }
-        });
+            _ = shutdown_rx_accept.changed() => break,
+        }
     }
+
+    drop(listener);
+    drain_connections(&mut connections, shutdown_timeout).await;
+
+    if let Err(e) = storage.sync_all() {
+        tracing::error!("failed to sync storage on shutdown: {e}");
+    }
+
+    tracing::info!("shutdown complete");
+    Ok(())
 }
