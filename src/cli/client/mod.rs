@@ -3,6 +3,7 @@ pub mod grpc;
 pub mod http;
 pub mod ls;
 pub mod mb;
+pub mod presign;
 pub mod progress;
 pub mod rb;
 pub mod rm;
