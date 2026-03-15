@@ -113,7 +113,7 @@ impl Simple3 for GrpcService {
         let tmp_id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}"));
 
-        let (etag, size) = match stream_to_tmp(&mut stream, &tmp_path).await {
+        let (etag, size, crc) = match stream_to_tmp(&mut stream, &tmp_path).await {
             Ok(result) => result,
             Err(e) => {
                 std::fs::remove_file(&tmp_path).ok();
@@ -135,7 +135,9 @@ impl Simple3 for GrpcService {
         let etag_clone = etag.clone();
         let metadata = init.user_metadata;
         let meta = tokio::task::spawn_blocking(move || {
-            store.put_object_streamed(&key, &tmp_path, content_type, etag_clone, now, metadata)
+            store.put_object_streamed(
+                &key, &tmp_path, content_type, etag_clone, now, metadata, Some(crc),
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?
@@ -165,14 +167,15 @@ impl Simple3 for GrpcService {
             .map_err(map_io_err)?
             .ok_or_else(|| Status::not_found("object not found"))?;
 
+        let obj_size = meta.data_length();
         let (range_offset, range_len) = if let Some(start) = input.range_start {
-            let end = input.range_end.unwrap_or(meta.length);
-            if start >= meta.length || end > meta.length || start >= end {
+            let end = input.range_end.unwrap_or(obj_size);
+            if start >= obj_size || end > obj_size || start >= end {
                 return Err(Status::out_of_range("invalid range"));
             }
             (meta.offset + start, end - start)
         } else {
-            (meta.offset, meta.length)
+            (meta.offset, obj_size)
         };
 
         let (tx, rx) = mpsc::channel(8);
@@ -313,7 +316,7 @@ impl Simple3 for GrpcService {
             .into_iter()
             .map(|(key, meta)| ObjectInfo {
                 key,
-                size: meta.length,
+                size: meta.data_length(),
                 etag: meta.etag,
                 last_modified: meta.last_modified,
             })
@@ -616,6 +619,7 @@ impl Simple3 for GrpcService {
             checksum_errors: result.checksum_errors,
             read_errors: result.read_errors,
             errors,
+            crc_errors: result.crc_errors,
         }))
     }
 }

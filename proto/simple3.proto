@@ -241,6 +241,7 @@ message VerifyResponse {
   uint64 checksum_errors = 3;
   uint64 read_errors = 4;
   repeated VerifyError errors = 5;
+  uint64 crc_errors = 6;
 }
 
 message VerifyError {

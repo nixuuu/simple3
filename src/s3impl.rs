@@ -52,12 +52,13 @@ impl SimpleStorage {
     }
 }
 
-/// Stream request body to a temp file, returning the MD5 hex digest.
-async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<String> {
+/// Stream request body to a temp file, returning `(md5_hex, crc32c)`.
+async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<(String, u32)> {
     let file = std::fs::File::create(tmp_path)
         .map_err(|e| { tracing::error!("create tmp file: {e}"); s3_error!(e, InternalError) })?;
     let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
     let mut hasher = Md5::new();
+    let mut crc: u32 = 0;
     let mut stream = body;
 
     while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("read request body: {e}"); s3_error!(InternalError) })? {
@@ -65,10 +66,11 @@ async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<St
             .write_all(&chunk)
             .map_err(|e| { tracing::error!("write tmp file: {e}"); s3_error!(e, InternalError) })?;
         hasher.update(&chunk);
+        crc = crc32c::crc32c_append(crc, &chunk);
     }
     writer.flush().map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok((format!("{:x}", hasher.finalize()), crc))
 }
 
 #[async_trait::async_trait]
@@ -151,8 +153,8 @@ impl S3 for SimpleStorage {
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = store.bucket_dir().join(format!(".tmp_{tmp_id:020}"));
 
-        let etag_hex = match stream_body_to_tmp(body, &tmp_path).await {
-            Ok(etag) => etag,
+        let (etag_hex, crc) = match stream_body_to_tmp(body, &tmp_path).await {
+            Ok(v) => v,
             Err(e) => {
                 std::fs::remove_file(&tmp_path).ok();
                 return Err(e);
@@ -169,8 +171,10 @@ impl S3 for SimpleStorage {
         let etag_clone = etag_hex.clone();
         let metadata = input.metadata.unwrap_or_default();
         blocking(move || {
-            store.put_object_streamed(&key, &tmp_path, content_type, etag_clone, now, metadata)
-                .map(|_| ())
+            store.put_object_streamed(
+                &key, &tmp_path, content_type, etag_clone, now, metadata, Some(crc),
+            )
+            .map(|_| ())
         })
         .await
         .map_err(|e| { tracing::error!("put_object: {e}"); s3_error!(e, InternalError) })?;
@@ -197,9 +201,11 @@ impl S3 for SimpleStorage {
                 .get_meta(&key)?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NoSuchKey"))?;
 
+            let obj_size = meta.data_length();
+
             if let Some(ref range) = range {
                 let byte_range = range
-                    .check(meta.length)
+                    .check(obj_size)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "InvalidRange"))?;
                 let range_offset = meta.offset + byte_range.start;
                 let range_len = byte_range.end - byte_range.start;
@@ -208,11 +214,11 @@ impl S3 for SimpleStorage {
                     "bytes {}-{}/{}",
                     byte_range.start,
                     byte_range.end - 1,
-                    meta.length
+                    obj_size
                 );
                 Ok((meta, data, Some(cr)))
             } else {
-                let data = store.read_data(meta.segment_id, meta.offset, meta.length)?;
+                let data = store.read_object(&meta)?;
                 Ok((meta, data, None))
             }
         })
@@ -277,6 +283,7 @@ impl S3 for SimpleStorage {
         })?;
 
         let last_modified = Timestamp::from(UNIX_EPOCH + Duration::from_secs(meta.last_modified));
+        let content_length = meta.data_length().cast_signed();
 
         let metadata = if meta.user_metadata.is_empty() {
             None
@@ -285,7 +292,7 @@ impl S3 for SimpleStorage {
         };
 
         let output = HeadObjectOutput {
-            content_length: Some(meta.length.cast_signed()),
+            content_length: Some(content_length),
             content_type: meta.content_type,
             e_tag: Some(ETag::Strong(meta.etag)),
             last_modified: Some(last_modified),
@@ -407,7 +414,7 @@ impl S3 for SimpleStorage {
                     Timestamp::from(UNIX_EPOCH + Duration::from_secs(meta.last_modified));
                 Object {
                     key: Some(key),
-                    size: Some(meta.length.cast_signed()),
+                    size: Some(meta.data_length().cast_signed()),
                     e_tag: Some(ETag::Strong(meta.etag)),
                     last_modified: Some(last_modified),
                     ..Default::default()

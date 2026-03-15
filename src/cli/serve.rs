@@ -15,6 +15,35 @@ use simple3::auth::AuthStore;
 use simple3::s3impl::SimpleStorage;
 use simple3::storage::Storage;
 
+fn run_scrub(storage: &Arc<Storage>) {
+    let Ok(buckets) = storage.list_buckets() else {
+        return;
+    };
+    for name in &buckets {
+        let Some(store) = storage.get_bucket(name).ok().flatten() else {
+            continue;
+        };
+        match store.verify_integrity() {
+            Ok(result) => {
+                if result.errors.is_empty() {
+                    tracing::info!(
+                        "scrub: {name} — {} objects OK",
+                        result.verified_ok,
+                    );
+                } else {
+                    for e in &result.errors {
+                        tracing::warn!(
+                            "scrub: {name}/{} — {:?}: {}",
+                            e.key, e.kind, e.detail,
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::error!("scrub: {name} — verify failed: {e}"),
+        }
+    }
+}
+
 fn run_autovacuum(storage: &Arc<Storage>, threshold: f64) {
     let Ok(buckets) = storage.list_buckets() else {
         return;
@@ -216,6 +245,7 @@ fn admin_verify(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     data_dir: &Path,
     host: &str,
@@ -224,6 +254,7 @@ pub async fn run(
     autovacuum_interval: u64,
     autovacuum_threshold: f64,
     max_segment_size_mb: u64,
+    scrub_interval: u64,
 ) -> anyhow::Result<()> {
     let max_seg_bytes = max_segment_size_mb * 1024 * 1024;
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
@@ -265,6 +296,21 @@ pub async fn run(
             autovacuum_interval,
             autovacuum_threshold * 100.0
         );
+    }
+
+    if scrub_interval > 0 {
+        let scrub_storage = Arc::clone(&storage);
+        let interval = Duration::from_secs(scrub_interval);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let st = Arc::clone(&scrub_storage);
+                if let Err(e) = tokio::task::spawn_blocking(move || run_scrub(&st)).await {
+                    tracing::error!("scrub task panicked: {e}");
+                }
+            }
+        });
+        tracing::info!("background scrub enabled: interval={}s", scrub_interval);
     }
 
     let auth_provider = AuthProvider::new(Arc::clone(&auth_store));

@@ -389,24 +389,51 @@ impl BucketStore {
         Ok(buf)
     }
 
-    pub fn append_data(&self, data: &[u8]) -> io::Result<(u32, u64, u64)> {
+    pub fn append_data(&self, data: &[u8]) -> io::Result<(u32, u64, u64, u32)> {
+        let crc = crc32c::crc32c(data);
         let mut w = self
             .writer
             .lock()
             .map_err(|_| io::Error::other("writer lock poisoned"))?;
         #[allow(clippy::cast_possible_truncation)]
         let data_len = data.len() as u64;
+        let total_len = data_len + 4;
 
-        if w.size + data_len > self.max_segment_size && w.size > 0 {
+        if w.size + total_len > self.max_segment_size && w.size > 0 {
             self.rotate_segment(&mut w)?;
         }
 
         let segment_id = w.id;
         let offset = w.file.seek(SeekFrom::End(0))?;
         w.file.write_all(data)?;
-        w.size = offset + data_len;
+        w.file.write_all(&crc.to_le_bytes())?;
+        w.size = offset + total_len;
         drop(w);
-        Ok((segment_id, offset, data_len))
+        Ok((segment_id, offset, total_len, crc))
+    }
+
+    /// Read object data, validating the CRC32C checksum if present.
+    /// Returns only the data portion (without the 4-byte CRC trailer).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn read_object(&self, meta: &ObjectMeta) -> io::Result<Vec<u8>> {
+        if let Some(expected_crc) = meta.content_crc32c {
+            let full = self.read_data(meta.segment_id, meta.offset, meta.length)?;
+            let data_len = (meta.length - 4) as usize;
+            let computed = crc32c::crc32c(&full[..data_len]);
+            if computed != expected_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "CRC32C mismatch: expected {expected_crc:#010x}, computed {computed:#010x}"
+                    ),
+                ));
+            }
+            let mut data = full;
+            data.truncate(data_len);
+            Ok(data)
+        } else {
+            self.read_data(meta.segment_id, meta.offset, meta.length)
+        }
     }
 
     pub fn put_meta(&self, key: &str, meta: &ObjectMeta) -> io::Result<()> {
@@ -465,36 +492,49 @@ impl BucketStore {
     // === Streamed PUT ===
 
     /// Write tmp file data into the active segment — rename if empty, copy otherwise.
+    /// If `content_crc32c` is provided, appends a 4-byte LE CRC after the data.
     fn write_to_segment(
         &self,
         w: &mut ActiveWriter,
         tmp_path: &Path,
         mut tmp: File,
         tmp_size: u64,
+        content_crc32c: Option<u32>,
     ) -> io::Result<(u64, u64)> {
+        let crc_len = if content_crc32c.is_some() { 4u64 } else { 0 };
         let seg_path = self.bucket_dir.join(segment_filename(w.id));
         if w.size == 0 {
             // Empty segment — rename tmp file to become the segment (O(1) vs O(n) copy)
             drop(tmp);
             fs::rename(tmp_path, &seg_path)?;
             w.file = OpenOptions::new().read(true).write(true).open(&seg_path)?;
+            if let Some(crc) = content_crc32c {
+                w.file.seek(SeekFrom::End(0))?;
+                w.file.write_all(&crc.to_le_bytes())?;
+            }
             w.file.sync_all()?;
-            w.size = tmp_size;
+            let total = tmp_size + crc_len;
+            w.size = total;
             let reader = w.file.try_clone()?;
             self.segments
                 .write()
                 .map_err(|_| io::Error::other("segments lock poisoned"))?
                 .insert(w.id, Arc::new(RwLock::new(reader)));
-            Ok((0, tmp_size))
+            Ok((0, total))
         } else {
             let offset = w.file.seek(SeekFrom::End(0))?;
-            let length = copy_large(&mut tmp, &mut w.file)?;
+            let data_length = copy_large(&mut tmp, &mut w.file)?;
+            if let Some(crc) = content_crc32c {
+                w.file.write_all(&crc.to_le_bytes())?;
+            }
             w.file.sync_all()?;
-            w.size = offset + length;
-            Ok((offset, length))
+            let total = data_length + crc_len;
+            w.size = offset + total;
+            Ok((offset, total))
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn put_object_streamed(
         &self,
         key: &str,
@@ -503,6 +543,7 @@ impl BucketStore {
         etag: String,
         last_modified: u64,
         user_metadata: HashMap<String, String>,
+        content_crc32c: Option<u32>,
     ) -> io::Result<ObjectMeta> {
         let tmp = File::open(tmp_path)?;
         let tmp_size = tmp.metadata()?.len();
@@ -511,12 +552,14 @@ impl BucketStore {
             .lock()
             .map_err(|_| io::Error::other("writer lock poisoned"))?;
 
-        if w.size + tmp_size > self.max_segment_size && w.size > 0 {
+        let crc_len = if content_crc32c.is_some() { 4u64 } else { 0 };
+        if w.size + tmp_size + crc_len > self.max_segment_size && w.size > 0 {
             self.rotate_segment(&mut w)?;
         }
 
         let segment_id = w.id;
-        let (offset, length) = self.write_to_segment(&mut w, tmp_path, tmp, tmp_size)?;
+        let (offset, length) =
+            self.write_to_segment(&mut w, tmp_path, tmp, tmp_size, content_crc32c)?;
 
         let content_md5 = Some(etag.clone());
         let meta = ObjectMeta {
@@ -528,6 +571,7 @@ impl BucketStore {
             last_modified,
             user_metadata,
             content_md5,
+            content_crc32c,
         };
 
         if let Err(e) = self.commit_put(key, &meta) {

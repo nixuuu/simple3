@@ -30,6 +30,8 @@ You are reviewing a PR in **simple3** — an S3-compatible storage service writt
 - Compaction must set `seg_compacting` flag before starting, remove after atomic rename.
 - Temp files (`.tmp_*`, `.mpu_*`) must be cleaned up on error paths (not just happy path).
 - `content_md5` must be computed and stored for all upload paths (single-part and multipart).
+- `content_crc32c` must be computed during upload streaming (alongside MD5) and passed to `put_object_streamed`. Segment format: `[data][crc32c_le_4bytes]`, `ObjectMeta.length` includes the 4-byte trailer. Use `data_length()` (not `length`) for user-visible sizes and range checks.
+- `read_object()` validates CRC on read for objects with `content_crc32c`. Range reads and gRPC streaming use raw `read_data()` — CRC validation deferred to background scrub.
 - After any data write, verify the redb transaction commits before returning success to the caller.
 
 ### Locking and concurrency
@@ -59,7 +61,7 @@ You are reviewing a PR in **simple3** — an S3-compatible storage service writt
 ### gRPC specifics
 
 - Downloads stream 256 KB chunks via mpsc channels — never load full object into memory.
-- Uploads stream to temp files with MD5 hasher, then call `put_object_streamed`.
+- Uploads stream to temp files with MD5 + CRC32C hashers, then call `put_object_streamed` with `Some(crc)`.
 - Proto-generated code has justified `#[allow(clippy::...)]` in `grpc.rs` — new suppressions elsewhere need justification.
 
 ### Performance

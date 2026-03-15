@@ -46,6 +46,9 @@ enum Command {
         /// gRPC server port (0 = disabled)
         #[arg(long, default_value_t = 50051)]
         grpc_port: u16,
+        /// Background scrub interval in seconds (0 = disabled)
+        #[arg(long, default_value_t = 3600)]
+        scrub_interval: u64,
     },
     /// Compact buckets to reclaim dead space
     Compact {
@@ -149,6 +152,7 @@ enum Command {
     },
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -210,31 +214,35 @@ pub async fn run() -> anyhow::Result<()> {
         }
         cmd => {
             let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir)?;
-            let (host, port, av_interval, av_threshold, max_seg_mb, grpc_port) = match cmd {
-                Some(Command::Serve {
-                    host,
-                    port,
-                    autovacuum_interval,
-                    autovacuum_threshold,
-                    max_segment_size_mb,
-                    grpc_port,
-                }) => (
-                    host,
-                    port,
-                    autovacuum_interval,
-                    autovacuum_threshold,
-                    max_segment_size_mb,
-                    grpc_port,
-                ),
-                _ => (
-                    cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
-                    cfg.server.port.unwrap_or(8080),
-                    cfg.storage.autovacuum_interval.unwrap_or(300),
-                    cfg.storage.autovacuum_threshold.unwrap_or(0.5),
-                    cfg.storage.max_segment_size_mb.unwrap_or(4096),
-                    cfg.server.grpc_port.unwrap_or(50051),
-                ),
-            };
+            let (host, port, av_interval, av_threshold, max_seg_mb, grpc_port, scrub_interval) =
+                match cmd {
+                    Some(Command::Serve {
+                        host,
+                        port,
+                        autovacuum_interval,
+                        autovacuum_threshold,
+                        max_segment_size_mb,
+                        grpc_port,
+                        scrub_interval,
+                    }) => (
+                        host,
+                        port,
+                        autovacuum_interval,
+                        autovacuum_threshold,
+                        max_segment_size_mb,
+                        grpc_port,
+                        scrub_interval,
+                    ),
+                    _ => (
+                        cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
+                        cfg.server.port.unwrap_or(8080),
+                        cfg.storage.autovacuum_interval.unwrap_or(300),
+                        cfg.storage.autovacuum_threshold.unwrap_or(0.5),
+                        cfg.storage.max_segment_size_mb.unwrap_or(4096),
+                        cfg.server.grpc_port.unwrap_or(50051),
+                        cfg.storage.scrub_interval.unwrap_or(3600),
+                    ),
+                };
             serve::run(
                 &cli.data_dir,
                 &host,
@@ -243,6 +251,7 @@ pub async fn run() -> anyhow::Result<()> {
                 av_interval,
                 av_threshold,
                 max_seg_mb,
+                scrub_interval,
             )
             .await
         }
