@@ -48,5 +48,6 @@ WORKDIR /data
 
 EXPOSE 8080 50051
 
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["simple3"]
 CMD ["serve", "--data-dir", "/data", "--host", "0.0.0.0"]
