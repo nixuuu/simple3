@@ -1,0 +1,41 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+    paths: ['**.rs', 'Cargo.toml', 'Cargo.lock', 'proto/**']
+  pull_request:
+    branches: [main]
+    paths: ['**.rs', 'Cargo.toml', 'Cargo.lock', 'proto/**']
+  schedule:
+    - cron: '0 6 * * 1'
+
+jobs:
+  analyze:
+    runs-on: [self-hosted, linux]
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check protoc
+        run: protoc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+
+      - name: Build
+        run: cargo build
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
