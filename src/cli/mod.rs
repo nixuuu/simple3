@@ -152,7 +152,7 @@ enum Command {
     },
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // single dispatch for all subcommands, splitting would hurt readability
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 

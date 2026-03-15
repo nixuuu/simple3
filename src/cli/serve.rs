@@ -245,7 +245,7 @@ fn admin_verify(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // server config values passed through; a struct would add indirection without benefit
 pub async fn run(
     data_dir: &Path,
     host: &str,

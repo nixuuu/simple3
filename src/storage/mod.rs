@@ -547,7 +547,7 @@ impl BucketStore {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // all fields required for atomic put; builder would complicate rollback
     pub fn put_object_streamed(
         &self,
         key: &str,
