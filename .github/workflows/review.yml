@@ -6,7 +6,7 @@ on:
 
 jobs:
   review:
-    runs-on: self-hosted-linux-x64
+    runs-on: [self-hosted, linux]
     permissions:
       contents: read
       pull-requests: write
