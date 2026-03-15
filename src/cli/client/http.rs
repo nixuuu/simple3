@@ -1,11 +1,10 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 
-use super::{BucketEntry, ListResult, ObjectEntry, ObjectHead, Transport};
+use super::{BucketEntry, ListResult, ObjectEntry, ObjectHead, Transport, build_s3_client};
 
 pub struct HttpTransport {
     client: aws_sdk_s3::Client,
@@ -13,23 +12,9 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(endpoint: &str, access_key: &str, secret_key: &str, region: &str) -> Self {
-        let creds = aws_sdk_s3::config::Credentials::new(
-            access_key,
-            secret_key,
-            None,
-            None,
-            "simple3-cli",
-        );
-        let config = aws_sdk_s3::config::Builder::new()
-            .endpoint_url(endpoint)
-            .credentials_provider(creds)
-            .region(aws_sdk_s3::config::Region::new(region.to_owned()))
-            .force_path_style(true)
-            .behavior_version_latest()
-            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-            .build();
-        let client = aws_sdk_s3::Client::from_conf(config);
-        Self { client }
+        Self {
+            client: build_s3_client(endpoint, access_key, secret_key, region),
+        }
     }
 }
 

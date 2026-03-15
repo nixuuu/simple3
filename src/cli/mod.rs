@@ -138,6 +138,19 @@ enum Command {
         #[command(flatten)]
         client: client::ClientArgs,
     },
+    /// Generate a presigned URL for GET or PUT
+    Presign {
+        /// Object URI (<s3://bucket/key>)
+        uri: String,
+        /// HTTP method
+        #[arg(long, value_enum, default_value_t = client::presign::PresignMethod::Get)]
+        method: client::presign::PresignMethod,
+        /// Time-to-live for the URL (e.g. 3600, 1h, 30m, 7d)
+        #[arg(long, default_value = "3600")]
+        ttl: String,
+        #[command(flatten)]
+        client: client::ClientArgs,
+    },
     /// Sync files between local filesystem and S3
     Sync {
         /// Source (local path or <s3://bucket/prefix>)
@@ -221,6 +234,18 @@ pub async fn run() -> anyhow::Result<()> {
             let transport = args.build_transport().await?;
             client::sync_cmd::run(transport, &src, &dest, delete, dryrun, size_only, concurrency)
                 .await
+        }
+        Some(Command::Presign {
+            uri,
+            method,
+            ttl,
+            client: args,
+        }) => {
+            if args.grpc {
+                anyhow::bail!("`simple3 presign` only supports S3 HTTP endpoints; remove --grpc");
+            }
+            let resolved = args.resolve(8080);
+            client::presign::run(&uri, method, &ttl, resolved).await
         }
         cmd => {
             let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir)?;
