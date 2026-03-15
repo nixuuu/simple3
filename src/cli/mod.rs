@@ -209,7 +209,7 @@ pub async fn run() -> anyhow::Result<()> {
                 .await
         }
         cmd => {
-            let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir);
+            let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir)?;
             let (host, port, av_interval, av_threshold, max_seg_mb, grpc_port) = match cmd {
                 Some(Command::Serve {
                     host,

@@ -8,6 +8,7 @@ use simple3::auth::AuthStore;
 use super::serve::json_response;
 
 /// Check admin credentials from `Authorization: Bearer <access_key>:<secret_key>`.
+// Err variant carries full HttpResponse for direct return to caller
 #[allow(clippy::result_large_err)]
 fn check_admin_auth(
     req: &hyper::Request<hyper::body::Incoming>,
