@@ -324,7 +324,7 @@ fn spawn_scrub(
     handle
 }
 
-fn spawn_grpc(
+async fn spawn_grpc(
     storage: &Arc<Storage>,
     auth_store: &Arc<AuthStore>,
     host: &str,
@@ -333,7 +333,9 @@ fn spawn_grpc(
 ) -> anyhow::Result<JoinHandle<()>> {
     let grpc_svc =
         simple3::grpc::GrpcService::new(Arc::clone(storage), Some(Arc::clone(auth_store)));
-    let grpc_addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    let listener = TcpListener::bind(format!("{host}:{port}")).await?;
+    tracing::info!("gRPC listening on {}:{}", host, port);
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let mut rx = shutdown_rx.clone();
     let handle = tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
@@ -342,7 +344,7 @@ fn spawn_grpc(
                     .max_decoding_message_size(64 * 1024 * 1024)
                     .max_encoding_message_size(64 * 1024 * 1024),
             )
-            .serve_with_shutdown(grpc_addr, async move {
+            .serve_with_incoming_shutdown(incoming, async move {
                 let _ = rx.changed().await;
             })
             .await
@@ -350,7 +352,6 @@ fn spawn_grpc(
             tracing::error!("gRPC server error: {e}");
         }
     });
-    tracing::info!("gRPC listening on {}:{}", host, port);
     Ok(handle)
 }
 
@@ -454,7 +455,7 @@ pub async fn run(
     };
 
     if grpc_port > 0 {
-        bg_tasks.push(spawn_grpc(&storage, &auth_store, host, grpc_port, &shutdown_rx)?);
+        bg_tasks.push(spawn_grpc(&storage, &auth_store, host, grpc_port, &shutdown_rx).await?);
     }
 
     let listener = TcpListener::bind((host, port)).await?;
