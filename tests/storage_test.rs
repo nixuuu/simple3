@@ -1008,3 +1008,114 @@ fn test_read_object_crc_mismatch() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("CRC32C mismatch"));
 }
+
+// === Backup / restore ===
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_recursive(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_backup_restore_cold_copy() {
+    // --- Set up original storage with objects ---
+    let orig_dir = tempfile::tempdir().unwrap();
+
+    // Create auth store so _auth.redb exists
+    let (_auth, _bootstrap) = simple3::auth::AuthStore::open(orig_dir.path()).unwrap();
+    drop(_auth);
+
+    let storage = Storage::open(orig_dir.path()).unwrap();
+    storage.create_bucket("docs").unwrap();
+    let bucket = storage.get_bucket("docs").unwrap().unwrap();
+
+    // 1) Simple object via append_data + put_meta
+    let data1 = b"first object";
+    let md5_1 = format!("{:x}", Md5::digest(data1));
+    let (seg, off, len, crc) = bucket.append_data(data1).unwrap();
+    let meta1 = ObjectMeta {
+        segment_id: seg,
+        offset: off,
+        length: len,
+        content_type: Some("text/plain".into()),
+        etag: md5_1.clone(),
+        last_modified: 100,
+        user_metadata: HashMap::new(),
+        content_md5: Some(md5_1),
+        content_crc32c: Some(crc),
+    };
+    bucket.put_meta("simple.txt", &meta1).unwrap();
+
+    // 2) Streamed put
+    let data2 = b"streamed backup content";
+    let tmp_path = bucket.bucket_dir().join(".tmp_backup_test");
+    std::fs::write(&tmp_path, data2).unwrap();
+    let etag2 = format!("{:x}", Md5::digest(data2));
+    let crc2 = crc32c::crc32c(data2);
+    bucket
+        .put_object_streamed(
+            "streamed.txt",
+            &tmp_path,
+            Some("application/octet-stream".into()),
+            etag2,
+            200,
+            HashMap::new(),
+            Some(crc2),
+        )
+        .unwrap();
+
+    // 3) Multipart upload
+    let upload_id = bucket.create_multipart_upload();
+    let etag_p1 = bucket.upload_part(&upload_id, 1, b"alpha-").unwrap();
+    let etag_p2 = bucket.upload_part(&upload_id, 2, b"beta").unwrap();
+    let parts = vec![(1, etag_p1), (2, etag_p2)];
+    bucket
+        .complete_multipart_upload(&upload_id, "multi.bin", &parts, None, 300, HashMap::new())
+        .unwrap();
+
+    // Drop storage to simulate server stop
+    drop(bucket);
+    drop(storage);
+
+    // --- Cold copy to backup dir ---
+    let backup_dir = tempfile::tempdir().unwrap();
+    copy_dir_recursive(orig_dir.path(), backup_dir.path());
+
+    // --- Reopen from backup ---
+    let restored = Storage::open(backup_dir.path()).unwrap();
+    let rb = restored.get_bucket("docs").unwrap().unwrap();
+
+    // Verify simple object
+    let m1 = rb.get_meta("simple.txt").unwrap().unwrap();
+    assert_eq!(rb.read_object(&m1).unwrap(), data1);
+
+    // Verify streamed object
+    let m2 = rb.get_meta("streamed.txt").unwrap().unwrap();
+    assert_eq!(rb.read_object(&m2).unwrap(), data2);
+
+    // Verify multipart object
+    let m3 = rb.get_meta("multi.bin").unwrap().unwrap();
+    assert_eq!(rb.read_object(&m3).unwrap(), b"alpha-beta");
+
+    // Full integrity check
+    let result = rb.verify_integrity().unwrap();
+    assert_eq!(result.total_objects, 3);
+    assert_eq!(result.verified_ok, 3);
+    assert!(result.errors.is_empty());
+
+    // Auth store opens cleanly from backup
+    let (auth_restored, bootstrap) = simple3::auth::AuthStore::open(backup_dir.path()).unwrap();
+    assert!(matches!(
+        bootstrap,
+        simple3::auth::types::BootstrapResult::Existing
+    ));
+    drop(auth_restored);
+}
