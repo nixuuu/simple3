@@ -494,8 +494,10 @@ pub async fn run(
     }
 
     drop(listener);
-    drain_connections(&mut connections, shutdown_timeout).await;
-    await_bg_tasks(&mut bg_tasks, shutdown_timeout).await;
+    tokio::join!(
+        drain_connections(&mut connections, shutdown_timeout),
+        await_bg_tasks(&mut bg_tasks, shutdown_timeout),
+    );
 
     match tokio::task::spawn_blocking(move || storage.sync_all()).await {
         Ok(Ok(())) => {}
