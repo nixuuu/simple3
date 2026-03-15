@@ -274,4 +274,53 @@ async fn test_presign_policy_denied() {
 
     let resp = http_client.get(presigned_denied.uri()).send().await.unwrap();
     assert_eq!(resp.status(), 403, "denied bucket should return 403");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<Code>AccessDenied</Code>"),
+        "expected AccessDenied error code, got: {body}"
+    );
+}
+
+/// Exercise the `simple3 presign` CLI command end-to-end.
+#[tokio::test]
+async fn test_presign_cli_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(dir.path()).await;
+    let client = make_client(srv.port, &srv.access_key, &srv.secret_key);
+
+    client.create_bucket().bucket("cli-test").send().await.unwrap();
+    client
+        .put_object()
+        .bucket("cli-test")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"cli content"))
+        .send()
+        .await
+        .unwrap();
+
+    // Run the binary's presign subcommand
+    let bin = env!("CARGO_BIN_EXE_simple3");
+    let output = std::process::Command::new(bin)
+        .args([
+            "presign",
+            "s3://cli-test/doc.txt",
+            "--ttl", "1h",
+            "--method", "get",
+            "--endpoint-url", &format!("http://127.0.0.1:{}", srv.port),
+            "--access-key", &srv.access_key,
+            "--secret-key", &srv.secret_key,
+        ])
+        .output()
+        .expect("failed to run simple3 presign");
+
+    assert!(output.status.success(), "presign failed: {}", String::from_utf8_lossy(&output.stderr));
+    let url = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    assert!(url.starts_with("http://"), "expected URL, got: {url}");
+
+    // Fetch the presigned URL with an unsigned client
+    let http_client = reqwest::Client::new();
+    let resp = http_client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(&body[..], b"cli content");
 }

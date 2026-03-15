@@ -131,6 +131,22 @@ impl S3Uri {
     }
 }
 
+/// Build an `aws_sdk_s3::Client` with path-style addressing and static credentials.
+pub fn build_s3_client(endpoint: &str, access_key: &str, secret_key: &str, region: &str) -> aws_sdk_s3::Client {
+    use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
+
+    let creds = Credentials::new(access_key, secret_key, None, None, "simple3-cli");
+    let config = aws_sdk_s3::config::Builder::new()
+        .endpoint_url(endpoint)
+        .credentials_provider(creds)
+        .region(Region::new(region.to_owned()))
+        .force_path_style(true)
+        .behavior_version_latest()
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .build();
+    aws_sdk_s3::Client::from_conf(config)
+}
+
 /// Returns true if the string looks like an S3 URI.
 pub fn is_s3_uri(s: &str) -> bool {
     s.starts_with("s3://")

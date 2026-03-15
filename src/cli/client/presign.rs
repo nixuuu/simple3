@@ -1,10 +1,9 @@
 use std::time::Duration;
 
-use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
 use aws_sdk_s3::presigning::PresigningConfig;
 use clap::ValueEnum;
 
-use super::{ResolvedArgs, S3Uri};
+use super::{ResolvedArgs, S3Uri, build_s3_client};
 
 const MAX_TTL_SECS: u64 = 604_800; // 7 days
 
@@ -20,19 +19,19 @@ pub fn parse_ttl(s: &str) -> anyhow::Result<Duration> {
         return validate_ttl(secs);
     }
 
-    if s_trimmed.len() < 2 {
-        anyhow::bail!("invalid TTL: {s}");
-    }
-
-    let (num_str, suffix) = s_trimmed.split_at(s_trimmed.len() - 1);
+    let suffix = s_trimmed
+        .chars()
+        .next_back()
+        .ok_or_else(|| anyhow::anyhow!("invalid TTL: {s}"))?;
+    let num_str = &s_trimmed[..s_trimmed.len() - suffix.len_utf8()];
     let n: u64 = num_str
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid TTL: {s}"))?;
     let multiplier: u64 = match suffix {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86400,
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
         _ => anyhow::bail!("unknown TTL suffix '{suffix}', expected s/m/h/d"),
     };
     let secs = n
@@ -65,23 +64,12 @@ pub async fn run(
 
     let ttl = parse_ttl(ttl_str)?;
     let presign_config = PresigningConfig::expires_in(ttl)?;
-
-    let creds = Credentials::new(
+    let client = build_s3_client(
+        &resolved.endpoint,
         &resolved.access_key,
         &resolved.secret_key,
-        None,
-        None,
-        "simple3-cli",
+        &resolved.region,
     );
-    let config = aws_sdk_s3::config::Builder::new()
-        .endpoint_url(&resolved.endpoint)
-        .credentials_provider(creds)
-        .region(Region::new(resolved.region))
-        .force_path_style(true)
-        .behavior_version_latest()
-        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .build();
-    let client = aws_sdk_s3::Client::from_conf(config);
 
     let presigned = match method {
         PresignMethod::Get => {
@@ -148,5 +136,11 @@ mod tests {
     fn test_parse_ttl_overflow() {
         assert!(parse_ttl("99999999999999999h").is_err());
         assert!(parse_ttl("99999999999999999d").is_err());
+    }
+
+    #[test]
+    fn test_parse_ttl_multibyte_suffix() {
+        assert!(parse_ttl("1秒").is_err());
+        assert!(parse_ttl("5分").is_err());
     }
 }
