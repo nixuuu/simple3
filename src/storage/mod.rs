@@ -780,7 +780,11 @@ impl Storage {
     }
 
     pub fn end_compacting(&self) {
-        self.compacting.fetch_sub(1, Ordering::Relaxed);
+        self.compacting
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
     }
 
     pub fn is_compacting(&self) -> bool {
