@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 mod admin_auth;
 mod compact;
+mod health;
 pub mod client;
 pub mod config;
 pub mod keys;
@@ -56,6 +57,8 @@ enum Command {
         #[arg(long)]
         min_disk_free_mb: Option<u64>,
     },
+    /// Check if the running server is healthy
+    Health,
     /// Compact buckets to reclaim dead space
     Compact {
         /// Compact only this bucket (default: all buckets)
@@ -163,6 +166,7 @@ pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Health) => health::run(&cli.data_dir, cli.config.as_deref()).await,
         Some(Command::Compact { bucket }) => compact::run(&cli.data_dir, bucket),
         Some(Command::Verify { bucket }) => verify::run(&cli.data_dir, bucket),
         Some(Command::Keys { cmd, client: args }) => keys::run(args, cmd).await,

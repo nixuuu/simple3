@@ -33,7 +33,7 @@ RUN cargo build --release --bin simple3
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r simple3 && useradd -r -g simple3 -m simple3
@@ -50,6 +50,6 @@ EXPOSE 8080 50051
 
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8080/health || exit 1
+  CMD simple3 health --data-dir /data || exit 1
 ENTRYPOINT ["simple3"]
 CMD ["serve", "--data-dir", "/data", "--host", "0.0.0.0"]
