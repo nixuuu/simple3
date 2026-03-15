@@ -450,6 +450,8 @@ fn test_put_object_streamed() {
 
     assert_eq!(meta.data_length(), 18);
     assert_eq!(meta.etag, "etag_s");
+    assert!(meta.content_crc32c.is_some());
+    assert_eq!(meta.length, meta.data_length() + 4);
 
     // Temp file removed
     assert!(!tmp_path.exists());
@@ -962,8 +964,12 @@ fn test_verify_multipart_upload() {
     assert_eq!(result.verified_ok, 1);
     assert!(result.errors.is_empty());
 
-    // Also verify the content_md5 matches MD5 of the full assembled data
+    // Verify CRC metadata persisted on multipart path
     let meta = bucket.get_meta("mpu_obj").unwrap().unwrap();
+    assert!(meta.content_crc32c.is_some());
+    assert_eq!(meta.length, meta.data_length() + 4);
+
+    // Verify the content_md5 matches MD5 of the full assembled data
     let full_data = bucket.read_object(&meta).unwrap();
     assert_eq!(full_data, b"part one part two");
     let expected_md5 = format!("{:x}", Md5::digest(&full_data));

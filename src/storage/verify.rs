@@ -129,18 +129,36 @@ impl BucketStore {
             offset += chunk as u64;
             remaining -= chunk as u64;
         }
-        drop(file);
-
-        // Verify CRC32C
-        if let Some(expected_crc) = meta.content_crc32c
-            && crc != expected_crc
-        {
-            return Err(VerifyError {
+        // Verify CRC32C: computed from data + on-disk trailer
+        if let Some(expected_crc) = meta.content_crc32c {
+            if crc != expected_crc {
+                drop(file);
+                return Err(VerifyError {
+                    key: key.to_owned(),
+                    kind: VerifyErrorKind::CrcMismatch,
+                    detail: format!("expected {expected_crc:#010x}, computed {crc:#010x}"),
+                });
+            }
+            // Read the 4-byte on-disk trailer and compare
+            let mut trailer = [0u8; 4];
+            file.read_exact_at(&mut trailer, meta.offset + data_len).map_err(|e| VerifyError {
                 key: key.to_owned(),
-                kind: VerifyErrorKind::CrcMismatch,
-                detail: format!("expected {expected_crc:#010x}, computed {crc:#010x}"),
-            });
+                kind: VerifyErrorKind::ReadError,
+                detail: format!("segment {}: CRC trailer read error: {e}", meta.segment_id),
+            })?;
+            let stored_crc = u32::from_le_bytes(trailer);
+            if stored_crc != expected_crc {
+                drop(file);
+                return Err(VerifyError {
+                    key: key.to_owned(),
+                    kind: VerifyErrorKind::CrcMismatch,
+                    detail: format!(
+                        "trailer mismatch: expected {expected_crc:#010x}, stored {stored_crc:#010x}"
+                    ),
+                });
+            }
         }
+        drop(file);
 
         // Verify MD5
         let computed = format!("{:x}", md5_hasher.finalize());

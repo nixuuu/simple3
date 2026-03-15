@@ -74,14 +74,22 @@ impl BucketStore {
         let segment_id = w.id;
         let offset = w.file.seek(SeekFrom::End(0))?;
 
-        let (total_data_len, etag, content_md5, crc) =
-            self.assemble_parts(&mut w.file, &sorted_parts, upload_id)?;
-
-        // Append CRC32C after assembled data
-        w.file.write_all(&crc.to_le_bytes())?;
+        let write_result = (|| -> io::Result<(u64, String, String, u32)> {
+            let (total_data_len, etag, content_md5, crc) =
+                self.assemble_parts(&mut w.file, &sorted_parts, upload_id)?;
+            w.file.write_all(&crc.to_le_bytes())?;
+            w.file.sync_all()?;
+            Ok((total_data_len, etag, content_md5, crc))
+        })();
+        let (total_data_len, etag, content_md5, crc) = match write_result {
+            Ok(v) => v,
+            Err(e) => {
+                w.file.set_len(offset).ok();
+                w.size = offset;
+                return Err(e);
+            }
+        };
         let total_len = total_data_len + 4;
-
-        w.file.sync_all()?;
         w.size = offset + total_len;
 
         let meta = ObjectMeta {

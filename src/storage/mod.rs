@@ -395,7 +395,7 @@ impl BucketStore {
             .writer
             .lock()
             .map_err(|_| io::Error::other("writer lock poisoned"))?;
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_truncation)] // usize → u64 never truncates on 64-bit
         let data_len = data.len() as u64;
         let total_len = data_len + 4;
 
@@ -414,17 +414,30 @@ impl BucketStore {
 
     /// Read object data, validating the CRC32C checksum if present.
     /// Returns only the data portion (without the 4-byte CRC trailer).
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)] // segment sizes bounded well within usize on 64-bit
     pub fn read_object(&self, meta: &ObjectMeta) -> io::Result<Vec<u8>> {
         if let Some(expected_crc) = meta.content_crc32c {
+            if meta.length < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "object length is smaller than the CRC trailer",
+                ));
+            }
             let full = self.read_data(meta.segment_id, meta.offset, meta.length)?;
-            let data_len = (meta.length - 4) as usize;
+            let data_len = meta.data_length() as usize;
             let computed = crc32c::crc32c(&full[..data_len]);
-            if computed != expected_crc {
+            let stored_crc = u32::from_le_bytes([
+                full[data_len],
+                full[data_len + 1],
+                full[data_len + 2],
+                full[data_len + 3],
+            ]);
+            if computed != expected_crc || stored_crc != expected_crc {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "CRC32C mismatch: expected {expected_crc:#010x}, computed {computed:#010x}"
+                        "CRC32C mismatch: expected {expected_crc:#010x}, \
+                         stored {stored_crc:#010x}, computed {computed:#010x}"
                     ),
                 ));
             }
