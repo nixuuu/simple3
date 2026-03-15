@@ -50,8 +50,8 @@ enum Command {
         #[arg(long, default_value_t = 3600)]
         scrub_interval: u64,
         /// Graceful shutdown timeout in seconds
-        #[arg(long, default_value_t = 30)]
-        shutdown_timeout: u64,
+        #[arg(long)]
+        shutdown_timeout: Option<u64>,
     },
     /// Compact buckets to reclaim dead space
     Compact {
@@ -244,7 +244,9 @@ pub async fn run() -> anyhow::Result<()> {
                     max_segment_size_mb,
                     grpc_port,
                     scrub_interval,
-                    shutdown_timeout,
+                    shutdown_timeout
+                        .or(cfg.server.shutdown_timeout)
+                        .unwrap_or(30),
                 ),
                 _ => (
                     cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),

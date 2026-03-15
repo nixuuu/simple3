@@ -820,12 +820,15 @@ impl Storage {
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
+        let mut first_err = None;
         for (name, store) in &stores {
             if let Err(e) = store.sync_active_segment() {
                 tracing::error!("sync_all: {name} — {e}");
-                return Err(e);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 }

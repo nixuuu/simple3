@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use simple3::auth::s3_auth::AuthProvider;
 use simple3::auth::types::BootstrapResult;
@@ -259,6 +259,13 @@ fn spawn_signal_handler(
             _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
         }
         let _ = shutdown_tx.send(true);
+
+        // Second signal: force exit
+        tokio::select! {
+            _ = sigterm.recv() => tracing::warn!("received second SIGTERM, forcing exit"),
+            _ = sigint.recv() => tracing::warn!("received second SIGINT, forcing exit"),
+        }
+        std::process::exit(1);
     });
 }
 
@@ -267,11 +274,11 @@ fn spawn_autovacuum(
     interval_secs: u64,
     threshold: f64,
     shutdown_rx: &watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     let av_storage = Arc::clone(storage);
     let interval = Duration::from_secs(interval_secs);
     let mut rx = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
@@ -290,17 +297,18 @@ fn spawn_autovacuum(
         interval_secs,
         threshold * 100.0
     );
+    handle
 }
 
 fn spawn_scrub(
     storage: &Arc<Storage>,
     interval_secs: u64,
     shutdown_rx: &watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     let scrub_storage = Arc::clone(storage);
     let interval = Duration::from_secs(interval_secs);
     let mut rx = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
@@ -313,6 +321,7 @@ fn spawn_scrub(
         }
     });
     tracing::info!("background scrub enabled: interval={}s", interval_secs);
+    handle
 }
 
 fn spawn_grpc(
@@ -321,12 +330,12 @@ fn spawn_grpc(
     host: &str,
     port: u16,
     shutdown_rx: &watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<JoinHandle<()>> {
     let grpc_svc =
         simple3::grpc::GrpcService::new(Arc::clone(storage), Some(Arc::clone(auth_store)));
     let grpc_addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
     let mut rx = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(
                 simple3::grpc::proto::simple3_server::Simple3Server::new(grpc_svc)
@@ -342,7 +351,24 @@ fn spawn_grpc(
         }
     });
     tracing::info!("gRPC listening on {}:{}", host, port);
-    Ok(())
+    Ok(handle)
+}
+
+async fn await_bg_tasks(tasks: &mut [JoinHandle<()>], timeout_secs: u64) {
+    let timeout = Duration::from_secs(timeout_secs);
+    if tokio::time::timeout(timeout, async {
+        for handle in tasks.iter_mut() {
+            let _ = handle.await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!("background tasks did not finish within timeout, aborting");
+        for handle in tasks.iter() {
+            handle.abort();
+        }
+    }
 }
 
 async fn drain_connections(connections: &mut JoinSet<()>, timeout_secs: u64) {
@@ -403,12 +429,16 @@ pub async fn run(
     let sigint = tokio::signal::unix::signal(SignalKind::interrupt())?;
     spawn_signal_handler(sigterm, sigint, shutdown_tx);
 
+    let mut bg_tasks: Vec<JoinHandle<()>> = Vec::new();
+
     if autovacuum_interval > 0 {
-        spawn_autovacuum(&storage, autovacuum_interval, autovacuum_threshold, &shutdown_rx);
+        bg_tasks.push(spawn_autovacuum(
+            &storage, autovacuum_interval, autovacuum_threshold, &shutdown_rx,
+        ));
     }
 
     if scrub_interval > 0 {
-        spawn_scrub(&storage, scrub_interval, &shutdown_rx);
+        bg_tasks.push(spawn_scrub(&storage, scrub_interval, &shutdown_rx));
     }
 
     let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
@@ -424,7 +454,7 @@ pub async fn run(
     };
 
     if grpc_port > 0 {
-        spawn_grpc(&storage, &auth_store, host, grpc_port, &shutdown_rx)?;
+        bg_tasks.push(spawn_grpc(&storage, &auth_store, host, grpc_port, &shutdown_rx)?);
     }
 
     let listener = TcpListener::bind((host, port)).await?;
@@ -465,9 +495,18 @@ pub async fn run(
 
     drop(listener);
     drain_connections(&mut connections, shutdown_timeout).await;
+    await_bg_tasks(&mut bg_tasks, shutdown_timeout).await;
 
-    if let Err(e) = storage.sync_all() {
-        tracing::error!("failed to sync storage on shutdown: {e}");
+    match tokio::task::spawn_blocking(move || storage.sync_all()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!("failed to sync storage on shutdown: {e}");
+            return Err(e.into());
+        }
+        Err(e) => {
+            tracing::error!("sync_all task panicked: {e}");
+            return Err(e.into());
+        }
     }
 
     tracing::info!("shutdown complete");
