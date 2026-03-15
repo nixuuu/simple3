@@ -7,7 +7,7 @@ pub mod types;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rand::Rng;
+use rand::RngExt;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use types::{BootstrapResult, KeyRecord, PolicyRecord};
