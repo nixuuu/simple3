@@ -2,6 +2,7 @@
 name = "simple3"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE.md"
 
 [dependencies]
 s3s = "0.13.0"
