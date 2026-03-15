@@ -128,12 +128,11 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
 
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let path = req.uri().path().to_owned();
-        let method = req.method().clone();
-        if method == hyper::Method::GET && path == "/health" {
+        if *req.method() == hyper::Method::GET && path == "/health" {
             Box::pin(async {
                 Ok(json_response(200, &serde_json::json!({"status": "ok"})))
             })
-        } else if method == hyper::Method::GET && path == "/ready" {
+        } else if *req.method() == hyper::Method::GET && path == "/ready" {
             let storage = Arc::clone(&self.storage);
             let min_free = self.min_disk_free_mb;
             Box::pin(async move {
@@ -145,6 +144,7 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
             })
         } else if path.starts_with("/_/keys") || path.starts_with("/_/policies") {
             let auth_store = Arc::clone(&self.auth_store);
+            let method = req.method().clone();
             Box::pin(async move {
                 Ok(super::admin_auth::handle_admin_auth(req, &path, &method, auth_store).await)
             })
@@ -267,9 +267,10 @@ fn handle_ready(storage: &Storage, min_disk_free_mb: u64) -> s3s::HttpResponse {
     let buckets = match storage.list_buckets() {
         Ok(b) => b,
         Err(e) => {
+            let msg = format!("storage not accessible: {e}");
             return json_response(
                 503,
-                &serde_json::json!({"status": "unavailable", "error": format!("storage not accessible: {e}")}),
+                &serde_json::json!({"status": "unavailable", "error": msg}),
             );
         }
     };
@@ -283,7 +284,7 @@ fn handle_ready(storage: &Storage, min_disk_free_mb: u64) -> s3s::HttpResponse {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss)] // u64 -> f64 for ratio; sub-ULP precision irrelevant
     let dead_ratio = if total_size > 0 {
         total_dead as f64 / total_size as f64
     } else {
@@ -297,23 +298,34 @@ fn handle_ready(storage: &Storage, min_disk_free_mb: u64) -> s3s::HttpResponse {
     let degraded = min_free_bytes > 0 && disk_free_bytes < min_free_bytes;
     let (status_code, status) = if degraded { (503, "unavailable") } else { (200, "ok") };
 
-    json_response(
-        status_code,
-        &serde_json::json!({
-            "status": status,
-            "bucket_count": buckets.len(),
-            "total_size_bytes": total_size,
-            "total_dead_bytes": total_dead,
-            "dead_space_ratio": (dead_ratio * 10000.0).round() / 10000.0,
-            "disk_free_bytes": disk_free_bytes,
-            "compaction_running": compaction_running,
-        }),
-    )
+    let mut body = serde_json::json!({
+        "status": status,
+        "bucket_count": buckets.len(),
+        "total_size_bytes": total_size,
+        "total_dead_bytes": total_dead,
+        "dead_space_ratio": (dead_ratio * 10000.0).round() / 10000.0,
+        "disk_free_bytes": disk_free_bytes,
+        "compaction_running": compaction_running,
+    });
+    if degraded {
+        body["error"] = serde_json::json!(format!(
+            "disk free {}MB < minimum {}MB",
+            disk_free_bytes / (1024 * 1024),
+            min_disk_free_mb
+        ));
+    }
+
+    json_response(status_code, &body)
 }
 
 fn disk_free(path: &Path) -> u64 {
-    nix::sys::statvfs::statvfs(path)
-        .map_or(0, |s| u64::from(s.blocks_available()) * s.fragment_size())
+    match nix::sys::statvfs::statvfs(path) {
+        Ok(s) => u64::from(s.blocks_available()) * s.fragment_size(),
+        Err(e) => {
+            tracing::warn!("statvfs failed for {}: {e}", path.display());
+            0
+        }
+    }
 }
 
 fn spawn_signal_handler(
