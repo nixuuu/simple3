@@ -4,7 +4,7 @@ simple3 stores all state on disk inside a single `data_dir`. A consistent copy o
 
 ## File layout
 
-```
+```text
 data_dir/
   _auth.redb              # access keys and IAM policies
   bucket-a/
