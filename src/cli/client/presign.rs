@@ -2,10 +2,17 @@ use std::time::Duration;
 
 use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
 use aws_sdk_s3::presigning::PresigningConfig;
+use clap::ValueEnum;
 
-use super::S3Uri;
+use super::{ResolvedArgs, S3Uri};
 
 const MAX_TTL_SECS: u64 = 604_800; // 7 days
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum PresignMethod {
+    Get,
+    Put,
+}
 
 pub fn parse_ttl(s: &str) -> anyhow::Result<Duration> {
     // Pure seconds: "3600"
@@ -44,12 +51,9 @@ fn validate_ttl(secs: u64) -> anyhow::Result<Duration> {
 
 pub async fn run(
     uri: &str,
-    method: &str,
+    method: PresignMethod,
     ttl_str: &str,
-    endpoint: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
+    resolved: &ResolvedArgs,
 ) -> anyhow::Result<()> {
     let parsed = S3Uri::parse(uri)?;
     let key = parsed
@@ -60,19 +64,25 @@ pub async fn run(
     let ttl = parse_ttl(ttl_str)?;
     let presign_config = PresigningConfig::expires_in(ttl)?;
 
-    let creds = Credentials::new(access_key, secret_key, None, None, "simple3-cli");
+    let creds = Credentials::new(
+        &resolved.access_key,
+        &resolved.secret_key,
+        None,
+        None,
+        "simple3-cli",
+    );
     let config = aws_sdk_s3::config::Builder::new()
-        .endpoint_url(endpoint)
+        .endpoint_url(&resolved.endpoint)
         .credentials_provider(creds)
-        .region(Region::new(region.to_owned()))
+        .region(Region::new(resolved.region.clone()))
         .force_path_style(true)
         .behavior_version_latest()
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
         .build();
     let client = aws_sdk_s3::Client::from_conf(config);
 
-    let presigned = match method.to_uppercase().as_str() {
-        "GET" => {
+    let presigned = match method {
+        PresignMethod::Get => {
             client
                 .get_object()
                 .bucket(bucket)
@@ -80,7 +90,7 @@ pub async fn run(
                 .presigned(presign_config)
                 .await?
         }
-        "PUT" => {
+        PresignMethod::Put => {
             client
                 .put_object()
                 .bucket(bucket)
@@ -88,7 +98,6 @@ pub async fn run(
                 .presigned(presign_config)
                 .await?
         }
-        other => anyhow::bail!("unsupported method: {other}, expected GET or PUT"),
     };
 
     println!("{}", presigned.uri());

@@ -39,30 +39,48 @@ pub struct ClientArgs {
     pub region: Option<String>,
 }
 
+/// Resolved connection parameters (no more `Option`s).
+pub struct ResolvedArgs {
+    pub endpoint: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub region: String,
+}
+
 impl ClientArgs {
-    pub async fn build_transport(self) -> anyhow::Result<Arc<dyn Transport>> {
+    /// Resolve optional CLI/env values into concrete defaults.
+    pub fn resolve(self, default_port: u16) -> ResolvedArgs {
         let region = self
             .region
             .or_else(|| std::env::var("AWS_REGION").ok())
             .unwrap_or_else(|| "us-east-1".into());
+        let endpoint = self
+            .endpoint_url
+            .unwrap_or_else(|| format!("http://localhost:{default_port}"));
+        let access_key = self.access_key.unwrap_or_else(|| "test".into());
+        let secret_key = self.secret_key.unwrap_or_else(|| "test".into());
+        ResolvedArgs {
+            endpoint,
+            access_key,
+            secret_key,
+            region,
+        }
+    }
 
+    pub async fn build_transport(self) -> anyhow::Result<Arc<dyn Transport>> {
         if self.grpc {
-            let endpoint = self
-                .endpoint_url
-                .unwrap_or_else(|| "http://localhost:50051".into());
-            let access_key = self.access_key.as_deref().or(Some("test"));
-            let secret_key = self.secret_key.as_deref().or(Some("test"));
-            let transport =
-                grpc::GrpcTransport::connect(&endpoint, access_key, secret_key).await?;
+            let r = self.resolve(50051);
+            let transport = grpc::GrpcTransport::connect(
+                &r.endpoint,
+                Some(r.access_key.as_str()),
+                Some(r.secret_key.as_str()),
+            )
+            .await?;
             Ok(Arc::new(transport))
         } else {
-            let endpoint = self
-                .endpoint_url
-                .unwrap_or_else(|| "http://localhost:8080".into());
-            let access_key = self.access_key.unwrap_or_else(|| "test".into());
-            let secret_key = self.secret_key.unwrap_or_else(|| "test".into());
+            let r = self.resolve(8080);
             let transport =
-                http::HttpTransport::new(&endpoint, &access_key, &secret_key, &region);
+                http::HttpTransport::new(&r.endpoint, &r.access_key, &r.secret_key, &r.region);
             Ok(Arc::new(transport))
         }
     }

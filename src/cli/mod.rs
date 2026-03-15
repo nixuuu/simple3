@@ -142,9 +142,9 @@ enum Command {
     Presign {
         /// Object URI (<s3://bucket/key>)
         uri: String,
-        /// HTTP method (GET or PUT)
-        #[arg(long, default_value = "GET")]
-        method: String,
+        /// HTTP method
+        #[arg(long, value_enum, default_value_t = client::presign::PresignMethod::Get)]
+        method: client::presign::PresignMethod,
         /// Time-to-live for the URL (e.g. 3600, 1h, 30m, 7d)
         #[arg(long, default_value = "3600")]
         ttl: String,
@@ -241,17 +241,8 @@ pub async fn run() -> anyhow::Result<()> {
             ttl,
             client: args,
         }) => {
-            let region = args
-                .region
-                .or_else(|| std::env::var("AWS_REGION").ok())
-                .unwrap_or_else(|| "us-east-1".into());
-            let endpoint = args
-                .endpoint_url
-                .unwrap_or_else(|| "http://localhost:8080".into());
-            let access_key = args.access_key.unwrap_or_else(|| "test".into());
-            let secret_key = args.secret_key.unwrap_or_else(|| "test".into());
-            client::presign::run(&uri, &method, &ttl, &endpoint, &access_key, &secret_key, &region)
-                .await
+            let resolved = args.resolve(8080);
+            client::presign::run(&uri, method, &ttl, &resolved).await
         }
         cmd => {
             let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir)?;
