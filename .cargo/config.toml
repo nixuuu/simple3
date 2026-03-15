@@ -63,5 +63,5 @@ rustflags = [
 
 # Useful aliases for common operations
 [alias]
-lint = "clippy -- -W clippy::all -W clippy::pedantic -W clippy::nursery"
+lint = "clippy -- -W clippy::all -W clippy::pedantic -W clippy::nursery -A clippy::module_name_repetitions -A clippy::must_use_candidate -A clippy::missing_errors_doc -A clippy::missing_panics_doc"
 fix-lint = "clippy --fix --allow-dirty --allow-staged"

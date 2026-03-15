@@ -54,13 +54,13 @@ pub async fn run(args: ClientArgs, cmd: KeysCommand) -> anyhow::Result<()> {
         KeysCommand::List => {
             let resp: serde_json::Value = client.get("/_/keys").await?;
             let keys = resp["keys"].as_array();
-            if keys.is_none() || keys.is_some_and(|k| k.is_empty()) {
+            if keys.is_none() || keys.is_some_and(Vec::is_empty) {
                 println!("no access keys");
                 return Ok(());
             }
             println!(
-                "{:<22} {:<20} {:<7} {:<8} {}",
-                "ACCESS_KEY_ID", "CREATED", "ADMIN", "ENABLED", "DESCRIPTION"
+                "{:<22} {:<20} {:<7} {:<8} DESCRIPTION",
+                "ACCESS_KEY_ID", "CREATED", "ADMIN", "ENABLED"
             );
             for k in keys.unwrap_or(&vec![]) {
                 println!(
@@ -88,7 +88,7 @@ pub async fn run(args: ClientArgs, cmd: KeysCommand) -> anyhow::Result<()> {
             );
             println!("Description:   {}", resp["description"].as_str().unwrap_or(""));
             let policies = resp["policies"].as_array();
-            if policies.is_none() || policies.is_some_and(|p| p.is_empty()) {
+            if policies.is_none() || policies.is_some_and(Vec::is_empty) {
                 println!("Policies:      (none)");
             } else {
                 println!("Policies:");
@@ -197,6 +197,6 @@ impl AdminClient {
                 .unwrap_or(body);
             anyhow::bail!("{msg}");
         }
-        Ok(serde_json::from_str(&body).unwrap_or(serde_json::json!({})))
+        Ok(serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({})))
     }
 }

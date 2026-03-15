@@ -56,11 +56,11 @@ pub async fn run(args: ClientArgs, cmd: PolicyCommand) -> anyhow::Result<()> {
         PolicyCommand::List => {
             let resp: serde_json::Value = client.get("/_/policies").await?;
             let policies = resp["policies"].as_array();
-            if policies.is_none() || policies.is_some_and(|p| p.is_empty()) {
+            if policies.is_none() || policies.is_some_and(Vec::is_empty) {
                 println!("no policies");
                 return Ok(());
             }
-            println!("{:<30} {:<12} {}", "NAME", "STATEMENTS", "CREATED");
+            println!("{:<30} {:<12} CREATED", "NAME", "STATEMENTS");
             for p in policies.unwrap_or(&vec![]) {
                 println!(
                     "{:<30} {:<12} {}",

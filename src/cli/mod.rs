@@ -18,7 +18,7 @@ pub struct Cli {
     #[arg(long, default_value = "./data", global = true)]
     data_dir: PathBuf,
 
-    /// Path to TOML config file (default: {data_dir}/simple3.toml)
+    /// Path to TOML config file (default: `<data_dir>/simple3.toml`)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -209,7 +209,7 @@ pub async fn run() -> anyhow::Result<()> {
                 .await
         }
         cmd => {
-            let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir);
+            let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir)?;
             let (host, port, av_interval, av_threshold, max_seg_mb, grpc_port) = match cmd {
                 Some(Command::Serve {
                     host,

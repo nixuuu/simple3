@@ -4,12 +4,13 @@ pub fn format_epoch(epoch: u64) -> String {
     let remaining = epoch % 86400;
     let hours = remaining / 3600;
     let mins = (remaining % 3600) / 60;
+    let secs = remaining % 60;
     let (y, m, d) = days_to_date(days);
-    format!("{y:04}-{m:02}-{d:02} {hours:02}:{mins:02}")
+    format!("{y:04}-{m:02}-{d:02} {hours:02}:{mins:02}:{secs:02}")
 }
 
 /// Convert days since Unix epoch to (year, month, day) using the civil calendar algorithm.
-fn days_to_date(days: u64) -> (u64, u64, u64) {
+const fn days_to_date(days: u64) -> (u64, u64, u64) {
     let z = days + 719_468;
     let era = z / 146_097;
     let doe = z - era * 146_097;

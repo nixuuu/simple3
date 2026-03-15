@@ -35,23 +35,34 @@ pub struct AuthConfig {
     pub enabled: Option<bool>,
 }
 
-pub fn load_config(config_path: Option<&Path>, data_dir: &Path) -> Config {
-    // Try explicit config path first, then default location in data dir
-    let path = config_path
-        .map(|p| p.to_owned())
-        .unwrap_or_else(|| data_dir.join("simple3.toml"));
+pub fn load_config(config_path: Option<&Path>, data_dir: &Path) -> anyhow::Result<Config> {
+    let explicit = config_path.is_some();
+    let path = config_path.map_or_else(|| data_dir.join("simple3.toml"), ToOwned::to_owned);
 
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match toml::from_str(&content) {
-            Ok(config) => {
-                tracing::info!("loaded config from {}", path.display());
-                config
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if !explicit && e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Config::default());
+        }
+        Err(e) if explicit => {
+            anyhow::bail!("failed to read config {}: {e}", path.display());
+        }
+        Err(e) => {
+            tracing::warn!("failed to read config {}: {e}", path.display());
+            return Ok(Config::default());
+        }
+    };
+    match toml::from_str(&content) {
+        Ok(config) => {
+            tracing::info!("loaded config from {}", path.display());
+            Ok(config)
+        }
+        Err(e) => {
+            if explicit {
+                anyhow::bail!("failed to parse {}: {e}", path.display());
             }
-            Err(e) => {
-                tracing::warn!("failed to parse {}: {e}", path.display());
-                Config::default()
-            }
-        },
-        Err(_) => Config::default(),
+            tracing::warn!("failed to parse {}: {e}", path.display());
+            Ok(Config::default())
+        }
     }
 }
