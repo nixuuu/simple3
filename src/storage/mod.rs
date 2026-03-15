@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -731,6 +732,7 @@ pub struct Storage {
     data_dir: PathBuf,
     buckets: RwLock<HashMap<String, Arc<BucketStore>>>,
     max_segment_size: u64,
+    compacting: AtomicBool,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -765,7 +767,20 @@ impl Storage {
             data_dir: data_dir.to_path_buf(),
             buckets: RwLock::new(map),
             max_segment_size,
+            compacting: AtomicBool::new(false),
         })
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn set_compacting(&self, val: bool) {
+        self.compacting.store(val, Ordering::Relaxed);
+    }
+
+    pub fn is_compacting(&self) -> bool {
+        self.compacting.load(Ordering::Relaxed)
     }
 
     fn read_buckets(&self) -> io::Result<RwLockReadGuard<'_, HashMap<String, Arc<BucketStore>>>> {
