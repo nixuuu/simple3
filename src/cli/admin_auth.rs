@@ -7,7 +7,8 @@ use simple3::auth::AuthStore;
 
 use super::serve::json_response;
 
-/// Check admin credentials from Authorization: Bearer {access_key}:{secret_key}
+/// Check admin credentials from `Authorization: Bearer <access_key>:<secret_key>`.
+#[allow(clippy::result_large_err)]
 fn check_admin_auth(
     req: &hyper::Request<hyper::body::Incoming>,
     store: &AuthStore,
@@ -147,7 +148,7 @@ async fn read_body(req: hyper::Request<hyper::body::Incoming>) -> String {
     let bytes = body
         .collect()
         .await
-        .map(|b| b.to_bytes())
+        .map(http_body_util::Collected::to_bytes)
         .unwrap_or_default();
     String::from_utf8_lossy(&bytes).into_owned()
 }

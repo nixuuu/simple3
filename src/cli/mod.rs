@@ -18,7 +18,7 @@ pub struct Cli {
     #[arg(long, default_value = "./data", global = true)]
     data_dir: PathBuf,
 
-    /// Path to TOML config file (default: {data_dir}/simple3.toml)
+    /// Path to TOML config file (default: `<data_dir>/simple3.toml`)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
