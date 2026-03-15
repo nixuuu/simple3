@@ -24,31 +24,15 @@ jobs:
           - language: actions
             build-mode: none
           - language: rust
-            build-mode: manual
+            build-mode: none
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install Rust
-        if: matrix.build-mode == 'manual'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Check protoc
-        if: matrix.build-mode == 'manual'
-        run: protoc --version
-
-      - name: Cache cargo
-        if: matrix.build-mode == 'manual'
-        uses: Swatinem/rust-cache@v2
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-
-      - name: Build
-        if: matrix.build-mode == 'manual'
-        run: cargo build
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4

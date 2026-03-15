@@ -272,7 +272,7 @@ pub async fn run(
         eprintln!("  root admin key created (save this, it won't be shown again):");
         eprintln!();
         eprintln!("  Access Key ID: {access_key_id}");
-        eprintln!("  Secret Key:    {secret_key}"); // codeql[rust/cleartext-logging] intentional: one-time bootstrap display
+        eprintln!("  Secret Key:    {secret_key}");
         eprintln!("================================================================");
     }
 
