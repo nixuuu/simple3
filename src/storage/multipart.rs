@@ -67,17 +67,29 @@ impl BucketStore {
             .writer
             .lock()
             .map_err(|_| io::Error::other("writer lock poisoned"))?;
-        if w.size + total_expected > self.max_segment_size && w.size > 0 {
+        if w.size + total_expected + 4 > self.max_segment_size && w.size > 0 {
             self.rotate_segment(&mut w)?;
         }
 
         let segment_id = w.id;
         let offset = w.file.seek(SeekFrom::End(0))?;
 
-        let (total_len, etag, content_md5) =
-            self.assemble_parts(&mut w.file, &sorted_parts, upload_id)?;
-
-        w.file.sync_all()?;
+        let write_result = (|| -> io::Result<(u64, String, String, u32)> {
+            let (total_data_len, etag, content_md5, crc) =
+                self.assemble_parts(&mut w.file, &sorted_parts, upload_id)?;
+            w.file.write_all(&crc.to_le_bytes())?;
+            w.file.sync_all()?;
+            Ok((total_data_len, etag, content_md5, crc))
+        })();
+        let (total_data_len, etag, content_md5, crc) = match write_result {
+            Ok(v) => v,
+            Err(e) => {
+                w.file.set_len(offset).ok();
+                w.size = offset;
+                return Err(e);
+            }
+        };
+        let total_len = total_data_len + 4;
         w.size = offset + total_len;
 
         let meta = ObjectMeta {
@@ -89,6 +101,7 @@ impl BucketStore {
             last_modified,
             user_metadata,
             content_md5: Some(content_md5),
+            content_crc32c: Some(crc),
         };
 
         if let Err(e) = self.commit_put(key, &meta) {
@@ -105,18 +118,19 @@ impl BucketStore {
         Ok((meta, etag))
     }
 
-    /// Read part files, write them sequentially, and compute the combined multipart `ETag`
-    /// plus a whole-object `content_md5` for integrity verification.
+    /// Read part files, write them sequentially, and compute the combined multipart `ETag`,
+    /// whole-object `content_md5`, and CRC32C for integrity verification.
     #[allow(clippy::cast_possible_truncation)]
     fn assemble_parts(
         &self,
         writer: &mut File,
         sorted_parts: &[(i32, String)],
         upload_id: &str,
-    ) -> io::Result<(u64, String, String)> {
+    ) -> io::Result<(u64, String, String, u32)> {
         let mut total_len: u64 = 0;
         let mut part_md5_concat = Vec::new();
         let mut content_hasher = Md5::new();
+        let mut crc: u32 = 0;
         let mut buf = vec![0u8; COPY_BUF_SIZE];
 
         for (part_num, _etag) in sorted_parts {
@@ -140,6 +154,7 @@ impl BucketStore {
                 }
                 writer.write_all(&buf[..n])?;
                 content_hasher.update(&buf[..n]);
+                crc = crc32c::crc32c_append(crc, &buf[..n]);
                 remaining -= n as u64;
                 total_len += n as u64;
             }
@@ -154,7 +169,7 @@ impl BucketStore {
         let etag = format!("{:x}-{}", final_hasher.finalize(), sorted_parts.len());
         let content_md5 = format!("{:x}", content_hasher.finalize());
 
-        Ok((total_len, etag, content_md5))
+        Ok((total_len, etag, content_md5, crc))
     }
 
     pub fn abort_multipart_upload(&self, upload_id: &str) -> io::Result<()> {

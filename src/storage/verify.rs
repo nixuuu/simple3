@@ -14,6 +14,7 @@ pub struct VerifyResult {
     pub total_objects: u64,
     pub verified_ok: u64,
     pub checksum_errors: u64,
+    pub crc_errors: u64,
     pub read_errors: u64,
     pub errors: Vec<VerifyError>,
 }
@@ -29,6 +30,7 @@ pub struct VerifyError {
 #[serde(rename_all = "snake_case")]
 pub enum VerifyErrorKind {
     ChecksumMismatch,
+    CrcMismatch,
     ReadError,
 }
 
@@ -42,6 +44,7 @@ impl BucketStore {
             total_objects: 0,
             verified_ok: 0,
             checksum_errors: 0,
+            crc_errors: 0,
             read_errors: 0,
             errors: Vec::new(),
         };
@@ -60,16 +63,13 @@ impl BucketStore {
             }
         }
 
-        result.checksum_errors = result
-            .errors
-            .iter()
-            .filter(|e| matches!(e.kind, VerifyErrorKind::ChecksumMismatch))
-            .count() as u64;
-        result.read_errors = result
-            .errors
-            .iter()
-            .filter(|e| matches!(e.kind, VerifyErrorKind::ReadError))
-            .count() as u64;
+        for e in &result.errors {
+            match e.kind {
+                VerifyErrorKind::ChecksumMismatch => result.checksum_errors += 1,
+                VerifyErrorKind::CrcMismatch => result.crc_errors += 1,
+                VerifyErrorKind::ReadError => result.read_errors += 1,
+            }
+        }
 
         Ok(result)
     }
@@ -107,9 +107,12 @@ impl BucketStore {
             });
         }
 
-        let mut hasher = Md5::new();
+        let data_len = meta.data_length();
+        let mut md5_hasher = Md5::new();
+        let mut crc: u32 = 0;
+        let has_crc = meta.content_crc32c.is_some();
         let mut buf = vec![0u8; COPY_BUF_SIZE];
-        let mut remaining = meta.length;
+        let mut remaining = data_len;
         let mut offset = meta.offset;
 
         while remaining > 0 {
@@ -119,16 +122,47 @@ impl BucketStore {
                 kind: VerifyErrorKind::ReadError,
                 detail: format!("segment {}: read error at offset {offset}: {e}", meta.segment_id),
             })?;
-            hasher.update(&buf[..chunk]);
+            md5_hasher.update(&buf[..chunk]);
+            if has_crc {
+                crc = crc32c::crc32c_append(crc, &buf[..chunk]);
+            }
             offset += chunk as u64;
             remaining -= chunk as u64;
         }
+        // Verify CRC32C: computed from data + on-disk trailer
+        if let Some(expected_crc) = meta.content_crc32c {
+            if crc != expected_crc {
+                drop(file);
+                return Err(VerifyError {
+                    key: key.to_owned(),
+                    kind: VerifyErrorKind::CrcMismatch,
+                    detail: format!("expected {expected_crc:#010x}, computed {crc:#010x}"),
+                });
+            }
+            // Read the 4-byte on-disk trailer and compare
+            let mut trailer = [0u8; 4];
+            file.read_exact_at(&mut trailer, meta.offset + data_len).map_err(|e| VerifyError {
+                key: key.to_owned(),
+                kind: VerifyErrorKind::ReadError,
+                detail: format!("segment {}: CRC trailer read error: {e}", meta.segment_id),
+            })?;
+            let stored_crc = u32::from_le_bytes(trailer);
+            if stored_crc != expected_crc {
+                drop(file);
+                return Err(VerifyError {
+                    key: key.to_owned(),
+                    kind: VerifyErrorKind::CrcMismatch,
+                    detail: format!(
+                        "trailer mismatch: expected {expected_crc:#010x}, stored {stored_crc:#010x}"
+                    ),
+                });
+            }
+        }
         drop(file);
 
-        let computed = format!("{:x}", hasher.finalize());
+        // Verify MD5
+        let computed = format!("{:x}", md5_hasher.finalize());
 
-        // Determine expected MD5: prefer content_md5 (always whole-object MD5),
-        // fall back to etag for single-part uploads (where etag IS the MD5).
         let expected = meta
             .content_md5
             .as_deref()
@@ -146,7 +180,6 @@ impl BucketStore {
                 detail: format!("expected {expected}, computed {computed}"),
             });
         }
-        // Legacy multipart objects without content_md5: data was read successfully → pass
 
         Ok(())
     }

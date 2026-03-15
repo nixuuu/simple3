@@ -2,9 +2,10 @@ use md5::{Digest, Md5};
 use simple3::storage::Storage;
 use simple3::types::ObjectMeta;
 use std::collections::HashMap;
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
 
-fn make_meta(segment_id: u32, offset: u64, length: u64, etag: &str) -> ObjectMeta {
+fn make_meta(segment_id: u32, offset: u64, length: u64, etag: &str, crc: u32) -> ObjectMeta {
     ObjectMeta {
         segment_id,
         offset,
@@ -14,6 +15,7 @@ fn make_meta(segment_id: u32, offset: u64, length: u64, etag: &str) -> ObjectMet
         last_modified: 1000,
         user_metadata: HashMap::new(),
         content_md5: None,
+        content_crc32c: Some(crc),
     }
 }
 
@@ -77,18 +79,18 @@ fn test_put_get_object() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let data = b"hello world";
-    let (seg_id, offset, length) = bucket.append_data(data).unwrap();
+    let (seg_id, offset, length, crc) = bucket.append_data(data).unwrap();
 
-    let meta = make_meta(seg_id, offset, length, "abc123");
+    let meta = make_meta(seg_id, offset, length, "abc123", crc);
     bucket.put_meta("key1", &meta).unwrap();
 
-    let read_back = bucket.read_data(seg_id, offset, length).unwrap();
+    let read_back = bucket.read_object(&meta).unwrap();
     assert_eq!(read_back, data);
 
     let got = bucket.get_meta("key1").unwrap().unwrap();
     assert_eq!(got.segment_id, seg_id);
     assert_eq!(got.offset, offset);
-    assert_eq!(got.length, length);
+    assert_eq!(got.data_length(), data.len() as u64);
     assert_eq!(got.etag, "abc123");
 }
 
@@ -99,21 +101,21 @@ fn test_put_overwrite() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    let (seg1, off1, len1) = bucket.append_data(b"old data").unwrap();
+    let (seg1, off1, len1, crc1) = bucket.append_data(b"old data").unwrap();
     bucket
-        .put_meta("key", &make_meta(seg1, off1, len1, "old"))
+        .put_meta("key", &make_meta(seg1, off1, len1, "old", crc1))
         .unwrap();
 
-    let (seg2, off2, len2) = bucket.append_data(b"new data!!!").unwrap();
+    let (seg2, off2, len2, crc2) = bucket.append_data(b"new data!!!").unwrap();
     bucket
-        .put_meta("key", &make_meta(seg2, off2, len2, "new"))
+        .put_meta("key", &make_meta(seg2, off2, len2, "new", crc2))
         .unwrap();
 
     let meta = bucket.get_meta("key").unwrap().unwrap();
     assert_eq!(meta.etag, "new");
-    assert_eq!(meta.length, 11);
+    assert_eq!(meta.data_length(), 11);
 
-    let data = bucket.read_data(meta.segment_id, meta.offset, meta.length).unwrap();
+    let data = bucket.read_object(&meta).unwrap();
     assert_eq!(data, b"new data!!!");
 }
 
@@ -135,7 +137,7 @@ fn test_head_object_metadata() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let data = b"some content";
-    let (seg_id, offset, length) = bucket.append_data(data).unwrap();
+    let (seg_id, offset, length, crc) = bucket.append_data(data).unwrap();
     let meta = ObjectMeta {
         segment_id: seg_id,
         offset,
@@ -145,12 +147,13 @@ fn test_head_object_metadata() {
         last_modified: 42,
         user_metadata: [("x-custom".into(), "val".into())].into(),
         content_md5: None,
+        content_crc32c: Some(crc),
     };
     bucket.put_meta("obj", &meta).unwrap();
 
     let got = bucket.get_meta("obj").unwrap().unwrap();
     assert_eq!(got.content_type.as_deref(), Some("application/json"));
-    assert_eq!(got.length, 12);
+    assert_eq!(got.data_length(), 12);
     assert_eq!(got.last_modified, 42);
     assert_eq!(got.user_metadata.get("x-custom").unwrap(), "val");
 }
@@ -162,9 +165,9 @@ fn test_delete_object() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    let (seg, off, len) = bucket.append_data(b"deleteme").unwrap();
+    let (seg, off, len, crc) = bucket.append_data(b"deleteme").unwrap();
     bucket
-        .put_meta("k", &make_meta(seg, off, len, "e"))
+        .put_meta("k", &make_meta(seg, off, len, "e", crc))
         .unwrap();
 
     let removed = bucket.delete_object("k").unwrap();
@@ -191,26 +194,27 @@ fn test_compaction_shrinks_file() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    let (seg, off_a, len_a) = bucket.append_data(b"AAAA").unwrap();
+    let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea"))
+        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
 
-    let (seg, off_b, len_b) = bucket.append_data(b"BBBBBB").unwrap();
+    let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBBBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb"))
+        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 10);
+    // AAAA+crc(4) + BBBBBB+crc(4) = 4+4+6+4 = 18
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 18);
 
     // Delete leaves dead space, then compact reclaims it
     bucket.delete_object("a").unwrap();
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 10);
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 18);
 
     bucket.compact().unwrap();
-    // After compact: segment 0 rewritten with only "b" (6 bytes)
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 6);
+    // After compact: segment 0 rewritten with only "b" (6+4 = 10 bytes)
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 10);
 }
 
 #[test]
@@ -220,40 +224,37 @@ fn test_compaction_preserves_other_objects() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    let (seg, off_a, len_a) = bucket.append_data(b"AAA").unwrap();
+    let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea"))
+        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
 
-    let (seg, off_b, len_b) = bucket.append_data(b"BBB").unwrap();
+    let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb"))
+        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
 
-    let (seg, off_c, len_c) = bucket.append_data(b"CCC").unwrap();
+    let (seg, off_c, len_c, crc_c) = bucket.append_data(b"CCC").unwrap();
     bucket
-        .put_meta("c", &make_meta(seg, off_c, len_c, "ec"))
+        .put_meta("c", &make_meta(seg, off_c, len_c, "ec", crc_c))
         .unwrap();
 
     bucket.delete_object("b").unwrap();
     bucket.compact().unwrap();
 
     let meta_a = bucket.get_meta("a").unwrap().unwrap();
-    let data_a = bucket
-        .read_data(meta_a.segment_id, meta_a.offset, meta_a.length)
-        .unwrap();
+    let data_a = bucket.read_object(&meta_a).unwrap();
     assert_eq!(data_a, b"AAA");
 
     let meta_c = bucket.get_meta("c").unwrap().unwrap();
-    let data_c = bucket
-        .read_data(meta_c.segment_id, meta_c.offset, meta_c.length)
-        .unwrap();
+    let data_c = bucket.read_object(&meta_c).unwrap();
     assert_eq!(data_c, b"CCC");
 
     assert!(bucket.get_meta("b").unwrap().is_none());
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 6);
+    // AAA+crc(4) + CCC+crc(4) = 14
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 14);
 }
 
 // === List objects ===
@@ -278,8 +279,8 @@ fn test_list_objects_prefix() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     for key in ["photos/a.jpg", "photos/b.jpg", "docs/x.txt", "docs/y.txt"] {
-        let (seg, off, len) = bucket.append_data(b"data").unwrap();
-        bucket.put_meta(key, &make_meta(seg, off, len, "e")).unwrap();
+        let (seg, off, len, crc) = bucket.append_data(b"data").unwrap();
+        bucket.put_meta(key, &make_meta(seg, off, len, "e", crc)).unwrap();
     }
 
     let (items, _) = bucket.list_objects(Some("photos/"), 1000, None).unwrap();
@@ -305,8 +306,8 @@ fn test_list_objects_delimiter() {
         "docs/x.txt",
         "root.txt",
     ] {
-        let (seg, off, len) = bucket.append_data(b"data").unwrap();
-        bucket.put_meta(key, &make_meta(seg, off, len, "e")).unwrap();
+        let (seg, off, len, crc) = bucket.append_data(b"data").unwrap();
+        bucket.put_meta(key, &make_meta(seg, off, len, "e", crc)).unwrap();
     }
 
     // Root level with delimiter
@@ -343,9 +344,9 @@ fn test_list_objects_pagination() {
 
     for i in 0..5 {
         let key = format!("key{i:02}");
-        let (seg, off, len) = bucket.append_data(b"x").unwrap();
+        let (seg, off, len, crc) = bucket.append_data(b"x").unwrap();
         bucket
-            .put_meta(&key, &make_meta(seg, off, len, "e"))
+            .put_meta(&key, &make_meta(seg, off, len, "e", crc))
             .unwrap();
     }
 
@@ -377,9 +378,9 @@ fn test_reopen_storage() {
         let storage = Storage::open(dir.path()).unwrap();
         storage.create_bucket("persist").unwrap();
         let bucket = storage.get_bucket("persist").unwrap().unwrap();
-        let (seg, off, len) = bucket.append_data(b"survive restart").unwrap();
+        let (seg, off, len, crc) = bucket.append_data(b"survive restart").unwrap();
         bucket
-            .put_meta("key1", &make_meta(seg, off, len, "etag"))
+            .put_meta("key1", &make_meta(seg, off, len, "etag", crc))
             .unwrap();
     }
 
@@ -390,9 +391,7 @@ fn test_reopen_storage() {
 
     let bucket = storage.get_bucket("persist").unwrap().unwrap();
     let meta = bucket.get_meta("key1").unwrap().unwrap();
-    let data = bucket
-        .read_data(meta.segment_id, meta.offset, meta.length)
-        .unwrap();
+    let data = bucket.read_object(&meta).unwrap();
     assert_eq!(data, b"survive restart");
 }
 
@@ -435,6 +434,8 @@ fn test_put_object_streamed() {
     tmp.flush().unwrap();
     drop(tmp);
 
+    let data_bytes = b"streamed data here";
+    let crc = crc32c::crc32c(data_bytes);
     let meta = bucket
         .put_object_streamed(
             "skey",
@@ -443,20 +444,21 @@ fn test_put_object_streamed() {
             "etag_s".into(),
             999,
             HashMap::new(),
+            Some(crc),
         )
         .unwrap();
 
-    assert_eq!(meta.length, 18);
+    assert_eq!(meta.data_length(), 18);
     assert_eq!(meta.etag, "etag_s");
+    assert!(meta.content_crc32c.is_some());
+    assert_eq!(meta.length, meta.data_length() + 4);
 
     // Temp file removed
     assert!(!tmp_path.exists());
 
     // Data readable
-    let data = bucket
-        .read_data(meta.segment_id, meta.offset, meta.length)
-        .unwrap();
-    assert_eq!(data, b"streamed data here");
+    let data = bucket.read_object(&meta).unwrap();
+    assert_eq!(data, data_bytes);
 
     // Meta stored
     let got = bucket.get_meta("skey").unwrap().unwrap();
@@ -488,12 +490,10 @@ fn test_multipart_upload_basic() {
 
     // ETag has -N suffix
     assert!(etag.ends_with("-3"), "etag should end with -3: {etag}");
-    assert_eq!(meta.length, 12); // 4+4+4
+    assert_eq!(meta.data_length(), 12); // 4+4+4
 
     // Data is concatenation of parts in order
-    let data = bucket
-        .read_data(meta.segment_id, meta.offset, meta.length)
-        .unwrap();
+    let data = bucket.read_object(&meta).unwrap();
     assert_eq!(data, b"AAAABBBBCCCC");
 
     // Part files cleaned up
@@ -530,9 +530,7 @@ fn test_multipart_upload_out_of_order() {
         .unwrap();
 
     // Should be sorted by part number
-    let data = bucket
-        .read_data(meta.segment_id, meta.offset, meta.length)
-        .unwrap();
+    let data = bucket.read_object(&meta).unwrap();
     assert_eq!(data, b"AAABBBCCC");
 }
 
@@ -597,35 +595,39 @@ fn test_overwrite_compacts_old_data() {
 
     // Upload via streamed put
     let tmp1 = bucket.bucket_dir().join(".tmp_ow1");
-    std::fs::write(&tmp1, b"AAAAAAAAAA").unwrap(); // 10 bytes
+    let data1 = b"AAAAAAAAAA";
+    std::fs::write(&tmp1, data1).unwrap(); // 10 bytes
+    let crc1 = crc32c::crc32c(data1);
     bucket
-        .put_object_streamed("key", &tmp1, None, "e1".into(), 0, HashMap::new())
+        .put_object_streamed("key", &tmp1, None, "e1".into(), 0, HashMap::new(), Some(crc1))
         .unwrap();
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 10);
+    // 10 data + 4 crc = 14
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 14);
 
     // Overwrite same key with smaller data (append-only: file grows)
     let tmp2 = bucket.bucket_dir().join(".tmp_ow2");
-    std::fs::write(&tmp2, b"BBB").unwrap(); // 3 bytes
+    let data2 = b"BBB";
+    std::fs::write(&tmp2, data2).unwrap(); // 3 bytes
+    let crc2 = crc32c::crc32c(data2);
     let meta = bucket
-        .put_object_streamed("key", &tmp2, None, "e2".into(), 0, HashMap::new())
+        .put_object_streamed("key", &tmp2, None, "e2".into(), 0, HashMap::new(), Some(crc2))
         .unwrap();
 
-    // Append-only: seg = 10 + 3 = 13, dead_bytes = 10
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 13);
-    assert_eq!(bucket.dead_bytes(), 10);
-    assert_eq!(meta.length, 3);
+    // Append-only: seg = 14 + 3+4 = 21, dead_bytes = 14
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 21);
+    assert_eq!(bucket.dead_bytes(), 14);
+    assert_eq!(meta.data_length(), 3);
 
     // Data readable correctly
-    let data = bucket
-        .read_data(meta.segment_id, meta.offset, meta.length)
-        .unwrap();
+    let data = bucket.read_object(&meta).unwrap();
     assert_eq!(data, b"BBB");
 
     // Compact reclaims dead space
     bucket.compact().unwrap();
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 3);
+    // 3 data + 4 crc = 7
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 7);
     assert_eq!(bucket.dead_bytes(), 0);
 }
 
@@ -636,17 +638,20 @@ fn test_multipart_overwrite_compacts() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    // First upload: 10 bytes
+    // First upload: 10 bytes data
     let tmp = bucket.bucket_dir().join(".tmp_mow");
-    std::fs::write(&tmp, b"XXXXXXXXXX").unwrap();
+    let d1 = b"XXXXXXXXXX";
+    std::fs::write(&tmp, d1).unwrap();
+    let crc1 = crc32c::crc32c(d1);
     bucket
-        .put_object_streamed("key", &tmp, None, "e1".into(), 0, HashMap::new())
+        .put_object_streamed("key", &tmp, None, "e1".into(), 0, HashMap::new(), Some(crc1))
         .unwrap();
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 10);
+    // 10 data + 4 crc = 14
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 14);
 
-    // Overwrite via multipart: 6 bytes total (append-only: file grows)
+    // Overwrite via multipart: 6 bytes data total (append-only: file grows)
     let uid = bucket.create_multipart_upload();
     let e1 = bucket.upload_part(&uid, 1, b"AAA").unwrap();
     let e2 = bucket.upload_part(&uid, 2, b"BBB").unwrap();
@@ -654,19 +659,18 @@ fn test_multipart_overwrite_compacts() {
         .complete_multipart_upload(&uid, "key", &[(1, e1), (2, e2)], None, 0, HashMap::new())
         .unwrap();
 
-    // Append-only: 10 + 6 = 16, dead_bytes = 10
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 16);
-    assert_eq!(bucket.dead_bytes(), 10);
-    assert_eq!(meta.length, 6);
+    // Append-only: 14 + 6+4 = 24, dead_bytes = 14
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 24);
+    assert_eq!(bucket.dead_bytes(), 14);
+    assert_eq!(meta.data_length(), 6);
 
-    let data = bucket
-        .read_data(meta.segment_id, meta.offset, meta.length)
-        .unwrap();
+    let data = bucket.read_object(&meta).unwrap();
     assert_eq!(data, b"AAABBB");
 
     // Compact reclaims dead space
     bucket.compact().unwrap();
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 6);
+    // 6 data + 4 crc = 10
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 10);
     assert_eq!(bucket.dead_bytes(), 0);
 }
 
@@ -682,28 +686,30 @@ fn test_dead_bytes_tracking() {
     assert_eq!(bucket.dead_bytes(), 0);
 
     // Put two objects
-    let (seg, off_a, len_a) = bucket.append_data(b"AAAA").unwrap();
+    let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea"))
+        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
-    let (seg, off_b, len_b) = bucket.append_data(b"BBBBBB").unwrap();
+    let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBBBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb"))
+        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
 
     assert_eq!(bucket.dead_bytes(), 0);
 
-    // Delete "a" (4 bytes become dead)
+    // Delete "a" (4 data + 4 crc = 8 bytes become dead)
     bucket.delete_object("a").unwrap();
-    assert_eq!(bucket.dead_bytes(), 4);
+    assert_eq!(bucket.dead_bytes(), 8);
 
-    // Overwrite "b" (6 bytes become dead)
+    // Overwrite "b" (6 data + 4 crc = 10 bytes become dead)
     let tmp = bucket.bucket_dir().join(".tmp_db");
-    std::fs::write(&tmp, b"CC").unwrap();
+    let dd = b"CC";
+    std::fs::write(&tmp, dd).unwrap();
+    let crc_cc = crc32c::crc32c(dd);
     bucket
-        .put_object_streamed("b", &tmp, None, "e2".into(), 0, HashMap::new())
+        .put_object_streamed("b", &tmp, None, "e2".into(), 0, HashMap::new(), Some(crc_cc))
         .unwrap();
-    assert_eq!(bucket.dead_bytes(), 10); // 4 + 6
+    assert_eq!(bucket.dead_bytes(), 18); // 8 + 10
 }
 
 #[test]
@@ -714,46 +720,38 @@ fn test_compact_full_rewrite() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     // Put 3 objects: A(4) + B(6) + C(3) = 13 bytes
-    let (seg, off_a, len_a) = bucket.append_data(b"AAAA").unwrap();
+    let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea"))
+        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
-    let (seg, off_b, len_b) = bucket.append_data(b"BBBBBB").unwrap();
+    let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBBBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb"))
+        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
-    let (seg, off_c, len_c) = bucket.append_data(b"CCC").unwrap();
+    let (seg, off_c, len_c, crc_c) = bucket.append_data(b"CCC").unwrap();
     bucket
-        .put_meta("c", &make_meta(seg, off_c, len_c, "ec"))
+        .put_meta("c", &make_meta(seg, off_c, len_c, "ec", crc_c))
         .unwrap();
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 13);
+    // (4+4) + (6+4) + (3+4) = 25
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 25);
 
     // Delete B
     bucket.delete_object("b").unwrap();
-    assert_eq!(bucket.dead_bytes(), 6);
+    assert_eq!(bucket.dead_bytes(), 10); // 6 data + 4 crc
 
     // Compact
     bucket.compact().unwrap();
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 7); // A(4) + C(3)
+    // A(4+4) + C(3+4) = 15
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 15);
     assert_eq!(bucket.dead_bytes(), 0);
 
     // Verify data intact
     let meta_a = bucket.get_meta("a").unwrap().unwrap();
-    assert_eq!(
-        bucket
-            .read_data(meta_a.segment_id, meta_a.offset, meta_a.length)
-            .unwrap(),
-        b"AAAA"
-    );
+    assert_eq!(bucket.read_object(&meta_a).unwrap(), b"AAAA");
     let meta_c = bucket.get_meta("c").unwrap().unwrap();
-    assert_eq!(
-        bucket
-            .read_data(meta_c.segment_id, meta_c.offset, meta_c.length)
-            .unwrap(),
-        b"CCC"
-    );
+    assert_eq!(bucket.read_object(&meta_c).unwrap(), b"CCC");
     assert!(bucket.get_meta("b").unwrap().is_none());
 }
 
@@ -764,13 +762,14 @@ fn test_recovery_truncates_orphans() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    let (seg, off, len) = bucket.append_data(b"HELLO").unwrap();
+    let (seg, off, len, crc) = bucket.append_data(b"HELLO").unwrap();
     bucket
-        .put_meta("key", &make_meta(seg, off, len, "e1"))
+        .put_meta("key", &make_meta(seg, off, len, "e1", crc))
         .unwrap();
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 5);
+    // 5 data + 4 crc = 9
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 9);
 
     // Simulate orphaned bytes (crashed append without metadata update)
     {
@@ -781,7 +780,7 @@ fn test_recovery_truncates_orphans() {
             .unwrap();
         f.write_all(b"ORPHAN_JUNK").unwrap();
     }
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 16); // 5 + 11
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 20); // 9 + 11
 
     drop(bucket);
     drop(storage);
@@ -790,14 +789,9 @@ fn test_recovery_truncates_orphans() {
     let storage2 = Storage::open(dir.path()).unwrap();
     let bucket2 = storage2.get_bucket("b").unwrap().unwrap();
 
-    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 5);
+    assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), 9);
     let meta = bucket2.get_meta("key").unwrap().unwrap();
-    assert_eq!(
-        bucket2
-            .read_data(meta.segment_id, meta.offset, meta.length)
-            .unwrap(),
-        b"HELLO"
-    );
+    assert_eq!(bucket2.read_object(&meta).unwrap(), b"HELLO");
 }
 
 #[test]
@@ -808,13 +802,13 @@ fn test_recovery_after_interrupted_compaction() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     // Put objects
-    let (seg, off_a, len_a) = bucket.append_data(b"AAAA").unwrap();
+    let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea"))
+        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
-    let (seg, off_b, len_b) = bucket.append_data(b"BBBB").unwrap();
+    let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb"))
+        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
 
     // Simulate interrupted compaction: leave temp file
@@ -831,19 +825,9 @@ fn test_recovery_after_interrupted_compaction() {
     assert!(!bucket_dir.join("seg_000000.bin.tmp").exists());
 
     let meta_a = bucket2.get_meta("a").unwrap().unwrap();
-    assert_eq!(
-        bucket2
-            .read_data(meta_a.segment_id, meta_a.offset, meta_a.length)
-            .unwrap(),
-        b"AAAA"
-    );
+    assert_eq!(bucket2.read_object(&meta_a).unwrap(), b"AAAA");
     let meta_b = bucket2.get_meta("b").unwrap().unwrap();
-    assert_eq!(
-        bucket2
-            .read_data(meta_b.segment_id, meta_b.offset, meta_b.length)
-            .unwrap(),
-        b"BBBB"
-    );
+    assert_eq!(bucket2.read_object(&meta_b).unwrap(), b"BBBB");
 }
 
 // === Segment stats ===
@@ -855,13 +839,13 @@ fn test_segment_stats() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    let (seg, off, len) = bucket.append_data(b"AAAA").unwrap();
+    let (seg, off, len, crc) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off, len, "ea"))
+        .put_meta("a", &make_meta(seg, off, len, "ea", crc))
         .unwrap();
-    let (seg, off, len) = bucket.append_data(b"BBBB").unwrap();
+    let (seg, off, len, crc) = bucket.append_data(b"BBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off, len, "eb"))
+        .put_meta("b", &make_meta(seg, off, len, "eb", crc))
         .unwrap();
 
     bucket.delete_object("a").unwrap();
@@ -869,8 +853,10 @@ fn test_segment_stats() {
     let stats = bucket.segment_stats().unwrap();
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].id, 0);
-    assert_eq!(stats[0].size, 8); // 4 + 4
-    assert_eq!(stats[0].dead_bytes, 4);
+    // (4+4) + (4+4) = 16
+    assert_eq!(stats[0].size, 16);
+    // 4 data + 4 crc = 8
+    assert_eq!(stats[0].dead_bytes, 8);
 }
 
 // === Verify integrity ===
@@ -885,7 +871,7 @@ fn test_verify_integrity_ok() {
     // Put objects with correct content_md5
     let data = b"hello world";
     let md5 = format!("{:x}", Md5::digest(data));
-    let (seg, off, len) = bucket.append_data(data).unwrap();
+    let (seg, off, len, crc) = bucket.append_data(data).unwrap();
     let meta = ObjectMeta {
         segment_id: seg,
         offset: off,
@@ -895,6 +881,7 @@ fn test_verify_integrity_ok() {
         last_modified: 0,
         user_metadata: HashMap::new(),
         content_md5: Some(md5),
+        content_crc32c: Some(crc),
     };
     bucket.put_meta("key1", &meta).unwrap();
 
@@ -912,7 +899,7 @@ fn test_verify_integrity_checksum_mismatch() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let data = b"hello world";
-    let (seg, off, len) = bucket.append_data(data).unwrap();
+    let (seg, off, len, crc) = bucket.append_data(data).unwrap();
     let meta = ObjectMeta {
         segment_id: seg,
         offset: off,
@@ -922,6 +909,7 @@ fn test_verify_integrity_checksum_mismatch() {
         last_modified: 0,
         user_metadata: HashMap::new(),
         content_md5: Some("wrong_md5_value".into()),
+        content_crc32c: Some(crc),
     };
     bucket.put_meta("key1", &meta).unwrap();
 
@@ -944,8 +932,9 @@ fn test_verify_streamed_put() {
     std::fs::write(&tmp_path, data).unwrap();
     let etag = format!("{:x}", Md5::digest(data));
 
+    let crc = crc32c::crc32c(data);
     bucket
-        .put_object_streamed("obj1", &tmp_path, None, etag, 0, HashMap::new())
+        .put_object_streamed("obj1", &tmp_path, None, etag, 0, HashMap::new(), Some(crc))
         .unwrap();
 
     let result = bucket.verify_integrity().unwrap();
@@ -975,12 +964,47 @@ fn test_verify_multipart_upload() {
     assert_eq!(result.verified_ok, 1);
     assert!(result.errors.is_empty());
 
-    // Also verify the content_md5 matches MD5 of the full assembled data
+    // Verify CRC metadata persisted on multipart path
     let meta = bucket.get_meta("mpu_obj").unwrap().unwrap();
-    let full_data = bucket
-        .read_data(meta.segment_id, meta.offset, meta.length)
-        .unwrap();
+    assert!(meta.content_crc32c.is_some());
+    assert_eq!(meta.length, meta.data_length() + 4);
+
+    // Verify the content_md5 matches MD5 of the full assembled data
+    let full_data = bucket.read_object(&meta).unwrap();
     assert_eq!(full_data, b"part one part two");
     let expected_md5 = format!("{:x}", Md5::digest(&full_data));
     assert_eq!(meta.content_md5.as_deref(), Some(expected_md5.as_str()));
+}
+
+// === CRC validation ===
+
+#[test]
+fn test_read_object_crc_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    storage.create_bucket("b").unwrap();
+    let bucket = storage.get_bucket("b").unwrap().unwrap();
+
+    let data = b"hello world";
+    let (seg, off, len, crc) = bucket.append_data(data).unwrap();
+    let meta = make_meta(seg, off, len, "etag", crc);
+    bucket.put_meta("key", &meta).unwrap();
+
+    // Valid read succeeds
+    let result = bucket.read_object(&meta).unwrap();
+    assert_eq!(result, data);
+
+    // Corrupt one byte in the data portion of the segment file
+    let seg_path = dir.path().join("b").join("seg_000000.bin");
+    {
+        let mut f = OpenOptions::new().write(true).open(&seg_path).unwrap();
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(&[0xFF]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // read_object should detect the CRC mismatch
+    let err = bucket.read_object(&meta).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("CRC32C mismatch"));
 }

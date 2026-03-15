@@ -27,8 +27,17 @@ fn write_obj(
     let tmp = bucket.bucket_dir().join(format!(".tmp_test_{key}"));
     fs::write(&tmp, data).unwrap();
     let etag = format!("{:x}", Md5::digest(data));
+    let crc = crc32c::crc32c(data);
     bucket
-        .put_object_streamed(key, &tmp, Some("text/plain".into()), etag, 1000, HashMap::new())
+        .put_object_streamed(
+            key,
+            &tmp,
+            Some("text/plain".into()),
+            etag,
+            1000,
+            HashMap::new(),
+            Some(crc),
+        )
         .unwrap()
 }
 
@@ -91,15 +100,16 @@ fn test_crash_during_put_committed_survive() {
 
     // Committed objects intact
     let m1 = b2.get_meta("obj1").unwrap().unwrap();
-    assert_eq!(b2.read_data(m1.segment_id, m1.offset, m1.length).unwrap(), b"AAAA");
+    assert_eq!(b2.read_object(&m1).unwrap(), b"AAAA");
     let m2 = b2.get_meta("obj2").unwrap().unwrap();
-    assert_eq!(b2.read_data(m2.segment_id, m2.offset, m2.length).unwrap(), b"BBBBBB");
+    assert_eq!(b2.read_object(&m2).unwrap(), b"BBBBBB");
     let m3 = b2.get_meta("obj3").unwrap().unwrap();
-    assert_eq!(b2.read_data(m3.segment_id, m3.offset, m3.length).unwrap(), b"CCC");
+    assert_eq!(b2.read_object(&m3).unwrap(), b"CCC");
 
     // Orphans truncated, tmp cleaned
     let seg_size = fs::metadata(bd.join("seg_000000.bin")).unwrap().len();
-    assert_eq!(seg_size, 13); // 4 + 6 + 3
+    // (4+4) + (6+4) + (3+4) = 25
+    assert_eq!(seg_size, 25);
     assert!(!bd.join(".tmp_abcdef").exists());
 
     // Integrity check
@@ -111,7 +121,7 @@ fn test_crash_during_put_committed_survive() {
     // Can still write after recovery
     write_obj(&b2, "obj4", b"POST_RECOVERY");
     let m4 = b2.get_meta("obj4").unwrap().unwrap();
-    assert_eq!(b2.read_data(m4.segment_id, m4.offset, m4.length).unwrap(), b"POST_RECOVERY");
+    assert_eq!(b2.read_object(&m4).unwrap(), b"POST_RECOVERY");
 }
 
 // === Test 2: crash during PUT with multiple segments ===
@@ -119,13 +129,13 @@ fn test_crash_during_put_committed_survive() {
 #[test]
 fn test_crash_during_put_multi_segment() {
     let dir = tempfile::tempdir().unwrap();
-    let storage = Storage::open_with_segment_size(dir.path(), 20).unwrap();
+    // Segment size 30 to ensure "a" (15+4=19) fits, "b" (10+4=14) triggers rotation
+    let storage = Storage::open_with_segment_size(dir.path(), 30).unwrap();
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    // 15 bytes -> seg 0, then 10 bytes -> seg 1 (rotation at 20)
-    write_obj(&bucket, "a", b"AAAAAAAAAAAAAAA"); // 15 bytes
-    let m_b = write_obj(&bucket, "b", b"BBBBBBBBBB");       // 10 bytes
+    write_obj(&bucket, "a", b"AAAAAAAAAAAAAAA"); // 15 data + 4 crc = 19
+    let m_b = write_obj(&bucket, "b", b"BBBBBBBBBB");       // 10 data + 4 crc = 14, triggers rotation
 
     let bd = bucket.bucket_dir().to_path_buf();
     let active_seg = m_b.segment_id;
@@ -134,16 +144,16 @@ fn test_crash_during_put_multi_segment() {
 
     append_orphan(&bd, active_seg, b"ORPHAN_MULTI_SEG");
 
-    let storage2 = Storage::open_with_segment_size(dir.path(), 20).unwrap();
+    let storage2 = Storage::open_with_segment_size(dir.path(), 30).unwrap();
     let b2 = storage2.get_bucket("b").unwrap().unwrap();
 
     let ma = b2.get_meta("a").unwrap().unwrap();
-    assert_eq!(b2.read_data(ma.segment_id, ma.offset, ma.length).unwrap(), b"AAAAAAAAAAAAAAA");
+    assert_eq!(b2.read_object(&ma).unwrap(), b"AAAAAAAAAAAAAAA");
     let mb = b2.get_meta("b").unwrap().unwrap();
-    assert_eq!(b2.read_data(mb.segment_id, mb.offset, mb.length).unwrap(), b"BBBBBBBBBB");
+    assert_eq!(b2.read_object(&mb).unwrap(), b"BBBBBBBBBB");
 
     let active_size = fs::metadata(bd.join(seg_filename(active_seg))).unwrap().len();
-    assert_eq!(active_size, 10);
+    assert_eq!(active_size, 14); // 10 data + 4 crc
 
     let v = b2.verify_integrity().unwrap();
     assert_eq!(v.verified_ok, 2);
@@ -178,7 +188,7 @@ fn test_crash_during_multipart_before_commit() {
 
     // Committed object survives
     let m = b2.get_meta("existing").unwrap().unwrap();
-    assert_eq!(b2.read_data(m.segment_id, m.offset, m.length).unwrap(), b"PRESERVED");
+    assert_eq!(b2.read_object(&m).unwrap(), b"PRESERVED");
 
     // No multipart object committed
     assert!(b2.get_meta("multipart_key").unwrap().is_none());
@@ -230,7 +240,7 @@ fn test_crash_during_multipart_after_commit() {
 
     let m = b2.get_meta("mpu_obj").unwrap().unwrap();
     assert_eq!(
-        b2.read_data(m.segment_id, m.offset, m.length).unwrap(),
+        b2.read_object(&m).unwrap(),
         b"part-one-part-two"
     );
 
@@ -260,9 +270,9 @@ fn test_crash_compaction_after_rename() {
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    write_obj(&bucket, "a", b"AAAA");   // 4 bytes @ offset 0
-    write_obj(&bucket, "b", b"BBBBBB"); // 6 bytes @ offset 4
-    write_obj(&bucket, "c", b"CCC");    // 3 bytes @ offset 10
+    write_obj(&bucket, "a", b"AAAA");   // 4+4=8 bytes @ offset 0
+    write_obj(&bucket, "b", b"BBBBBB"); // 6+4=10 bytes @ offset 8
+    write_obj(&bucket, "c", b"CCC");    // 3+4=7 bytes @ offset 18
 
     bucket.delete_object("b").unwrap();
 
@@ -275,15 +285,17 @@ fn test_crash_compaction_after_rename() {
     let meta_a = metas.iter().find(|(k, _)| k == "a").unwrap().1.clone();
     let meta_c = metas.iter().find(|(k, _)| k == "c").unwrap().1.clone();
     assert_eq!(meta_a.offset, 0);
-    assert_eq!(meta_c.offset, 10);
+    assert_eq!(meta_a.length, 8); // 4 data + 4 crc
+    assert_eq!(meta_c.offset, 18);
+    assert_eq!(meta_c.length, 7); // 3 data + 4 crc
 
-    // Build compacted segment: A(4) + C(3) = 7 bytes contiguous
+    // Build compacted segment: A(8) + C(7) = 15 bytes contiguous
     let seg_path = bd.join("seg_000000.bin");
     let original = fs::read(&seg_path).unwrap();
     let mut compacted = Vec::new();
-    compacted.extend_from_slice(&original[0..4]);   // A
-    compacted.extend_from_slice(&original[10..13]);  // C
-    assert_eq!(compacted.len(), 7);
+    compacted.extend_from_slice(&original[0..8]);   // A data+crc
+    compacted.extend_from_slice(&original[18..25]);  // C data+crc
+    assert_eq!(compacted.len(), 15);
     fs::write(&seg_path, &compacted).unwrap();
 
     // Set compacting flag (simulates: flag set, rename done, metadata commit didn't happen)
@@ -293,16 +305,16 @@ fn test_crash_compaction_after_rename() {
     let storage2 = Storage::open(dir.path()).unwrap();
     let b2 = storage2.get_bucket("b").unwrap().unwrap();
 
-    // Offsets should be remapped: A@0, C@4
+    // Offsets should be remapped: A@0, C@8
     let ma = b2.get_meta("a").unwrap().unwrap();
     assert_eq!(ma.offset, 0);
-    assert_eq!(ma.length, 4);
-    assert_eq!(b2.read_data(ma.segment_id, ma.offset, ma.length).unwrap(), b"AAAA");
+    assert_eq!(ma.length, 8);
+    assert_eq!(b2.read_object(&ma).unwrap(), b"AAAA");
 
     let mc = b2.get_meta("c").unwrap().unwrap();
-    assert_eq!(mc.offset, 4);
-    assert_eq!(mc.length, 3);
-    assert_eq!(b2.read_data(mc.segment_id, mc.offset, mc.length).unwrap(), b"CCC");
+    assert_eq!(mc.offset, 8);
+    assert_eq!(mc.length, 7);
+    assert_eq!(b2.read_object(&mc).unwrap(), b"CCC");
 
     assert!(b2.get_meta("b").unwrap().is_none());
 
@@ -314,7 +326,7 @@ fn test_crash_compaction_after_rename() {
     write_obj(&b2, "d", b"POST_COMPACT_RECOVERY");
     let md = b2.get_meta("d").unwrap().unwrap();
     assert_eq!(
-        b2.read_data(md.segment_id, md.offset, md.length).unwrap(),
+        b2.read_object(&md).unwrap(),
         b"POST_COMPACT_RECOVERY"
     );
 }
@@ -342,11 +354,11 @@ fn test_crash_compaction_before_rename() {
     let seg_path = bd.join("seg_000000.bin");
     let original = fs::read(&seg_path).unwrap();
     let mut compacted = Vec::new();
-    compacted.extend_from_slice(&original[0..4]);
-    compacted.extend_from_slice(&original[10..13]);
+    compacted.extend_from_slice(&original[0..8]);   // A data+crc
+    compacted.extend_from_slice(&original[18..25]);  // C data+crc
     fs::write(bd.join("seg_000000.bin.tmp"), &compacted).unwrap();
 
-    // Set flag (but original file unchanged — 13 bytes)
+    // Set flag (but original file unchanged — 25 bytes)
     set_compacting_flag(&bd, 0);
 
     let storage2 = Storage::open(dir.path()).unwrap();
@@ -355,13 +367,13 @@ fn test_crash_compaction_before_rename() {
     // .bin.tmp removed
     assert!(!bd.join("seg_000000.bin.tmp").exists());
 
-    // Original offsets preserved (file_size=13, compacted_size=7, no remap)
+    // Original offsets preserved (file_size=25, compacted_size=15, no remap)
     let ma = b2.get_meta("a").unwrap().unwrap();
     assert_eq!(ma.offset, 0);
-    assert_eq!(b2.read_data(ma.segment_id, ma.offset, ma.length).unwrap(), b"AAAA");
+    assert_eq!(b2.read_object(&ma).unwrap(), b"AAAA");
     let mc = b2.get_meta("c").unwrap().unwrap();
-    assert_eq!(mc.offset, 10);
-    assert_eq!(b2.read_data(mc.segment_id, mc.offset, mc.length).unwrap(), b"CCC");
+    assert_eq!(mc.offset, 18);
+    assert_eq!(b2.read_object(&mc).unwrap(), b"CCC");
 
     let v = b2.verify_integrity().unwrap();
     assert_eq!(v.verified_ok, 2);
@@ -373,13 +385,14 @@ fn test_crash_compaction_before_rename() {
 #[test]
 fn test_crash_compaction_with_orphan_on_active() {
     let dir = tempfile::tempdir().unwrap();
-    let storage = Storage::open_with_segment_size(dir.path(), 20).unwrap();
+    // 30 bytes per segment to trigger rotation
+    let storage = Storage::open_with_segment_size(dir.path(), 30).unwrap();
     storage.create_bucket("b").unwrap();
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
-    // seg 0: 15 bytes
+    // seg 0: 15+4=19 bytes
     write_obj(&bucket, "a", b"AAAAAAAAAAAAAAA");
-    // seg 1 (rotation): 10 bytes
+    // seg 1 (rotation at 30): 10+4=14, 19+14=33>30
     let m_b = write_obj(&bucket, "b", b"BBBBBBBBBB");
     let active_seg = m_b.segment_id;
     assert!(active_seg > 0, "expected rotation to seg 1+");
@@ -387,9 +400,8 @@ fn test_crash_compaction_with_orphan_on_active() {
     // Delete a from seg 0 to create dead bytes
     bucket.delete_object("a").unwrap();
 
-    // Re-add a smaller object to seg 0 won't happen; a was on seg 0, delete just marks dead.
     // Write another object to active segment
-    write_obj(&bucket, "c", b"CCCCC"); // 5 bytes on active seg
+    write_obj(&bucket, "c", b"CCCCC"); // 5+4=9 bytes on active seg
 
     let bd = bucket.bucket_dir().to_path_buf();
     drop(bucket);
@@ -409,16 +421,17 @@ fn test_crash_compaction_with_orphan_on_active() {
 
     // b and c survive
     let mb = b2.get_meta("b").unwrap().unwrap();
-    assert_eq!(b2.read_data(mb.segment_id, mb.offset, mb.length).unwrap(), b"BBBBBBBBBB");
+    assert_eq!(b2.read_object(&mb).unwrap(), b"BBBBBBBBBB");
     let mc = b2.get_meta("c").unwrap().unwrap();
-    assert_eq!(b2.read_data(mc.segment_id, mc.offset, mc.length).unwrap(), b"CCCCC");
+    assert_eq!(b2.read_object(&mc).unwrap(), b"CCCCC");
 
     // a was deleted
     assert!(b2.get_meta("a").unwrap().is_none());
 
     // Active segment orphan truncated
     let active_size = fs::metadata(bd.join(seg_filename(active_seg))).unwrap().len();
-    assert_eq!(active_size, 15); // 10 + 5
+    // (10+4) + (5+4) = 23
+    assert_eq!(active_size, 23);
 
     let v = b2.verify_integrity().unwrap();
     assert_eq!(v.verified_ok, 2);
@@ -461,13 +474,14 @@ fn test_combined_crash_artifacts() {
 
     // Segment truncated
     let seg_size = fs::metadata(bd.join("seg_000000.bin")).unwrap().len();
-    assert_eq!(seg_size, 12); // 5 + 7
+    // (5+4) + (7+4) = 20
+    assert_eq!(seg_size, 20);
 
     // Objects intact
     let mx = b2.get_meta("x").unwrap().unwrap();
-    assert_eq!(b2.read_data(mx.segment_id, mx.offset, mx.length).unwrap(), b"XXXXX");
+    assert_eq!(b2.read_object(&mx).unwrap(), b"XXXXX");
     let my = b2.get_meta("y").unwrap().unwrap();
-    assert_eq!(b2.read_data(my.segment_id, my.offset, my.length).unwrap(), b"YYYYYYY");
+    assert_eq!(b2.read_object(&my).unwrap(), b"YYYYYYY");
 
     let v = b2.verify_integrity().unwrap();
     assert_eq!(v.verified_ok, 2);
@@ -488,7 +502,7 @@ fn test_recovery_then_compaction_works() {
     write_obj(&bucket, "c", b"CCC");
 
     bucket.delete_object("b").unwrap();
-    assert_eq!(bucket.dead_bytes(), 6);
+    assert_eq!(bucket.dead_bytes(), 10); // 6 data + 4 crc
 
     let bd = bucket.bucket_dir().to_path_buf();
     drop(bucket);
@@ -501,19 +515,21 @@ fn test_recovery_then_compaction_works() {
 
     // Recovery truncated orphans
     let seg_size = fs::metadata(bd.join("seg_000000.bin")).unwrap().len();
-    assert_eq!(seg_size, 13); // original 4+6+3
+    // (4+4) + (6+4) + (3+4) = 25
+    assert_eq!(seg_size, 25);
 
     // Compaction should still work
     b2.compact().unwrap();
 
     let seg_size = fs::metadata(bd.join("seg_000000.bin")).unwrap().len();
-    assert_eq!(seg_size, 7); // 4 + 3
+    // (4+4) + (3+4) = 15
+    assert_eq!(seg_size, 15);
     assert_eq!(b2.dead_bytes(), 0);
 
     let ma = b2.get_meta("a").unwrap().unwrap();
-    assert_eq!(b2.read_data(ma.segment_id, ma.offset, ma.length).unwrap(), b"AAAA");
+    assert_eq!(b2.read_object(&ma).unwrap(), b"AAAA");
     let mc = b2.get_meta("c").unwrap().unwrap();
-    assert_eq!(b2.read_data(mc.segment_id, mc.offset, mc.length).unwrap(), b"CCC");
+    assert_eq!(b2.read_object(&mc).unwrap(), b"CCC");
 
     let v = b2.verify_integrity().unwrap();
     assert_eq!(v.verified_ok, 2);

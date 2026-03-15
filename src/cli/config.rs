@@ -26,6 +26,7 @@ pub struct StorageConfig {
     pub max_segment_size_mb: Option<u64>,
     pub autovacuum_interval: Option<u64>,
     pub autovacuum_threshold: Option<f64>,
+    pub scrub_interval: Option<u64>,
 }
 
 // Parsed from TOML but not yet wired into server startup

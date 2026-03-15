@@ -35,7 +35,7 @@ pub fn meta_to_proto(key: &str, meta: &ObjectMeta) -> ObjectMetadata {
         key: key.to_owned(),
         etag: meta.etag.clone(),
         content_type: meta.content_type.clone().unwrap_or_default(),
-        size: meta.length,
+        size: meta.data_length(),
         last_modified: meta.last_modified,
         user_metadata: meta.user_metadata.clone(),
         content_md5: meta.content_md5.clone().unwrap_or_default(),
@@ -53,14 +53,15 @@ pub fn segments_to_proto(stats: Vec<SegmentStat>) -> Vec<proto::SegmentStat> {
         .collect()
 }
 
-/// Write incoming stream chunks to a temp file, computing MD5.
+/// Write incoming stream chunks to a temp file, computing MD5 and CRC32C.
 pub async fn stream_to_tmp(
     stream: &mut Streaming<PutObjectRequest>,
     tmp_path: &std::path::Path,
-) -> Result<(String, u64), Status> {
+) -> Result<(String, u64, u32), Status> {
     let mut file =
         std::fs::File::create(tmp_path).map_err(|e| Status::internal(format!("create tmp: {e}")))?;
     let mut hasher = Md5::new();
+    let mut crc: u32 = 0;
     let mut size = 0u64;
 
     while let Some(msg) = stream.message().await? {
@@ -72,6 +73,7 @@ pub async fn stream_to_tmp(
         file.write_all(&chunk)
             .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
         hasher.update(&chunk);
+        crc = crc32c::crc32c_append(crc, &chunk);
         #[allow(clippy::cast_possible_truncation)]
         {
             size += chunk.len() as u64;
@@ -81,7 +83,7 @@ pub async fn stream_to_tmp(
         .map_err(|e| Status::internal(format!("flush tmp: {e}")))?;
 
     let etag = format!("{:x}", hasher.finalize());
-    Ok((etag, size))
+    Ok((etag, size, crc))
 }
 
 /// Stream object data in chunks via an mpsc channel.
@@ -129,9 +131,10 @@ pub async fn stream_object_chunks(
     meta: &ObjectMeta,
     tx: &mpsc::Sender<Result<BulkGetResponse, Status>>,
 ) -> bool {
+    let data_len = meta.data_length();
     let mut pos = 0u64;
-    while pos < meta.length {
-        let chunk_size = (meta.length - pos).min(STREAM_CHUNK_SIZE);
+    while pos < data_len {
+        let chunk_size = (data_len - pos).min(STREAM_CHUNK_SIZE);
         let s = Arc::clone(store);
         let seg_id = meta.segment_id;
         let offset = meta.offset + pos;
@@ -175,6 +178,7 @@ pub async fn bulk_put_one_object(
     let mut file = std::fs::File::create(&tmp_path)
         .map_err(|e| Status::internal(format!("create tmp: {e}")))?;
     let mut hasher = Md5::new();
+    let mut crc: u32 = 0;
     let mut size = 0u64;
 
     loop {
@@ -194,6 +198,7 @@ pub async fn bulk_put_one_object(
                     return Err(Status::internal(e.to_string()));
                 }
                 hasher.update(&chunk);
+                crc = crc32c::crc32c_append(crc, &chunk);
                 #[allow(clippy::cast_possible_truncation)]
                 {
                     size += chunk.len() as u64;
@@ -226,7 +231,7 @@ pub async fn bulk_put_one_object(
     let s = Arc::clone(store);
 
     let meta = tokio::task::spawn_blocking(move || {
-        s.put_object_streamed(&key, &tmp_path, content_type, etag_clone, now, metadata)
+        s.put_object_streamed(&key, &tmp_path, content_type, etag_clone, now, metadata, Some(crc))
     })
     .await
     .map_err(|e| Status::internal(format!("task panicked: {e}")))?
