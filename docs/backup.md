@@ -62,10 +62,10 @@ Snapshots are crash-consistent: simple3 treats a snapshot the same way it treats
 ## Restore
 
 1. Make sure the server is stopped.
-2. Copy the backup into the target `data_dir`:
+2. Copy the backup to the target location:
 
 ```bash
-cp -a /path/to/backup/ /path/to/data_dir/
+cp -a /path/to/backup/data_dir /path/to/
 ```
 
 3. Verify integrity (offline, server not running):
@@ -84,7 +84,8 @@ simple3 --data-dir /path/to/data_dir verify
 For every stored object:
 - Reads the full data from the segment file
 - Computes MD5 and compares against stored `content_md5` / ETag
-- Computes CRC32C and compares against stored `content_crc32c`
-- Reads the on-disk CRC trailer and compares against the expected value
+- If CRC32C metadata is present:
+  - Computes CRC32C and compares against stored `content_crc32c`
+  - Reads the on-disk CRC trailer and compares against the expected value
 
-A clean verify means every object in the backup is intact.
+Objects written before CRC32C support was added are verified using MD5 only. A clean verify means every object passed all applicable checks.
