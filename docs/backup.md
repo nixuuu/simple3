@@ -42,9 +42,10 @@ If stopping the server is not acceptable, use a filesystem that supports atomic 
 **ZFS example:**
 
 ```bash
-zfs snapshot tank/simple3@backup-$(date +%Y%m%d)
+SNAP=backup-$(date +%Y%m%d)
+zfs snapshot tank/simple3@$SNAP
 # mount or send the snapshot elsewhere
-zfs send tank/simple3@backup-20260315 > /backup/simple3.zfs
+zfs send tank/simple3@$SNAP > /backup/simple3.zfs
 ```
 
 **LVM example:**
