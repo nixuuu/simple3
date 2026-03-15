@@ -193,6 +193,11 @@ async fn test_presign_expired() {
     let http_client = reqwest::Client::new();
     let resp = http_client.get(presigned.uri()).send().await.unwrap();
     assert_eq!(resp.status(), 403, "expired presigned URL should return 403");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<Code>AccessDenied</Code>"),
+        "expected AccessDenied error code, got: {body}"
+    );
 }
 
 #[tokio::test]

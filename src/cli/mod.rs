@@ -241,8 +241,11 @@ pub async fn run() -> anyhow::Result<()> {
             ttl,
             client: args,
         }) => {
+            if args.grpc {
+                anyhow::bail!("`simple3 presign` only supports S3 HTTP endpoints; remove --grpc");
+            }
             let resolved = args.resolve(8080);
-            client::presign::run(&uri, method, &ttl, &resolved).await
+            client::presign::run(&uri, method, &ttl, resolved).await
         }
         cmd => {
             let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir)?;

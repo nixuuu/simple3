@@ -15,12 +15,11 @@ pub enum PresignMethod {
 }
 
 pub fn parse_ttl(s: &str) -> anyhow::Result<Duration> {
-    // Pure seconds: "3600"
-    if let Ok(secs) = s.parse::<u64>() {
+    let s_trimmed = s.trim();
+    if let Ok(secs) = s_trimmed.parse::<u64>() {
         return validate_ttl(secs);
     }
 
-    let s_trimmed = s.trim();
     if s_trimmed.len() < 2 {
         anyhow::bail!("invalid TTL: {s}");
     }
@@ -29,13 +28,16 @@ pub fn parse_ttl(s: &str) -> anyhow::Result<Duration> {
     let n: u64 = num_str
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid TTL: {s}"))?;
-    let secs = match suffix {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
+    let multiplier: u64 = match suffix {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
         _ => anyhow::bail!("unknown TTL suffix '{suffix}', expected s/m/h/d"),
     };
+    let secs = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("TTL overflow: {s}"))?;
     validate_ttl(secs)
 }
 
@@ -53,7 +55,7 @@ pub async fn run(
     uri: &str,
     method: PresignMethod,
     ttl_str: &str,
-    resolved: &ResolvedArgs,
+    resolved: ResolvedArgs,
 ) -> anyhow::Result<()> {
     let parsed = S3Uri::parse(uri)?;
     let key = parsed
@@ -74,7 +76,7 @@ pub async fn run(
     let config = aws_sdk_s3::config::Builder::new()
         .endpoint_url(&resolved.endpoint)
         .credentials_provider(creds)
-        .region(Region::new(resolved.region.clone()))
+        .region(Region::new(resolved.region))
         .force_path_style(true)
         .behavior_version_latest()
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
@@ -140,5 +142,11 @@ mod tests {
         assert!(parse_ttl("abc").is_err());
         assert!(parse_ttl("10x").is_err());
         assert!(parse_ttl("").is_err());
+    }
+
+    #[test]
+    fn test_parse_ttl_overflow() {
+        assert!(parse_ttl("99999999999999999h").is_err());
+        assert!(parse_ttl("99999999999999999d").is_err());
     }
 }
