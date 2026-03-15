@@ -29,7 +29,7 @@ tokio-stream = "0.1"
 aws-sdk-s3 = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 walkdir = "2"
-indicatif = "0.17"
+indicatif = "0.18"
 mime_guess = "2"
 tempfile = "3"
 rand = "0.9"
