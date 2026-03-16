@@ -9,7 +9,10 @@ use simple3::grpc::proto::simple3_client::Simple3Client;
 #[allow(clippy::wildcard_imports)]
 use simple3::grpc::proto::*;
 
-use super::{BucketEntry, ListResult, ObjectEntry, ObjectHead, Transport};
+use super::{
+    BucketEntry, ListResult, ListVersionsResult, ObjectEntry, ObjectHead, Transport,
+    VersionEntryInfo,
+};
 
 const CHUNK_SIZE: usize = 256 * 1024;
 
@@ -215,6 +218,7 @@ impl Transport for GrpcTransport {
             .head_object(HeadObjectRequest {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
+                version_id: None,
             })
             .await
         {
@@ -317,5 +321,66 @@ impl Transport for GrpcTransport {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<&str>,
+    ) -> anyhow::Result<ListVersionsResult> {
+        let resp = self
+            .client
+            .clone()
+            .list_object_versions(ListObjectVersionsRequest {
+                bucket: bucket.to_owned(),
+                prefix: prefix.unwrap_or_default().to_owned(),
+                key_marker: key_marker.unwrap_or_default().to_owned(),
+                version_id_marker: version_id_marker.unwrap_or_default().to_owned(),
+                max_keys: 1000,
+                delimiter: String::new(),
+            })
+            .await?;
+        let inner = resp.into_inner();
+
+        let mut entries = Vec::new();
+
+        for ver in inner.versions {
+            entries.push(VersionEntryInfo {
+                key: ver.key,
+                version_id: ver.version_id,
+                size: ver.size,
+                last_modified: ver.last_modified,
+                is_latest: ver.is_latest,
+                is_delete_marker: false,
+            });
+        }
+
+        for dm in inner.delete_markers {
+            entries.push(VersionEntryInfo {
+                key: dm.key,
+                version_id: dm.version_id,
+                size: 0,
+                last_modified: dm.last_modified,
+                is_latest: dm.is_latest,
+                is_delete_marker: true,
+            });
+        }
+
+        Ok(ListVersionsResult {
+            entries,
+            is_truncated: inner.is_truncated,
+            next_key_marker: if inner.next_key_marker.is_empty() {
+                None
+            } else {
+                Some(inner.next_key_marker)
+            },
+            next_version_id_marker: if inner.next_version_id_marker.is_empty() {
+                None
+            } else {
+                Some(inner.next_version_id_marker)
+            },
+        })
     }
 }

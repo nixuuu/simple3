@@ -144,46 +144,12 @@ impl BucketStore {
             let mut ver_table = txn.open_table(VERSIONS).map_err(io::Error::other)?;
 
             for entry in updates {
-                match entry.source {
-                    TableSource::Objects => {
-                        let still_here = obj_table
-                            .get(entry.redb_key.as_str())
-                            .map_err(io::Error::other)?
-                            .map(|v| ObjectMeta::from_bytes(v.value()))
-                            .transpose()
-                            .map_err(io::Error::other)?
-                            .is_some_and(|cur| cur.segment_id == segment_id);
-
-                        if still_here {
-                            let v = bincode::serialize(&entry.meta)
-                                .map_err(io::Error::other)?;
-                            obj_table
-                                .insert(entry.redb_key.as_str(), v.as_slice())
-                                .map_err(io::Error::other)?;
-                        } else {
-                            stale_bytes += entry.meta.length;
-                        }
-                    }
-                    TableSource::Versions => {
-                        let still_here = ver_table
-                            .get(entry.redb_key.as_str())
-                            .map_err(io::Error::other)?
-                            .map(|v| ObjectMeta::from_bytes(v.value()))
-                            .transpose()
-                            .map_err(io::Error::other)?
-                            .is_some_and(|cur| cur.segment_id == segment_id);
-
-                        if still_here {
-                            let v = bincode::serialize(&entry.meta)
-                                .map_err(io::Error::other)?;
-                            ver_table
-                                .insert(entry.redb_key.as_str(), v.as_slice())
-                                .map_err(io::Error::other)?;
-                        } else {
-                            stale_bytes += entry.meta.length;
-                        }
-                    }
-                }
+                let table = match entry.source {
+                    TableSource::Objects => &mut obj_table,
+                    TableSource::Versions => &mut ver_table,
+                };
+                stale_bytes +=
+                    update_compacted_entry(table, entry, segment_id)?;
             }
         }
         {
@@ -288,4 +254,30 @@ fn copy_live_objects(
     drop(tmp);
 
     Ok(entries)
+}
+
+/// Update a single compacted entry in its table. Returns stale bytes if the
+/// entry was concurrently deleted/moved, 0 if successfully updated.
+fn update_compacted_entry(
+    table: &mut redb::Table<&str, &[u8]>,
+    entry: &LiveEntry,
+    segment_id: u32,
+) -> io::Result<u64> {
+    let still_here = table
+        .get(entry.redb_key.as_str())
+        .map_err(io::Error::other)?
+        .map(|v| ObjectMeta::from_bytes(v.value()))
+        .transpose()
+        .map_err(io::Error::other)?
+        .is_some_and(|cur| cur.segment_id == segment_id);
+
+    if still_here {
+        let v = bincode::serialize(&entry.meta).map_err(io::Error::other)?;
+        table
+            .insert(entry.redb_key.as_str(), v.as_slice())
+            .map_err(io::Error::other)?;
+        Ok(0)
+    } else {
+        Ok(entry.meta.length)
+    }
 }

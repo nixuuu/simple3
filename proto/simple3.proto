@@ -90,6 +90,7 @@ message ObjectMetadata {
 message HeadObjectRequest {
   string bucket = 1;
   string key = 2;
+  optional string version_id = 3;
 }
 
 message HeadObjectResponse {

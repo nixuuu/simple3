@@ -224,17 +224,42 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<HeadObjectResponse>, Status> {
-        let resource = format!("arn:s3:::{}/{}", request.get_ref().bucket, request.get_ref().key);
-        self.check_auth(&request, "s3:GetObject", &resource)?;
+        let input = request.get_ref();
+        let resource = format!("arn:s3:::{}/{}", input.bucket, input.key);
+        let action = if input.version_id.is_some() {
+            "s3:GetObjectVersion"
+        } else {
+            "s3:GetObject"
+        };
+        self.check_auth(&request, action, &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
         let key = input.key.clone();
-        let meta = tokio::task::spawn_blocking(move || store.get_meta(&key))
-            .await
-            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
-            .map_err(map_io_err)?
-            .ok_or_else(|| Status::not_found("object not found"))?;
+        let version_id = input.version_id.clone();
+        let s = Arc::clone(&store);
+        let meta = tokio::task::spawn_blocking(move || {
+            if let Some(vid) = &version_id {
+                // First check if it matches the current object's version
+                if let Some(current) = s.get_meta(&key)?
+                    && current.version_id.as_deref() == Some(vid.as_str())
+                {
+                    return Ok(Some(current));
+                }
+                // Otherwise look in versions table
+                s.get_version(&key, vid)
+            } else {
+                s.get_meta(&key)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+        .map_err(map_io_err)?
+        .ok_or_else(|| Status::not_found("object not found"))?;
+
+        if meta.is_delete_marker {
+            return Err(Status::not_found("object is a delete marker"));
+        }
 
         let version_id = meta.version_id.clone();
         Ok(Response::new(HeadObjectResponse {

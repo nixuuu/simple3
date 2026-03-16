@@ -672,6 +672,12 @@ impl BucketStore {
                 continue;
             }
 
+            // Skip delete markers — they must not appear in normal ListObjects
+            let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
+            if meta.is_delete_marker {
+                continue;
+            }
+
             if let Some(delim) = delimiter {
                 let rest = &obj_key[prefix_len..];
                 if let Some(pos) = rest.find(delim) {
@@ -695,7 +701,6 @@ impl BucketStore {
                 break;
             }
 
-            let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
             results.push((obj_key.to_owned(), meta));
         }
 

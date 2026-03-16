@@ -82,28 +82,17 @@ fn version_id_string(vid: Option<&str>) -> Option<String> {
 }
 
 /// Resolve an object by key, optionally looking up a specific version.
+/// Uses a single read transaction to avoid TOCTOU between tables.
 /// Returns the meta or an `io::Error` with appropriate `ErrorKind`.
 fn resolve_object_version(
     store: &BucketStore,
     key: &str,
     version_id: Option<&str>,
 ) -> io::Result<ObjectMeta> {
-    let meta = if let Some(vid) = version_id {
-        store
-            .get_version(key, vid)?
-            .or_else(|| {
-                store
-                    .get_meta(key)
-                    .ok()
-                    .flatten()
-                    .filter(|m| m.version_id.as_deref() == Some(vid))
-            })
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NoSuchVersion"))?
-    } else {
-        store
-            .get_meta(key)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NoSuchKey"))?
-    };
+    let not_found_msg = if version_id.is_some() { "NoSuchVersion" } else { "NoSuchKey" };
+    let meta = store
+        .get_object_or_version(key, version_id)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, not_found_msg))?;
 
     if meta.is_delete_marker {
         return Err(io::Error::new(io::ErrorKind::NotFound, "DeleteMarker"));

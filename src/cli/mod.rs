@@ -95,7 +95,7 @@ enum Command {
         /// List all objects recursively
         #[arg(long)]
         recursive: bool,
-        /// List all object versions (HTTP only)
+        /// List all object versions
         #[arg(long)]
         versions: bool,
         #[command(flatten)]
@@ -211,18 +211,8 @@ pub async fn run() -> anyhow::Result<()> {
             versions,
             client: args,
         }) => {
-            if versions && args.grpc {
-                anyhow::bail!("`ls --versions` only supports S3 HTTP; remove --grpc");
-            }
-            let transport = args.clone().build_transport().await?;
-            client::ls::run(
-                &*transport,
-                uri.as_deref(),
-                recursive,
-                versions,
-                if versions { Some(&args) } else { None },
-            )
-            .await
+            let transport = args.build_transport().await?;
+            client::ls::run(&*transport, uri.as_deref(), recursive, versions).await
         }
         Some(Command::Rm {
             uri,

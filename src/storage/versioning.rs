@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,8 +26,13 @@ pub fn generate_version_id() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
+    // Relaxed is fine: fetch_add returns a unique value per call regardless of ordering.
+    // Counter wraps at u32::MAX — practically impossible within a single nanosecond
+    // since the writer Mutex serializes all writes.
     let seq = VERSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{nanos:016x}{seq:04x}")
+    let mut s = String::with_capacity(20);
+    write!(s, "{nanos:016x}{seq:04x}").expect("write to String never fails");
+    s
 }
 
 /// Null version ID for objects in Suspended versioning mode.
@@ -243,6 +249,7 @@ impl BucketStore {
                         Some(v) => {
                             ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?
                         }
+                        // Safe early return: no modifications made, transaction rolled back on drop
                         None => return Ok(None),
                     }
                 };
@@ -317,6 +324,44 @@ impl BucketStore {
                 Ok(Some(meta))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Look up an object by key, optionally for a specific version, in a single
+    /// read transaction (avoids TOCTOU between versions and objects table).
+    /// Returns the meta if found, None otherwise. Does NOT check `is_delete_marker`.
+    pub fn get_object_or_version(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> io::Result<Option<ObjectMeta>> {
+        let txn = self.db.begin_read().map_err(io::Error::other)?;
+        if let Some(vid) = version_id {
+            // Check versions table first
+            let ver_table = txn.open_table(VERSIONS).map_err(io::Error::other)?;
+            let composite = version_key(key, vid);
+            if let Some(v) = ver_table.get(composite.as_str()).map_err(io::Error::other)? {
+                return Ok(Some(
+                    ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?,
+                ));
+            }
+            // Fall back to current object if version_id matches
+            let obj_table = txn.open_table(super::OBJECTS).map_err(io::Error::other)?;
+            if let Some(v) = obj_table.get(key).map_err(io::Error::other)? {
+                let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
+                if meta.version_id.as_deref() == Some(vid) {
+                    return Ok(Some(meta));
+                }
+            }
+            Ok(None)
+        } else {
+            let obj_table = txn.open_table(super::OBJECTS).map_err(io::Error::other)?;
+            match obj_table.get(key).map_err(io::Error::other)? {
+                Some(v) => Ok(Some(
+                    ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?,
+                )),
+                None => Ok(None),
+            }
         }
     }
 
@@ -408,7 +453,8 @@ impl BucketStore {
         let prefix_start = format!("{key}\0");
         let prefix_end = format!("{key}\x01"); // \x01 > \0, so this bounds all versions for key
 
-        // Collect versions for this key, sorted by version_id descending (latest first)
+        // Collect versions for this key. redb stores entries in ascending key order
+        // and version IDs are lexicographically time-ordered, so the last entry is the latest.
         let mut versions: Vec<(String, ObjectMeta)> = Vec::new();
         {
             let table = txn.open_table(VERSIONS).map_err(io::Error::other)?;
@@ -423,16 +469,10 @@ impl BucketStore {
             }
         }
 
-        // Sort by version_id descending (latest first) — version IDs are timestamp-based
-        versions.sort_by(|a, b| {
-            let (_, vid_a) = split_version_key(&a.0).unwrap_or(("", ""));
-            let (_, vid_b) = split_version_key(&b.0).unwrap_or(("", ""));
-            vid_b.cmp(vid_a)
-        });
-
-        // Find the latest non-delete-marker version
+        // Iterate in reverse (latest first) — no sort needed, redb ascending order is sufficient
         let promoted = versions
             .iter()
+            .rev()
             .find(|(_, m)| !m.is_delete_marker);
 
         if let Some((composite_key, meta)) = promoted {
@@ -483,35 +523,50 @@ impl BucketStore {
         // Collect all version entries: current objects + versions table
         let mut all_entries: Vec<(String, String, ObjectMeta)> = Vec::new(); // (key, vid, meta)
 
+        let prefix_str = prefix.unwrap_or("");
+
         // 1. Current objects from OBJECTS table
         {
             let table = txn.open_table(super::OBJECTS).map_err(io::Error::other)?;
-            for result in table.iter().map_err(io::Error::other)? {
+            let iter = if prefix_str.is_empty() {
+                table.iter().map_err(io::Error::other)?
+            } else {
+                table.range(prefix_str..).map_err(io::Error::other)?
+            };
+            for result in iter {
                 let (k, v) = result.map_err(io::Error::other)?;
                 let key = k.value().to_owned();
-                let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
 
-                if let Some(pfx) = prefix && !key.starts_with(pfx) {
-                    continue;
+                // Stop when we've passed the prefix
+                if !prefix_str.is_empty() && !key.starts_with(prefix_str) {
+                    break;
                 }
 
+                let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
                 let vid = meta.version_id.clone().unwrap_or_else(|| NULL_VERSION_ID.to_owned());
                 all_entries.push((key, vid, meta));
             }
         }
 
         // 2. Historical versions from VERSIONS table
+        //    Version keys are "objkey\0vid", so scanning from "prefix" covers all matching keys.
         {
             let table = txn.open_table(VERSIONS).map_err(io::Error::other)?;
-            for result in table.iter().map_err(io::Error::other)? {
+            let iter = if prefix_str.is_empty() {
+                table.iter().map_err(io::Error::other)?
+            } else {
+                table.range(prefix_str..).map_err(io::Error::other)?
+            };
+            for result in iter {
                 let (k, v) = result.map_err(io::Error::other)?;
                 let composite = k.value();
                 let Some((key, vid)) = split_version_key(composite) else {
                     continue;
                 };
 
-                if let Some(pfx) = prefix && !key.starts_with(pfx) {
-                    continue;
+                // Stop when the object key part no longer starts with prefix
+                if !prefix_str.is_empty() && !key.starts_with(prefix_str) {
+                    break;
                 }
 
                 let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
@@ -563,11 +618,13 @@ impl BucketStore {
                 if let Some(pos) = after_prefix.find(delim) {
                     let cp = format!("{pfx}{}", &after_prefix[..(pos + delim.len())]);
                     common_prefixes.insert(cp);
+                    count += 1;
                     continue;
                 }
             } else if let Some(delim) = delimiter && let Some(pos) = key.find(delim) {
                 let cp = key[..(pos + delim.len())].to_owned();
                 common_prefixes.insert(cp);
+                count += 1;
                 continue;
             }
 
