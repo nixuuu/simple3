@@ -525,19 +525,29 @@ impl BucketStore {
 
         let prefix_str = prefix.unwrap_or("");
 
+        // Use marker-based range start to skip entries before the pagination point.
+        // For OBJECTS table, start at key_marker (or prefix) to skip early keys.
+        let range_start = match (key_marker, prefix) {
+            (Some(km), Some(pfx)) => {
+                if km >= pfx { km } else { pfx }
+            }
+            (Some(km), None) => km,
+            (_, Some(pfx)) => pfx,
+            _ => "",
+        };
+
         // 1. Current objects from OBJECTS table
         {
             let table = txn.open_table(super::OBJECTS).map_err(io::Error::other)?;
-            let iter = if prefix_str.is_empty() {
+            let iter = if range_start.is_empty() {
                 table.iter().map_err(io::Error::other)?
             } else {
-                table.range(prefix_str..).map_err(io::Error::other)?
+                table.range(range_start..).map_err(io::Error::other)?
             };
             for result in iter {
                 let (k, v) = result.map_err(io::Error::other)?;
                 let key = k.value().to_owned();
 
-                // Stop when we've passed the prefix
                 if !prefix_str.is_empty() && !key.starts_with(prefix_str) {
                     break;
                 }
@@ -549,13 +559,13 @@ impl BucketStore {
         }
 
         // 2. Historical versions from VERSIONS table
-        //    Version keys are "objkey\0vid", so scanning from "prefix" covers all matching keys.
+        //    Version keys are "objkey\0vid"; start range at marker key to skip early entries.
         {
             let table = txn.open_table(VERSIONS).map_err(io::Error::other)?;
-            let iter = if prefix_str.is_empty() {
+            let iter = if range_start.is_empty() {
                 table.iter().map_err(io::Error::other)?
             } else {
-                table.range(prefix_str..).map_err(io::Error::other)?
+                table.range(range_start..).map_err(io::Error::other)?
             };
             for result in iter {
                 let (k, v) = result.map_err(io::Error::other)?;
@@ -564,7 +574,6 @@ impl BucketStore {
                     continue;
                 };
 
-                // Stop when the object key part no longer starts with prefix
                 if !prefix_str.is_empty() && !key.starts_with(prefix_str) {
                     break;
                 }
@@ -628,10 +637,10 @@ impl BucketStore {
                 continue;
             }
 
-            // Determine is_latest: first entry per key is latest
+            // First entry per key is latest (entries sorted by key asc, vid desc)
             let is_latest = entries
-                .iter()
-                .all(|e: &VersionEntry| e.key != key);
+                .last()
+                .is_none_or(|e: &VersionEntry| e.key != key);
 
             entries.push(VersionEntry {
                 key,

@@ -402,14 +402,13 @@ impl S3 for SimpleStorage {
 
         let result_meta = blocking(move || {
             if let Some(vid) = req_version_id {
-                // Version-specific delete: permanently remove
-                let deleted = store.delete_current_version(&key, &vid)?;
-                if deleted.is_none() {
-                    // Try versions table
-                    store.delete_version(&key, &vid)?;
+                // Version-specific delete: permanently remove.
+                // Return metadata for the response (AWS returns version_id).
+                if let Some(meta) = store.delete_current_version(&key, &vid)? {
+                    return Ok(Some(meta));
                 }
-                // Return 204 always (even if not found, per AWS)
-                Ok(None)
+                // Try versions table
+                Ok(store.delete_version(&key, &vid)?)
             } else {
                 // No version_id: hard delete or create delete marker
                 store.delete_object(&key)
@@ -419,11 +418,11 @@ impl S3 for SimpleStorage {
         .map_err(|e| { tracing::error!("delete_object: {e}"); s3_error!(e, InternalError) })?;
 
         let mut output = DeleteObjectOutput::default();
-        if let Some(meta) = result_meta
-            && meta.is_delete_marker
-        {
-            output.delete_marker = Some(true);
+        if let Some(meta) = result_meta {
             output.version_id = version_id_string(meta.version_id.as_deref());
+            if meta.is_delete_marker {
+                output.delete_marker = Some(true);
+            }
         }
         Ok(S3Response::new(output))
     }
