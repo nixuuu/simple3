@@ -150,6 +150,44 @@ impl Transport for HttpTransport {
         Ok(())
     }
 
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        dest: &Path,
+    ) -> anyhow::Result<u64> {
+        let resp = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await?;
+        let data = resp.body.collect().await?;
+        let bytes = data.into_bytes();
+        let len = bytes.len() as u64;
+        tokio::fs::write(dest, bytes).await?;
+        Ok(len)
+    }
+
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await?;
+        Ok(())
+    }
+
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> anyhow::Result<()> {
         if keys.is_empty() {
             return Ok(());

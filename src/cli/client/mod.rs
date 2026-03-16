@@ -206,6 +206,19 @@ pub trait Transport: Send + Sync {
     #[allow(dead_code)]
     async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()>;
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> anyhow::Result<()>;
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        dest: &Path,
+    ) -> anyhow::Result<u64>;
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> anyhow::Result<()>;
 }
 
 /// List ALL objects under a prefix by paginating through continuation tokens.

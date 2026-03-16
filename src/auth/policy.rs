@@ -161,10 +161,15 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 pub fn map_op_to_action(op_name: &str) -> Cow<'static, str> {
     match op_name {
         "GetObject" | "HeadObject" => Cow::Borrowed("s3:GetObject"),
+        "GetObjectVersion" => Cow::Borrowed("s3:GetObjectVersion"),
         "PutObject" | "CreateMultipartUpload" | "UploadPart" | "CompleteMultipartUpload"
         | "AbortMultipartUpload" => Cow::Borrowed("s3:PutObject"),
         "DeleteObject" | "DeleteObjects" => Cow::Borrowed("s3:DeleteObject"),
+        "DeleteObjectVersion" => Cow::Borrowed("s3:DeleteObjectVersion"),
         "ListObjectsV2" | "ListObjects" => Cow::Borrowed("s3:ListBucket"),
+        "ListObjectVersions" => Cow::Borrowed("s3:ListBucketVersions"),
+        "PutBucketVersioning" => Cow::Borrowed("s3:PutBucketVersioning"),
+        "GetBucketVersioning" => Cow::Borrowed("s3:GetBucketVersioning"),
         "CreateBucket" => Cow::Borrowed("s3:CreateBucket"),
         "DeleteBucket" => Cow::Borrowed("s3:DeleteBucket"),
         "ListBuckets" => Cow::Borrowed("s3:ListAllMyBuckets"),

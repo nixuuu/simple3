@@ -92,7 +92,7 @@ impl BucketStore {
         let total_len = total_data_len + 4;
         w.size = offset + total_len;
 
-        let meta = ObjectMeta {
+        let mut meta = ObjectMeta {
             segment_id,
             offset,
             length: total_len,
@@ -102,9 +102,11 @@ impl BucketStore {
             user_metadata,
             content_md5: Some(content_md5),
             content_crc32c: Some(crc),
+            version_id: None,
+            is_delete_marker: false,
         };
 
-        if let Err(e) = self.commit_put(key, &meta) {
+        if let Err(e) = self.commit_put(key, &mut meta) {
             w.file.set_len(offset).ok();
             w.size = offset;
             return Err(e);

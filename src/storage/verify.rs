@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::types::ObjectMeta;
 
 use super::{BucketStore, COPY_BUF_SIZE, OBJECTS};
+use super::versioning::VERSIONS;
 
 #[derive(Debug, Serialize)]
 pub struct VerifyResult {
@@ -38,7 +39,6 @@ pub enum VerifyErrorKind {
 impl BucketStore {
     pub fn verify_integrity(&self) -> io::Result<VerifyResult> {
         let txn = self.db.begin_read().map_err(io::Error::other)?;
-        let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
 
         let mut result = VerifyResult {
             total_objects: 0,
@@ -49,15 +49,50 @@ impl BucketStore {
             errors: Vec::new(),
         };
 
+        // Verify current objects
+        let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
         let iter = table.iter().map_err(io::Error::other)?;
         for entry in iter {
             let (k, v): (redb::AccessGuard<'_, &str>, redb::AccessGuard<'_, &[u8]>) =
                 entry.map_err(io::Error::other)?;
             let key = k.value().to_owned();
             let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
-            result.total_objects += 1;
 
+            // Skip delete markers (no segment data)
+            if meta.is_delete_marker {
+                continue;
+            }
+
+            result.total_objects += 1;
             match self.verify_object(&key, &meta) {
+                Ok(()) => result.verified_ok += 1,
+                Err(e) => result.errors.push(e),
+            }
+        }
+
+        // Verify historical versions
+        let ver_table = txn.open_table(VERSIONS).map_err(io::Error::other)?;
+        let ver_iter = ver_table.iter().map_err(io::Error::other)?;
+        for entry in ver_iter {
+            let (k, v): (redb::AccessGuard<'_, &str>, redb::AccessGuard<'_, &[u8]>) =
+                entry.map_err(io::Error::other)?;
+            let composite = k.value();
+            let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
+
+            // Skip delete markers
+            if meta.is_delete_marker {
+                continue;
+            }
+
+            // Extract key and version_id from composite key
+            let display_key = if let Some((obj_key, vid)) = composite.split_once('\0') {
+                format!("{obj_key} (version: {vid})")
+            } else {
+                composite.to_owned()
+            };
+
+            result.total_objects += 1;
+            match self.verify_object(&display_key, &meta) {
                 Ok(()) => result.verified_ok += 1,
                 Err(e) => result.errors.push(e),
             }

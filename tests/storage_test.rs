@@ -16,6 +16,8 @@ fn make_meta(segment_id: u32, offset: u64, length: u64, etag: &str, crc: u32) ->
         user_metadata: HashMap::new(),
         content_md5: None,
         content_crc32c: Some(crc),
+        version_id: None,
+        is_delete_marker: false,
     }
 }
 
@@ -81,8 +83,8 @@ fn test_put_get_object() {
     let data = b"hello world";
     let (seg_id, offset, length, crc) = bucket.append_data(data).unwrap();
 
-    let meta = make_meta(seg_id, offset, length, "abc123", crc);
-    bucket.put_meta("key1", &meta).unwrap();
+    let mut meta = make_meta(seg_id, offset, length, "abc123", crc);
+    bucket.put_meta("key1", &mut meta).unwrap();
 
     let read_back = bucket.read_object(&meta).unwrap();
     assert_eq!(read_back, data);
@@ -103,12 +105,12 @@ fn test_put_overwrite() {
 
     let (seg1, off1, len1, crc1) = bucket.append_data(b"old data").unwrap();
     bucket
-        .put_meta("key", &make_meta(seg1, off1, len1, "old", crc1))
+        .put_meta("key", &mut make_meta(seg1, off1, len1, "old", crc1))
         .unwrap();
 
     let (seg2, off2, len2, crc2) = bucket.append_data(b"new data!!!").unwrap();
     bucket
-        .put_meta("key", &make_meta(seg2, off2, len2, "new", crc2))
+        .put_meta("key", &mut make_meta(seg2, off2, len2, "new", crc2))
         .unwrap();
 
     let meta = bucket.get_meta("key").unwrap().unwrap();
@@ -138,7 +140,7 @@ fn test_head_object_metadata() {
 
     let data = b"some content";
     let (seg_id, offset, length, crc) = bucket.append_data(data).unwrap();
-    let meta = ObjectMeta {
+    let mut meta = ObjectMeta {
         segment_id: seg_id,
         offset,
         length,
@@ -148,8 +150,10 @@ fn test_head_object_metadata() {
         user_metadata: [("x-custom".into(), "val".into())].into(),
         content_md5: None,
         content_crc32c: Some(crc),
+        version_id: None,
+        is_delete_marker: false,
     };
-    bucket.put_meta("obj", &meta).unwrap();
+    bucket.put_meta("obj", &mut meta).unwrap();
 
     let got = bucket.get_meta("obj").unwrap().unwrap();
     assert_eq!(got.content_type.as_deref(), Some("application/json"));
@@ -167,7 +171,7 @@ fn test_delete_object() {
 
     let (seg, off, len, crc) = bucket.append_data(b"deleteme").unwrap();
     bucket
-        .put_meta("k", &make_meta(seg, off, len, "e", crc))
+        .put_meta("k", &mut make_meta(seg, off, len, "e", crc))
         .unwrap();
 
     let removed = bucket.delete_object("k").unwrap();
@@ -196,12 +200,12 @@ fn test_compaction_shrinks_file() {
 
     let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
+        .put_meta("a", &mut make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
 
     let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBBBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
+        .put_meta("b", &mut make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
@@ -226,17 +230,17 @@ fn test_compaction_preserves_other_objects() {
 
     let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
+        .put_meta("a", &mut make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
 
     let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
+        .put_meta("b", &mut make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
 
     let (seg, off_c, len_c, crc_c) = bucket.append_data(b"CCC").unwrap();
     bucket
-        .put_meta("c", &make_meta(seg, off_c, len_c, "ec", crc_c))
+        .put_meta("c", &mut make_meta(seg, off_c, len_c, "ec", crc_c))
         .unwrap();
 
     bucket.delete_object("b").unwrap();
@@ -280,7 +284,7 @@ fn test_list_objects_prefix() {
 
     for key in ["photos/a.jpg", "photos/b.jpg", "docs/x.txt", "docs/y.txt"] {
         let (seg, off, len, crc) = bucket.append_data(b"data").unwrap();
-        bucket.put_meta(key, &make_meta(seg, off, len, "e", crc)).unwrap();
+        bucket.put_meta(key, &mut make_meta(seg, off, len, "e", crc)).unwrap();
     }
 
     let (items, _) = bucket.list_objects(Some("photos/"), 1000, None).unwrap();
@@ -307,7 +311,7 @@ fn test_list_objects_delimiter() {
         "root.txt",
     ] {
         let (seg, off, len, crc) = bucket.append_data(b"data").unwrap();
-        bucket.put_meta(key, &make_meta(seg, off, len, "e", crc)).unwrap();
+        bucket.put_meta(key, &mut make_meta(seg, off, len, "e", crc)).unwrap();
     }
 
     // Root level with delimiter
@@ -346,7 +350,7 @@ fn test_list_objects_pagination() {
         let key = format!("key{i:02}");
         let (seg, off, len, crc) = bucket.append_data(b"x").unwrap();
         bucket
-            .put_meta(&key, &make_meta(seg, off, len, "e", crc))
+            .put_meta(&key, &mut make_meta(seg, off, len, "e", crc))
             .unwrap();
     }
 
@@ -380,7 +384,7 @@ fn test_reopen_storage() {
         let bucket = storage.get_bucket("persist").unwrap().unwrap();
         let (seg, off, len, crc) = bucket.append_data(b"survive restart").unwrap();
         bucket
-            .put_meta("key1", &make_meta(seg, off, len, "etag", crc))
+            .put_meta("key1", &mut make_meta(seg, off, len, "etag", crc))
             .unwrap();
     }
 
@@ -688,11 +692,11 @@ fn test_dead_bytes_tracking() {
     // Put two objects
     let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
+        .put_meta("a", &mut make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
     let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBBBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
+        .put_meta("b", &mut make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
 
     assert_eq!(bucket.dead_bytes(), 0);
@@ -722,15 +726,15 @@ fn test_compact_full_rewrite() {
     // Put 3 objects: A(4) + B(6) + C(3) = 13 bytes
     let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
+        .put_meta("a", &mut make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
     let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBBBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
+        .put_meta("b", &mut make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
     let (seg, off_c, len_c, crc_c) = bucket.append_data(b"CCC").unwrap();
     bucket
-        .put_meta("c", &make_meta(seg, off_c, len_c, "ec", crc_c))
+        .put_meta("c", &mut make_meta(seg, off_c, len_c, "ec", crc_c))
         .unwrap();
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
@@ -764,7 +768,7 @@ fn test_recovery_truncates_orphans() {
 
     let (seg, off, len, crc) = bucket.append_data(b"HELLO").unwrap();
     bucket
-        .put_meta("key", &make_meta(seg, off, len, "e1", crc))
+        .put_meta("key", &mut make_meta(seg, off, len, "e1", crc))
         .unwrap();
 
     let seg_path = dir.path().join("b").join("seg_000000.bin");
@@ -804,11 +808,11 @@ fn test_recovery_after_interrupted_compaction() {
     // Put objects
     let (seg, off_a, len_a, crc_a) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off_a, len_a, "ea", crc_a))
+        .put_meta("a", &mut make_meta(seg, off_a, len_a, "ea", crc_a))
         .unwrap();
     let (seg, off_b, len_b, crc_b) = bucket.append_data(b"BBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off_b, len_b, "eb", crc_b))
+        .put_meta("b", &mut make_meta(seg, off_b, len_b, "eb", crc_b))
         .unwrap();
 
     // Simulate interrupted compaction: leave temp file
@@ -841,11 +845,11 @@ fn test_segment_stats() {
 
     let (seg, off, len, crc) = bucket.append_data(b"AAAA").unwrap();
     bucket
-        .put_meta("a", &make_meta(seg, off, len, "ea", crc))
+        .put_meta("a", &mut make_meta(seg, off, len, "ea", crc))
         .unwrap();
     let (seg, off, len, crc) = bucket.append_data(b"BBBB").unwrap();
     bucket
-        .put_meta("b", &make_meta(seg, off, len, "eb", crc))
+        .put_meta("b", &mut make_meta(seg, off, len, "eb", crc))
         .unwrap();
 
     bucket.delete_object("a").unwrap();
@@ -872,7 +876,7 @@ fn test_verify_integrity_ok() {
     let data = b"hello world";
     let md5 = format!("{:x}", Md5::digest(data));
     let (seg, off, len, crc) = bucket.append_data(data).unwrap();
-    let meta = ObjectMeta {
+    let mut meta = ObjectMeta {
         segment_id: seg,
         offset: off,
         length: len,
@@ -882,8 +886,10 @@ fn test_verify_integrity_ok() {
         user_metadata: HashMap::new(),
         content_md5: Some(md5),
         content_crc32c: Some(crc),
+        version_id: None,
+        is_delete_marker: false,
     };
-    bucket.put_meta("key1", &meta).unwrap();
+    bucket.put_meta("key1", &mut meta).unwrap();
 
     let result = bucket.verify_integrity().unwrap();
     assert_eq!(result.total_objects, 1);
@@ -900,7 +906,7 @@ fn test_verify_integrity_checksum_mismatch() {
 
     let data = b"hello world";
     let (seg, off, len, crc) = bucket.append_data(data).unwrap();
-    let meta = ObjectMeta {
+    let mut meta = ObjectMeta {
         segment_id: seg,
         offset: off,
         length: len,
@@ -910,8 +916,10 @@ fn test_verify_integrity_checksum_mismatch() {
         user_metadata: HashMap::new(),
         content_md5: Some("wrong_md5_value".into()),
         content_crc32c: Some(crc),
+        version_id: None,
+        is_delete_marker: false,
     };
-    bucket.put_meta("key1", &meta).unwrap();
+    bucket.put_meta("key1", &mut meta).unwrap();
 
     let result = bucket.verify_integrity().unwrap();
     assert_eq!(result.total_objects, 1);
@@ -987,8 +995,8 @@ fn test_read_object_crc_mismatch() {
 
     let data = b"hello world";
     let (seg, off, len, crc) = bucket.append_data(data).unwrap();
-    let meta = make_meta(seg, off, len, "etag", crc);
-    bucket.put_meta("key", &meta).unwrap();
+    let mut meta = make_meta(seg, off, len, "etag", crc);
+    bucket.put_meta("key", &mut meta).unwrap();
 
     // Valid read succeeds
     let result = bucket.read_object(&meta).unwrap();
@@ -1041,7 +1049,7 @@ fn test_backup_restore_cold_copy() {
     let data1 = b"first object";
     let md5_1 = format!("{:x}", Md5::digest(data1));
     let (seg, off, len, crc) = bucket.append_data(data1).unwrap();
-    let meta1 = ObjectMeta {
+    let mut meta1 = ObjectMeta {
         segment_id: seg,
         offset: off,
         length: len,
@@ -1051,8 +1059,10 @@ fn test_backup_restore_cold_copy() {
         user_metadata: HashMap::new(),
         content_md5: Some(md5_1),
         content_crc32c: Some(crc),
+        version_id: None,
+        is_delete_marker: false,
     };
-    bucket.put_meta("simple.txt", &meta1).unwrap();
+    bucket.put_meta("simple.txt", &mut meta1).unwrap();
 
     // 2) Streamed put
     let data2 = b"streamed backup content";

@@ -191,6 +191,7 @@ impl Transport for GrpcTransport {
                 key: key.to_owned(),
                 range_start: None,
                 range_end: None,
+                version_id: None,
             })
             .await?;
         let mut stream = resp.into_inner();
@@ -241,6 +242,56 @@ impl Transport for GrpcTransport {
             .delete_object(DeleteObjectRequest {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
+                version_id: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        dest: &Path,
+    ) -> anyhow::Result<u64> {
+        let resp = self
+            .client
+            .clone()
+            .get_object(GetObjectRequest {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                range_start: None,
+                range_end: None,
+                version_id: Some(version_id.to_owned()),
+            })
+            .await?;
+        let mut stream = resp.into_inner();
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut total: u64 = 0;
+
+        while let Some(msg) = stream.message().await? {
+            if let Some(get_object_response::Response::Data(chunk)) = msg.response {
+                file.write_all(&chunk).await?;
+                total += chunk.len() as u64;
+            }
+        }
+        file.flush().await?;
+        Ok(total)
+    }
+
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .clone()
+            .delete_object(DeleteObjectRequest {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                version_id: Some(version_id.to_owned()),
             })
             .await?;
         Ok(())
@@ -255,7 +306,13 @@ impl Transport for GrpcTransport {
                 .clone()
                 .delete_objects(DeleteObjectsRequest {
                     bucket: bucket.to_owned(),
-                    keys: chunk.to_vec(),
+                    items: chunk
+                        .iter()
+                        .map(|k| DeleteObjectIdentifier {
+                            key: k.clone(),
+                            version_id: None,
+                        })
+                        .collect(),
                 })
                 .await?;
         }

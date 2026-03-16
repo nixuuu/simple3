@@ -13,13 +13,20 @@ pub async fn run(
     dest: &str,
     recursive: bool,
     concurrency: usize,
+    version_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let src_s3 = is_s3_uri(src);
     let dest_s3 = is_s3_uri(dest);
 
+    if version_id.is_some() && (!src_s3 || dest_s3) {
+        anyhow::bail!("--version-id is only supported when downloading from S3 to local");
+    }
+
     match (src_s3, dest_s3) {
         (false, true) => upload(&transport, src, dest, recursive, concurrency).await,
-        (true, false) => download(&transport, src, dest, recursive, concurrency).await,
+        (true, false) => {
+            download(&transport, src, dest, recursive, concurrency, version_id).await
+        }
         (true, true) => copy_s3_to_s3(&transport, src, dest, recursive, concurrency).await,
         (false, false) => anyhow::bail!("at least one path must be an s3:// URI"),
     }
@@ -108,6 +115,7 @@ async fn download(
     dest: &str,
     recursive: bool,
     concurrency: usize,
+    version_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let parsed = S3Uri::parse(src)?;
     let bucket = parsed.bucket();
@@ -125,9 +133,22 @@ async fn download(
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let bytes = transport.get_object(bucket, key, &target).await?;
-        println!("download: s3://{bucket}/{key} -> {} ({bytes} bytes)", target.display());
+        let bytes = if let Some(vid) = version_id {
+            transport
+                .get_object_version(bucket, key, vid, &target)
+                .await?
+        } else {
+            transport.get_object(bucket, key, &target).await?
+        };
+        println!(
+            "download: s3://{bucket}/{key} -> {} ({bytes} bytes)",
+            target.display()
+        );
         return Ok(());
+    }
+
+    if version_id.is_some() {
+        anyhow::bail!("--version-id cannot be used with --recursive");
     }
 
     let objects = list_all_objects(transport.as_ref(), bucket, src_prefix).await?;
