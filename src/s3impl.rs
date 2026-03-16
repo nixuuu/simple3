@@ -430,29 +430,8 @@ impl S3 for SimpleStorage {
             .as_ref()
             .is_some_and(|d| d.as_str() == MetadataDirective::REPLACE);
 
-        let src_key_clone = src_key.clone();
-        let src_vid = src_version_id.clone();
-        let ss = Arc::clone(&src_store);
-        let (src_meta, src_data) = blocking(move || {
-            let meta =
-                resolve_object_version(&ss, &src_key_clone, src_vid.as_deref())?;
-            let data = ss.read_object(&meta)?;
-            Ok((meta, data))
-        })
-        .await
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                return s3_error!(NoSuchKey);
-            }
-            tracing::error!("copy_object read source: {e}");
-            s3_error!(e, InternalError)
-        })?;
-
-        let (content_type, user_metadata) = if replace_metadata {
-            (input.content_type, input.metadata.unwrap_or_default())
-        } else {
-            (src_meta.content_type.clone(), src_meta.user_metadata.clone())
-        };
+        let req_content_type = input.content_type;
+        let req_metadata = input.metadata.unwrap_or_default();
 
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = dest_store.bucket_dir().join(format!(".tmp_{tmp_id:020}"));
@@ -462,18 +441,40 @@ impl S3 for SimpleStorage {
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
+        let src_vid = src_version_id.clone();
+        let ss = Arc::clone(&src_store);
         let dest_key = input.key;
-        let meta = blocking(move || {
-            let etag_hex = format!("{:x}", Md5::digest(&src_data));
-            let crc = crc32c::crc32c(&src_data);
-            if let Err(e) = std::fs::write(&tmp_path, &src_data) {
-                std::fs::remove_file(&tmp_path).ok();
-                return Err(e);
+        let result = blocking(move || {
+            let src_meta = resolve_object_version(&ss, &src_key, src_vid.as_deref())?;
+
+            let (content_type, user_metadata) = if replace_metadata {
+                (req_content_type, req_metadata)
+            } else {
+                (src_meta.content_type.clone(), src_meta.user_metadata.clone())
+            };
+
+            let file = std::fs::File::create(&tmp_path)?;
+            let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
+            let mut hasher = Md5::new();
+            let mut crc: u32 = 0;
+            let data_len = src_meta.data_length();
+            let mut pos = 0u64;
+            while pos < data_len {
+                let chunk_size = (data_len - pos).min(256 * 1024);
+                let chunk = ss.read_data(src_meta.segment_id, src_meta.offset + pos, chunk_size)?;
+                writer.write_all(&chunk)?;
+                hasher.update(&chunk);
+                crc = crc32c::crc32c_append(crc, &chunk);
+                pos += chunk_size;
             }
+            writer.flush()?;
+            drop(writer);
+
+            let etag_hex = format!("{:x}", hasher.finalize());
             match dest_store.put_object_streamed(
                 &dest_key, &tmp_path, content_type, etag_hex.clone(), now, user_metadata, Some(crc),
             ) {
-                Ok(m) => Ok((etag_hex, m)),
+                Ok(m) => Ok((etag_hex, m, src_meta.version_id, data_len)),
                 Err(e) => {
                     std::fs::remove_file(&tmp_path).ok();
                     Err(e)
@@ -481,9 +482,15 @@ impl S3 for SimpleStorage {
             }
         })
         .await
-        .map_err(|e| { tracing::error!("copy_object put dest: {e}"); s3_error!(e, InternalError) })?;
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                return s3_error!(NoSuchKey);
+            }
+            tracing::error!("copy_object: {e}");
+            s3_error!(e, InternalError)
+        })?;
 
-        let (etag_hex, meta) = meta;
+        let (etag_hex, meta, src_vid_out, _data_len) = result;
 
         let last_modified = Timestamp::from(UNIX_EPOCH + Duration::from_secs(now));
 
@@ -495,7 +502,7 @@ impl S3 for SimpleStorage {
             }),
             version_id: version_id_string(meta.version_id.as_deref()),
             copy_source_version_id: src_version_id
-                .or_else(|| src_meta.version_id.clone()),
+                .or_else(|| src_vid_out.clone()),
             ..Default::default()
         };
         Ok(S3Response::new(output))

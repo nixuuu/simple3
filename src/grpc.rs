@@ -377,30 +377,9 @@ impl Simple3 for GrpcService {
         let src_store = self.bucket(&input.source_bucket)?;
         let dest_store = self.bucket(&input.dest_bucket)?;
 
-        let src_key = input.source_key.clone();
-        let src_vid = input.source_version_id.clone();
-        let ss = Arc::clone(&src_store);
-        let (src_meta, src_data) = tokio::task::spawn_blocking(move || {
-            let meta = ss
-                .get_object_or_version(&src_key, src_vid.as_deref())?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source object not found"))?;
-            if meta.is_delete_marker {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "source is a delete marker"));
-            }
-            let data = ss.read_object(&meta)?;
-            Ok((meta, data))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
-        .map_err(map_io_err)?;
-
         let replace_metadata = input.metadata_directive == "REPLACE";
-        let (content_type, user_metadata) = if replace_metadata {
-            let ct = input.content_type.filter(|s| !s.is_empty());
-            (ct, input.metadata)
-        } else {
-            (src_meta.content_type.clone(), src_meta.user_metadata.clone())
-        };
+        let req_content_type = input.content_type.filter(|s| !s.is_empty());
+        let req_metadata = input.metadata;
 
         let tmp_id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = dest_store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}"));
@@ -410,20 +389,46 @@ impl Simple3 for GrpcService {
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
+        let src_key = input.source_key;
+        let src_vid = input.source_version_id;
+        let ss = Arc::clone(&src_store);
         let dest_key = input.dest_key;
-        #[allow(clippy::cast_possible_truncation)] // src_data.len() bounded by memory; always fits u64
-        let size = src_data.len() as u64;
-        let (etag, meta) = tokio::task::spawn_blocking(move || {
-            let etag = format!("{:x}", <md5::Md5 as md5::Digest>::digest(&src_data));
-            let crc = crc32c::crc32c(&src_data);
-            if let Err(e) = std::fs::write(&tmp_path, &src_data) {
-                std::fs::remove_file(&tmp_path).ok();
-                return Err(e);
+        let (etag, meta, src_version_id_out, size) = tokio::task::spawn_blocking(move || {
+            let src_meta = ss
+                .get_object_or_version(&src_key, src_vid.as_deref())?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source object not found"))?;
+            if src_meta.is_delete_marker {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "source is a delete marker"));
             }
+
+            let (content_type, user_metadata) = if replace_metadata {
+                (req_content_type, req_metadata)
+            } else {
+                (src_meta.content_type.clone(), src_meta.user_metadata.clone())
+            };
+
+            let file = std::fs::File::create(&tmp_path)?;
+            let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+            let mut hasher = <md5::Md5 as md5::Digest>::new();
+            let mut crc: u32 = 0;
+            let data_len = src_meta.data_length();
+            let mut pos = 0u64;
+            while pos < data_len {
+                let chunk_size = (data_len - pos).min(256 * 1024);
+                let chunk = ss.read_data(src_meta.segment_id, src_meta.offset + pos, chunk_size)?;
+                std::io::Write::write_all(&mut writer, &chunk)?;
+                <md5::Md5 as md5::Digest>::update(&mut hasher, &chunk);
+                crc = crc32c::crc32c_append(crc, &chunk);
+                pos += chunk_size;
+            }
+            std::io::Write::flush(&mut writer)?;
+            drop(writer);
+
+            let etag = format!("{:x}", <md5::Md5 as md5::Digest>::finalize(hasher));
             match dest_store.put_object_streamed(
                 &dest_key, &tmp_path, content_type, etag.clone(), now, user_metadata, Some(crc),
             ) {
-                Ok(m) => Ok((etag, m)),
+                Ok(m) => Ok((etag, m, src_meta.version_id, data_len)),
                 Err(e) => {
                     std::fs::remove_file(&tmp_path).ok();
                     Err(e)
@@ -439,7 +444,7 @@ impl Simple3 for GrpcService {
             content_md5: meta.content_md5.unwrap_or_default(),
             size,
             last_modified: now,
-            source_version_id: src_meta.version_id,
+            source_version_id: src_version_id_out,
             version_id: meta.version_id,
         }))
     }

@@ -320,3 +320,82 @@ async fn test_copy_overwrite_existing() {
     let data = get.body.collect().await.unwrap().into_bytes();
     assert_eq!(&data[..], b"new data");
 }
+
+#[tokio::test]
+async fn test_copy_empty_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(dir.path()).await;
+    let client = make_client(srv.port, &srv.access_key, &srv.secret_key);
+
+    client.create_bucket().bucket("test").send().await.unwrap();
+
+    client
+        .put_object()
+        .bucket("test")
+        .key("empty.txt")
+        .body(ByteStream::from_static(b""))
+        .content_type("text/plain")
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .copy_object()
+        .bucket("test")
+        .key("empty-copy.txt")
+        .copy_source("test/empty.txt")
+        .send()
+        .await
+        .unwrap();
+
+    let head = client
+        .head_object()
+        .bucket("test")
+        .key("empty-copy.txt")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(head.content_length().unwrap(), 0);
+    assert_eq!(head.content_type().unwrap(), "text/plain");
+}
+
+#[tokio::test]
+async fn test_copy_special_chars_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(dir.path()).await;
+    let client = make_client(srv.port, &srv.access_key, &srv.secret_key);
+
+    client.create_bucket().bucket("test").send().await.unwrap();
+
+    let body = b"special chars data";
+    let key = "path/to/file with spaces & symbols.txt";
+
+    client
+        .put_object()
+        .bucket("test")
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .copy_object()
+        .bucket("test")
+        .key("dest/copied file.txt")
+        .copy_source(format!("test/{key}"))
+        .send()
+        .await
+        .unwrap();
+
+    let get = client
+        .get_object()
+        .bucket("test")
+        .key("dest/copied file.txt")
+        .send()
+        .await
+        .unwrap();
+    let data = get.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&data[..], body);
+}
