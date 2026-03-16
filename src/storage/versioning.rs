@@ -27,9 +27,9 @@ pub fn generate_version_id() -> String {
         .unwrap_or_default()
         .as_nanos() as u64;
     // Relaxed is fine: fetch_add returns a unique value per call regardless of ordering.
-    // Counter wraps at u32::MAX — practically impossible within a single nanosecond
-    // since the writer Mutex serializes all writes.
-    let seq = VERSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Mask to 16 bits so the 4-hex-digit format never overflows, preserving the
+    // fixed 20-char version ID length and lexicographic ordering guarantee.
+    let seq = VERSION_COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFFFF;
     let mut s = String::with_capacity(20);
     write!(s, "{nanos:016x}{seq:04x}").expect("write to String never fails");
     s
@@ -616,19 +616,21 @@ impl BucketStore {
                 break;
             }
 
-            // Delimiter handling
+            // Delimiter handling — only count newly-inserted prefixes toward max_keys
             if let (Some(delim), Some(pfx)) = (delimiter, prefix) {
                 let after_prefix = &key[pfx.len()..];
                 if let Some(pos) = after_prefix.find(delim) {
                     let cp = format!("{pfx}{}", &after_prefix[..(pos + delim.len())]);
-                    common_prefixes.insert(cp);
-                    count += 1;
+                    if common_prefixes.insert(cp) {
+                        count += 1;
+                    }
                     continue;
                 }
             } else if let Some(delim) = delimiter && let Some(pos) = key.find(delim) {
                 let cp = key[..(pos + delim.len())].to_owned();
-                common_prefixes.insert(cp);
-                count += 1;
+                if common_prefixes.insert(cp) {
+                    count += 1;
+                }
                 continue;
             }
 

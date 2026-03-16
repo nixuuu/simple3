@@ -184,15 +184,26 @@ impl S3 for SimpleStorage {
             if let Some(s) = status {
                 let state = if s.as_str() == BucketVersioningStatus::ENABLED {
                     VersioningState::Enabled
-                } else {
+                } else if s.as_str() == BucketVersioningStatus::SUSPENDED {
                     VersioningState::Suspended
+                } else {
+                    return Err(io::Error::other(format!(
+                        "MalformedXML: invalid versioning status '{}'",
+                        s.as_str()
+                    )));
                 };
                 store.set_versioning_state(state)?;
             }
             Ok(())
         })
         .await
-        .map_err(|e| { tracing::error!("put_bucket_versioning: {e}"); s3_error!(e, InternalError) })?;
+        .map_err(|e| {
+            if e.to_string().starts_with("MalformedXML") {
+                return s3_error!(MalformedXML);
+            }
+            tracing::error!("put_bucket_versioning: {e}");
+            s3_error!(e, InternalError)
+        })?;
 
         Ok(S3Response::new(PutBucketVersioningOutput::default()))
     }
