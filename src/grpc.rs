@@ -171,18 +171,7 @@ impl Simple3 for GrpcService {
         let version_id = input.version_id.clone();
         let s = Arc::clone(&store);
         let meta = tokio::task::spawn_blocking(move || {
-            if let Some(vid) = &version_id {
-                // First check if it matches the current object's version
-                if let Some(current) = s.get_meta(&key)?
-                    && current.version_id.as_deref() == Some(vid.as_str())
-                {
-                    return Ok(Some(current));
-                }
-                // Otherwise look in versions table
-                s.get_version(&key, vid)
-            } else {
-                s.get_meta(&key)
-            }
+            s.get_object_or_version(&key, version_id.as_deref())
         })
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?
@@ -239,18 +228,7 @@ impl Simple3 for GrpcService {
         let version_id = input.version_id.clone();
         let s = Arc::clone(&store);
         let meta = tokio::task::spawn_blocking(move || {
-            if let Some(vid) = &version_id {
-                // First check if it matches the current object's version
-                if let Some(current) = s.get_meta(&key)?
-                    && current.version_id.as_deref() == Some(vid.as_str())
-                {
-                    return Ok(Some(current));
-                }
-                // Otherwise look in versions table
-                s.get_version(&key, vid)
-            } else {
-                s.get_meta(&key)
-            }
+            s.get_object_or_version(&key, version_id.as_deref())
         })
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?

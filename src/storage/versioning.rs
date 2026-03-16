@@ -453,9 +453,9 @@ impl BucketStore {
         let prefix_start = format!("{key}\0");
         let prefix_end = format!("{key}\x01"); // \x01 > \0, so this bounds all versions for key
 
-        // Collect versions for this key. redb stores entries in ascending key order
-        // and version IDs are lexicographically time-ordered, so the last entry is the latest.
-        let mut versions: Vec<(String, ObjectMeta)> = Vec::new();
+        // Forward pass keeping last non-delete-marker — O(1) memory.
+        // redb returns ascending order; last non-delete-marker is the latest version.
+        let mut promoted: Option<(String, ObjectMeta)> = None;
         {
             let table = txn.open_table(VERSIONS).map_err(io::Error::other)?;
             let range = table
@@ -463,19 +463,14 @@ impl BucketStore {
                 .map_err(io::Error::other)?;
             for entry in range {
                 let (k, v) = entry.map_err(io::Error::other)?;
-                let composite = k.value().to_owned();
                 let m = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
-                versions.push((composite, m));
+                if !m.is_delete_marker {
+                    promoted = Some((k.value().to_owned(), m));
+                }
             }
         }
 
-        // Iterate in reverse (latest first) — no sort needed, redb ascending order is sufficient
-        let promoted = versions
-            .iter()
-            .rev()
-            .find(|(_, m)| !m.is_delete_marker);
-
-        if let Some((composite_key, meta)) = promoted {
+        if let Some((composite_key, meta)) = promoted.as_ref() {
             // Move to objects table
             let bytes = bincode::serialize(meta).map_err(io::Error::other)?;
             {

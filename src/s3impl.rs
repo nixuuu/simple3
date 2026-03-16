@@ -459,7 +459,15 @@ impl S3 for SimpleStorage {
                         Ok(None) => {
                             // Try versions table
                             match store.delete_version(&key, &vid) {
-                                Ok(_) => {
+                                Ok(Some(meta)) => {
+                                    deleted_list.push(DeletedObject {
+                                        key: Some(key),
+                                        version_id: Some(vid),
+                                        delete_marker: if meta.is_delete_marker { Some(true) } else { None },
+                                        ..Default::default()
+                                    });
+                                }
+                                Ok(None) => {
                                     deleted_list.push(DeletedObject {
                                         key: Some(key),
                                         version_id: Some(vid),
@@ -558,7 +566,6 @@ impl S3 for SimpleStorage {
 
         let objects: Vec<Object> = entries
             .into_iter()
-            .filter(|(_, meta)| !meta.is_delete_marker)
             .map(|(key, meta)| {
                 let last_modified =
                     Timestamp::from(UNIX_EPOCH + Duration::from_secs(meta.last_modified));
