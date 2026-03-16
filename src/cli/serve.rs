@@ -27,11 +27,13 @@ fn run_scrub(storage: &Arc<Storage>) {
         let Some(store) = storage.get_bucket(name).ok().flatten() else {
             continue;
         };
+        let start = std::time::Instant::now();
         match store.verify_integrity() {
             Ok(result) => {
+                let elapsed = start.elapsed();
                 if result.errors.is_empty() {
                     tracing::info!(
-                        "scrub: {name} — {} objects OK",
+                        "scrub: {name} — {} objects OK in {elapsed:.2?}",
                         result.verified_ok,
                     );
                 } else {
@@ -41,9 +43,16 @@ fn run_scrub(storage: &Arc<Storage>) {
                             e.key, e.kind, e.detail,
                         );
                     }
+                    tracing::warn!(
+                        "scrub: {name} — {} errors in {elapsed:.2?}",
+                        result.errors.len(),
+                    );
                 }
             }
-            Err(e) => tracing::error!("scrub: {name} — verify failed: {e}"),
+            Err(e) => {
+                let elapsed = start.elapsed();
+                tracing::error!("scrub: {name} — verify failed in {elapsed:.2?}: {e}");
+            }
         }
     }
 }
