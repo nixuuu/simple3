@@ -16,6 +16,7 @@ service Simple3 {
   rpc BulkPut(stream BulkPutRequest) returns (stream BulkPutResponse);
 
   // --- Bucket management ---
+  rpc HeadBucket(HeadBucketRequest) returns (HeadBucketResponse);
   rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
   rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
   rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
@@ -228,6 +229,12 @@ message BulkPutResponse {
 // ============================================================
 // Bucket management
 // ============================================================
+
+message HeadBucketRequest {
+  string name = 1;
+}
+
+message HeadBucketResponse {}
 
 message CreateBucketRequest {
   string name = 1;

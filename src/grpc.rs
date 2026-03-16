@@ -634,6 +634,17 @@ impl Simple3 for GrpcService {
     // Bucket management
     // ================================================================
 
+    async fn head_bucket(
+        &self,
+        request: Request<HeadBucketRequest>,
+    ) -> Result<Response<HeadBucketResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().name);
+        self.check_auth(&request, "s3:HeadBucket", &resource)?;
+        let name = request.into_inner().name;
+        let _store = self.bucket(&name)?;
+        Ok(Response::new(HeadBucketResponse {}))
+    }
+
     async fn create_bucket(
         &self,
         request: Request<CreateBucketRequest>,
