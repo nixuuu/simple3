@@ -143,6 +143,23 @@ impl Transport for HttpTransport {
         }
     }
 
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dest_bucket: &str,
+        dest_key: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .copy_object()
+            .bucket(dest_bucket)
+            .key(dest_key)
+            .copy_source(format!("{src_bucket}/{src_key}"))
+            .send()
+            .await?;
+        Ok(())
+    }
+
     async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
         self.client
             .delete_object()

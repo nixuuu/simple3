@@ -250,6 +250,29 @@ impl Transport for GrpcTransport {
         }
     }
 
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dest_bucket: &str,
+        dest_key: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .clone()
+            .copy_object(CopyObjectRequest {
+                source_bucket: src_bucket.to_owned(),
+                source_key: src_key.to_owned(),
+                source_version_id: None,
+                dest_bucket: dest_bucket.to_owned(),
+                dest_key: dest_key.to_owned(),
+                metadata_directive: String::new(),
+                content_type: None,
+                metadata: HashMap::new(),
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
         self.client
             .clone()

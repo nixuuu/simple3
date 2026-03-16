@@ -9,6 +9,7 @@ service Simple3 {
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc DeleteObjects(DeleteObjectsRequest) returns (DeleteObjectsResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
 
   // --- Bulk streaming ---
   rpc BulkGet(BulkGetRequest) returns (stream BulkGetResponse);
@@ -160,6 +161,27 @@ message ObjectInfo {
   string etag = 3;
   uint64 last_modified = 4;
   optional string version_id = 5;
+}
+
+// CopyObject
+message CopyObjectRequest {
+  string source_bucket = 1;
+  string source_key = 2;
+  optional string source_version_id = 3;
+  string dest_bucket = 4;
+  string dest_key = 5;
+  string metadata_directive = 6;  // "COPY" or "REPLACE"
+  optional string content_type = 7;
+  map<string, string> metadata = 8;
+}
+
+message CopyObjectResponse {
+  string etag = 1;
+  string content_md5 = 2;
+  uint64 size = 3;
+  uint64 last_modified = 4;
+  optional string source_version_id = 5;
+  optional string version_id = 6;
 }
 
 // ============================================================

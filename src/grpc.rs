@@ -363,6 +363,81 @@ impl Simple3 for GrpcService {
         Ok(Response::new(DeleteObjectsResponse { deleted, errors }))
     }
 
+    async fn copy_object(
+        &self,
+        request: Request<CopyObjectRequest>,
+    ) -> Result<Response<CopyObjectResponse>, Status> {
+        let input = request.get_ref();
+        let src_resource = format!("arn:s3:::{}/{}", input.source_bucket, input.source_key);
+        let dest_resource = format!("arn:s3:::{}/{}", input.dest_bucket, input.dest_key);
+        self.check_auth(&request, "s3:GetObject", &src_resource)?;
+        self.check_auth(&request, "s3:PutObject", &dest_resource)?;
+        let input = request.into_inner();
+
+        let src_store = self.bucket(&input.source_bucket)?;
+        let dest_store = self.bucket(&input.dest_bucket)?;
+
+        let src_key = input.source_key.clone();
+        let src_vid = input.source_version_id.clone();
+        let ss = Arc::clone(&src_store);
+        let (src_meta, src_data) = tokio::task::spawn_blocking(move || {
+            let meta = ss
+                .get_object_or_version(&src_key, src_vid.as_deref())?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source object not found"))?;
+            if meta.is_delete_marker {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "source is a delete marker"));
+            }
+            let data = ss.read_object(&meta)?;
+            Ok((meta, data))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+        .map_err(map_io_err)?;
+
+        let replace_metadata = input.metadata_directive == "REPLACE";
+        let (content_type, user_metadata) = if replace_metadata {
+            let ct = input.content_type.filter(|s| !s.is_empty());
+            (ct, input.metadata)
+        } else {
+            (src_meta.content_type.clone(), src_meta.user_metadata.clone())
+        };
+
+        let tmp_id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = dest_store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}"));
+
+        let etag = format!("{:x}", <md5::Md5 as md5::Digest>::digest(&src_data));
+        let crc = crc32c::crc32c(&src_data);
+        std::fs::write(&tmp_path, &src_data)
+            .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+
+        let dest_key = input.dest_key;
+        let etag_clone = etag.clone();
+        #[allow(clippy::cast_possible_truncation)]
+        let size = src_data.len() as u64;
+        let meta = tokio::task::spawn_blocking(move || {
+            dest_store.put_object_streamed(
+                &dest_key, &tmp_path, content_type, etag_clone, now, user_metadata, Some(crc),
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+        .map_err(map_io_err)?;
+
+        Ok(Response::new(CopyObjectResponse {
+            etag,
+            content_md5: meta.content_md5.unwrap_or_default(),
+            size,
+            last_modified: now,
+            source_version_id: src_meta.version_id,
+            version_id: meta.version_id,
+        }))
+    }
+
     async fn list_objects(
         &self,
         request: Request<ListObjectsRequest>,
