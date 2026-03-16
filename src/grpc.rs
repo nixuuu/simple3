@@ -239,10 +239,8 @@ impl Simple3 for GrpcService {
             return Err(Status::not_found("object is a delete marker"));
         }
 
-        let version_id = meta.version_id.clone();
         Ok(Response::new(HeadObjectResponse {
             metadata: Some(meta_to_proto(&input.key, &meta)),
-            version_id,
         }))
     }
 

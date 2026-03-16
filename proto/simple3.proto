@@ -95,7 +95,7 @@ message HeadObjectRequest {
 
 message HeadObjectResponse {
   ObjectMetadata metadata = 1;
-  optional string version_id = 2;
+  // version_id is available via metadata.version_id
 }
 
 // DeleteObject
