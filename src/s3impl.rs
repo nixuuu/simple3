@@ -453,22 +453,28 @@ impl S3 for SimpleStorage {
                 (src_meta.content_type.clone(), src_meta.user_metadata.clone())
             };
 
-            let file = std::fs::File::create(&tmp_path)?;
-            let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
             let mut hasher = Md5::new();
             let mut crc: u32 = 0;
             let data_len = src_meta.data_length();
-            let mut pos = 0u64;
-            while pos < data_len {
-                let chunk_size = (data_len - pos).min(256 * 1024);
-                let chunk = ss.read_data(src_meta.segment_id, src_meta.offset + pos, chunk_size)?;
-                writer.write_all(&chunk)?;
-                hasher.update(&chunk);
-                crc = crc32c::crc32c_append(crc, &chunk);
-                pos += chunk_size;
+            let copy_result: io::Result<()> = (|| {
+                let file = std::fs::File::create(&tmp_path)?;
+                let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
+                let mut pos = 0u64;
+                while pos < data_len {
+                    let chunk_size = (data_len - pos).min(256 * 1024);
+                    let chunk = ss.read_data(src_meta.segment_id, src_meta.offset + pos, chunk_size)?;
+                    writer.write_all(&chunk)?;
+                    hasher.update(&chunk);
+                    crc = crc32c::crc32c_append(crc, &chunk);
+                    pos += chunk_size;
+                }
+                writer.flush()?;
+                Ok(())
+            })();
+            if let Err(e) = copy_result {
+                std::fs::remove_file(&tmp_path).ok();
+                return Err(e);
             }
-            writer.flush()?;
-            drop(writer);
 
             let etag_hex = format!("{:x}", hasher.finalize());
             match dest_store.put_object_streamed(
@@ -502,7 +508,7 @@ impl S3 for SimpleStorage {
             }),
             version_id: version_id_string(meta.version_id.as_deref()),
             copy_source_version_id: src_version_id
-                .or_else(|| src_vid_out.clone()),
+                .or(src_vid_out),
             ..Default::default()
         };
         Ok(S3Response::new(output))

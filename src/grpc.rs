@@ -407,22 +407,28 @@ impl Simple3 for GrpcService {
                 (src_meta.content_type.clone(), src_meta.user_metadata.clone())
             };
 
-            let file = std::fs::File::create(&tmp_path)?;
-            let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
             let mut hasher = <md5::Md5 as md5::Digest>::new();
             let mut crc: u32 = 0;
             let data_len = src_meta.data_length();
-            let mut pos = 0u64;
-            while pos < data_len {
-                let chunk_size = (data_len - pos).min(256 * 1024);
-                let chunk = ss.read_data(src_meta.segment_id, src_meta.offset + pos, chunk_size)?;
-                std::io::Write::write_all(&mut writer, &chunk)?;
-                <md5::Md5 as md5::Digest>::update(&mut hasher, &chunk);
-                crc = crc32c::crc32c_append(crc, &chunk);
-                pos += chunk_size;
+            let copy_result: io::Result<()> = (|| {
+                let file = std::fs::File::create(&tmp_path)?;
+                let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+                let mut pos = 0u64;
+                while pos < data_len {
+                    let chunk_size = (data_len - pos).min(256 * 1024);
+                    let chunk = ss.read_data(src_meta.segment_id, src_meta.offset + pos, chunk_size)?;
+                    std::io::Write::write_all(&mut writer, &chunk)?;
+                    <md5::Md5 as md5::Digest>::update(&mut hasher, &chunk);
+                    crc = crc32c::crc32c_append(crc, &chunk);
+                    pos += chunk_size;
+                }
+                std::io::Write::flush(&mut writer)?;
+                Ok(())
+            })();
+            if let Err(e) = copy_result {
+                std::fs::remove_file(&tmp_path).ok();
+                return Err(e);
             }
-            std::io::Write::flush(&mut writer)?;
-            drop(writer);
 
             let etag = format!("{:x}", <md5::Md5 as md5::Digest>::finalize(hasher));
             match dest_store.put_object_streamed(
