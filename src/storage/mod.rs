@@ -480,6 +480,37 @@ impl BucketStore {
         }
     }
 
+    /// Copy object data from a source segment to a temp file in 256 KB chunks,
+    /// computing MD5 and CRC32C incrementally. Returns `(md5_hex, crc32c)`.
+    /// Cleans up the temp file on any error.
+    pub fn copy_to_tmp_file(&self, meta: &ObjectMeta, tmp_path: &Path) -> io::Result<(String, u32)> {
+        use md5::{Digest, Md5};
+
+        let mut hasher = Md5::new();
+        let mut crc: u32 = 0;
+        let data_len = meta.data_length();
+        let result: io::Result<()> = (|| {
+            let file = File::create(tmp_path)?;
+            let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
+            let mut pos = 0u64;
+            while pos < data_len {
+                let chunk_size = (data_len - pos).min(256 * 1024);
+                let chunk = self.read_data(meta.segment_id, meta.offset + pos, chunk_size)?;
+                writer.write_all(&chunk)?;
+                hasher.update(&chunk);
+                crc = crc32c::crc32c_append(crc, &chunk);
+                pos += chunk_size;
+            }
+            writer.flush()?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            fs::remove_file(tmp_path).ok();
+            return Err(e);
+        }
+        Ok((format!("{:x}", hasher.finalize()), crc))
+    }
+
     pub fn put_meta(&self, key: &str, meta: &mut ObjectMeta) -> io::Result<()> {
         self.commit_put(key, meta)
     }

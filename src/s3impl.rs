@@ -453,30 +453,8 @@ impl S3 for SimpleStorage {
                 (src_meta.content_type.clone(), src_meta.user_metadata.clone())
             };
 
-            let mut hasher = Md5::new();
-            let mut crc: u32 = 0;
+            let (etag_hex, crc) = ss.copy_to_tmp_file(&src_meta, &tmp_path)?;
             let data_len = src_meta.data_length();
-            let copy_result: io::Result<()> = (|| {
-                let file = std::fs::File::create(&tmp_path)?;
-                let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
-                let mut pos = 0u64;
-                while pos < data_len {
-                    let chunk_size = (data_len - pos).min(256 * 1024);
-                    let chunk = ss.read_data(src_meta.segment_id, src_meta.offset + pos, chunk_size)?;
-                    writer.write_all(&chunk)?;
-                    hasher.update(&chunk);
-                    crc = crc32c::crc32c_append(crc, &chunk);
-                    pos += chunk_size;
-                }
-                writer.flush()?;
-                Ok(())
-            })();
-            if let Err(e) = copy_result {
-                std::fs::remove_file(&tmp_path).ok();
-                return Err(e);
-            }
-
-            let etag_hex = format!("{:x}", hasher.finalize());
             match dest_store.put_object_streamed(
                 &dest_key, &tmp_path, content_type, etag_hex.clone(), now, user_metadata, Some(crc),
             ) {
