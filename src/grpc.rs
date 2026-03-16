@@ -301,8 +301,17 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<DeleteObjectsRequest>,
     ) -> Result<Response<DeleteObjectsResponse>, Status> {
-        let resource = format!("arn:s3:::{}/*", request.get_ref().bucket);
-        self.check_auth(&request, "s3:DeleteObject", &resource)?;
+        // Per-item auth: version-specific deletes require s3:DeleteObjectVersion
+        let bucket = &request.get_ref().bucket;
+        for item in &request.get_ref().items {
+            let resource = format!("arn:s3:::{bucket}/{}", item.key);
+            let action = if item.version_id.is_some() {
+                "s3:DeleteObjectVersion"
+            } else {
+                "s3:DeleteObject"
+            };
+            self.check_auth(&request, action, &resource)?;
+        }
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
