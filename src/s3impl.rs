@@ -9,15 +9,17 @@ use futures::TryStreamExt;
 use md5::{Digest, Md5};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
+    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, CreateBucketInput,
     CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
     DeleteBucketInput, DeleteBucketOutput, DeleteMarkerEntry, DeleteObjectInput,
     DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
     GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput,
     HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
     ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
-    Object, ObjectVersion, PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput,
-    PutObjectOutput, StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
+    MetadataDirective, Object, ObjectVersion, PutBucketVersioningInput,
+    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
+    UploadPartInput, UploadPartOutput,
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
@@ -396,6 +398,95 @@ impl S3 for SimpleStorage {
             last_modified: Some(last_modified),
             metadata,
             version_id: version_id_string(meta.version_id.as_deref()),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let input = req.input;
+
+        let (src_bucket, src_key, src_version_id) = match input.copy_source {
+            CopySource::Bucket {
+                bucket,
+                key,
+                version_id,
+            } => (
+                bucket.to_string(),
+                key.to_string(),
+                version_id.map(|v| v.to_string()),
+            ),
+            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+        };
+
+        let src_store = self.bucket(&src_bucket)?;
+        let dest_store = self.bucket(&input.bucket)?;
+
+        let replace_metadata = input
+            .metadata_directive
+            .as_ref()
+            .is_some_and(|d| d.as_str() == MetadataDirective::REPLACE);
+
+        let req_content_type = input.content_type;
+        let req_metadata = input.metadata.unwrap_or_default();
+
+        let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = dest_store.bucket_dir().join(format!(".tmp_{tmp_id:020}"));
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        let src_vid = src_version_id.clone();
+        let ss = Arc::clone(&src_store);
+        let dest_key = input.key;
+        let result = blocking(move || {
+            let src_meta = resolve_object_version(&ss, &src_key, src_vid.as_deref())?;
+
+            let (content_type, user_metadata) = if replace_metadata {
+                (req_content_type, req_metadata)
+            } else {
+                (src_meta.content_type.clone(), src_meta.user_metadata.clone())
+            };
+
+            let (etag_hex, crc) = ss.copy_to_tmp_file(&src_meta, &tmp_path)?;
+            let data_len = src_meta.data_length();
+            match dest_store.put_object_streamed(
+                &dest_key, &tmp_path, content_type, etag_hex.clone(), now, user_metadata, Some(crc),
+            ) {
+                Ok(m) => Ok((etag_hex, m, src_meta.version_id, data_len)),
+                Err(e) => {
+                    std::fs::remove_file(&tmp_path).ok();
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                return s3_error!(NoSuchKey);
+            }
+            tracing::error!("copy_object: {e}");
+            s3_error!(e, InternalError)
+        })?;
+
+        let (etag_hex, meta, src_vid_out, _data_len) = result;
+
+        let last_modified = Timestamp::from(UNIX_EPOCH + Duration::from_secs(now));
+
+        let output = CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(ETag::Strong(etag_hex)),
+                last_modified: Some(last_modified),
+                ..Default::default()
+            }),
+            version_id: version_id_string(meta.version_id.as_deref()),
+            copy_source_version_id: src_version_id
+                .or(src_vid_out),
             ..Default::default()
         };
         Ok(S3Response::new(output))

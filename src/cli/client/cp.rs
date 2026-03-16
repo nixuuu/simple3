@@ -217,10 +217,8 @@ async fn copy_s3_to_s3(
         } else {
             dest_prefix.to_owned()
         };
-        let tmp = tempfile::NamedTempFile::new()?;
-        transport.get_object(src_bucket, key, tmp.path()).await?;
         transport
-            .put_object(dest_bucket, &dest_key, tmp.path(), None)
+            .copy_object(src_bucket, key, dest_bucket, &dest_key)
             .await?;
         println!("copy: s3://{src_bucket}/{key} -> s3://{dest_bucket}/{dest_key}");
         return Ok(());
@@ -250,15 +248,9 @@ async fn copy_s3_to_s3(
         };
 
         handles.push(tokio::spawn(async move {
-            let result = async {
-                let tmp = tempfile::NamedTempFile::new()?;
-                transport.get_object(&src_bucket, &obj_key, tmp.path()).await?;
-                transport
-                    .put_object(&dest_bucket, &dest_key, tmp.path(), None)
-                    .await?;
-                anyhow::Ok(())
-            }
-            .await;
+            let result = transport
+                .copy_object(&src_bucket, &obj_key, &dest_bucket, &dest_key)
+                .await;
             if let Err(e) = result {
                 pb.suspend(|| eprintln!("ERROR {obj_key}: {e}"));
                 errors.fetch_add(1, Ordering::Relaxed);

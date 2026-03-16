@@ -221,6 +221,13 @@ pub trait Transport: Send + Sync {
     async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<Option<ObjectHead>>;
     #[allow(dead_code)]
     async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()>;
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dest_bucket: &str,
+        dest_key: &str,
+    ) -> anyhow::Result<()>;
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> anyhow::Result<()>;
     async fn get_object_version(
         &self,

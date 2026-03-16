@@ -363,6 +363,76 @@ impl Simple3 for GrpcService {
         Ok(Response::new(DeleteObjectsResponse { deleted, errors }))
     }
 
+    async fn copy_object(
+        &self,
+        request: Request<CopyObjectRequest>,
+    ) -> Result<Response<CopyObjectResponse>, Status> {
+        let input = request.get_ref();
+        let src_resource = format!("arn:s3:::{}/{}", input.source_bucket, input.source_key);
+        let dest_resource = format!("arn:s3:::{}/{}", input.dest_bucket, input.dest_key);
+        self.check_auth(&request, "s3:GetObject", &src_resource)?;
+        self.check_auth(&request, "s3:PutObject", &dest_resource)?;
+        let input = request.into_inner();
+
+        let src_store = self.bucket(&input.source_bucket)?;
+        let dest_store = self.bucket(&input.dest_bucket)?;
+
+        let replace_metadata = input.metadata_directive == "REPLACE";
+        let req_content_type = input.content_type.filter(|s| !s.is_empty());
+        let req_metadata = input.metadata;
+
+        let tmp_id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = dest_store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}"));
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        let src_key = input.source_key;
+        let src_vid = input.source_version_id;
+        let ss = Arc::clone(&src_store);
+        let dest_key = input.dest_key;
+        let (etag, meta, src_version_id_out, size) = tokio::task::spawn_blocking(move || {
+            let src_meta = ss
+                .get_object_or_version(&src_key, src_vid.as_deref())?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source object not found"))?;
+            if src_meta.is_delete_marker {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "source is a delete marker"));
+            }
+
+            let (content_type, user_metadata) = if replace_metadata {
+                (req_content_type, req_metadata)
+            } else {
+                (src_meta.content_type.clone(), src_meta.user_metadata.clone())
+            };
+
+            let (etag, crc) = ss.copy_to_tmp_file(&src_meta, &tmp_path)?;
+            let data_len = src_meta.data_length();
+            match dest_store.put_object_streamed(
+                &dest_key, &tmp_path, content_type, etag.clone(), now, user_metadata, Some(crc),
+            ) {
+                Ok(m) => Ok((etag, m, src_meta.version_id, data_len)),
+                Err(e) => {
+                    std::fs::remove_file(&tmp_path).ok();
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+        .map_err(map_io_err)?;
+
+        Ok(Response::new(CopyObjectResponse {
+            etag,
+            content_md5: meta.content_md5.unwrap_or_default(),
+            size,
+            last_modified: now,
+            source_version_id: src_version_id_out,
+            version_id: meta.version_id,
+        }))
+    }
+
     async fn list_objects(
         &self,
         request: Request<ListObjectsRequest>,
