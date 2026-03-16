@@ -181,6 +181,22 @@ pub struct ListResult {
     pub next_continuation_token: Option<String>,
 }
 
+pub struct VersionEntryInfo {
+    pub key: String,
+    pub version_id: String,
+    pub size: u64,
+    pub last_modified: u64,
+    pub is_latest: bool,
+    pub is_delete_marker: bool,
+}
+
+pub struct ListVersionsResult {
+    pub entries: Vec<VersionEntryInfo>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_version_id_marker: Option<String>,
+}
+
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn create_bucket(&self, bucket: &str) -> anyhow::Result<()>;
@@ -206,6 +222,27 @@ pub trait Transport: Send + Sync {
     #[allow(dead_code)]
     async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()>;
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> anyhow::Result<()>;
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        dest: &Path,
+    ) -> anyhow::Result<u64>;
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> anyhow::Result<()>;
+    #[allow(dead_code)]
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<&str>,
+    ) -> anyhow::Result<ListVersionsResult>;
 }
 
 /// List ALL objects under a prefix by paginating through continuation tokens.

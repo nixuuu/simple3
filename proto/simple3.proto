@@ -19,6 +19,11 @@ service Simple3 {
   rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
   rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
 
+  // --- Versioning ---
+  rpc GetBucketVersioning(GetBucketVersioningRequest) returns (GetBucketVersioningResponse);
+  rpc PutBucketVersioning(PutBucketVersioningRequest) returns (PutBucketVersioningResponse);
+  rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
+
   // --- Admin ---
   rpc Stats(StatsRequest) returns (StatsResponse);
   rpc Compact(CompactRequest) returns (CompactResponse);
@@ -49,6 +54,7 @@ message PutObjectResponse {
   string etag = 1;
   string content_md5 = 2;
   uint64 size = 3;
+  optional string version_id = 4;
 }
 
 // GetObject — server-streaming download.
@@ -58,6 +64,7 @@ message GetObjectRequest {
   string key = 2;
   optional uint64 range_start = 3;
   optional uint64 range_end = 4;
+  optional string version_id = 5;
 }
 
 message GetObjectResponse {
@@ -75,40 +82,60 @@ message ObjectMetadata {
   uint64 last_modified = 5;
   map<string, string> user_metadata = 6;
   string content_md5 = 7;
+  optional string version_id = 8;
+  optional bool is_delete_marker = 9;
 }
 
 // HeadObject
 message HeadObjectRequest {
   string bucket = 1;
   string key = 2;
+  optional string version_id = 3;
 }
 
 message HeadObjectResponse {
   ObjectMetadata metadata = 1;
+  // version_id is available via metadata.version_id
 }
 
 // DeleteObject
 message DeleteObjectRequest {
   string bucket = 1;
   string key = 2;
+  optional string version_id = 3;
 }
 
-message DeleteObjectResponse {}
+message DeleteObjectResponse {
+  optional string version_id = 1;
+  optional bool is_delete_marker = 2;
+}
 
 // DeleteObjects — batch delete
 message DeleteObjectsRequest {
   string bucket = 1;
-  repeated string keys = 2;
+  repeated DeleteObjectIdentifier items = 2;
+}
+
+message DeleteObjectIdentifier {
+  string key = 1;
+  optional string version_id = 2;
+}
+
+message DeletedObjectResult {
+  string key = 1;
+  optional string version_id = 2;
+  optional bool delete_marker = 3;
 }
 
 message DeleteObjectsResponse {
-  repeated string deleted = 1;
+  repeated DeletedObjectResult deleted = 1;
   repeated DeleteError errors = 2;
 }
 
 message DeleteError {
   string key = 1;
   string message = 2;
+  optional string version_id = 3;
 }
 
 // ListObjects
@@ -132,6 +159,7 @@ message ObjectInfo {
   uint64 size = 2;
   string etag = 3;
   uint64 last_modified = 4;
+  optional string version_id = 5;
 }
 
 // ============================================================
@@ -200,6 +228,54 @@ message ListBucketsResponse {
 }
 
 // ============================================================
+// Versioning
+// ============================================================
+
+message GetBucketVersioningRequest {
+  string bucket = 1;
+}
+message GetBucketVersioningResponse {
+  string status = 1;  // "Enabled", "Suspended", or "" (absent)
+}
+message PutBucketVersioningRequest {
+  string bucket = 1;
+  string status = 2;  // "Enabled" or "Suspended"
+}
+message PutBucketVersioningResponse {}
+
+message ListObjectVersionsRequest {
+  string bucket = 1;
+  string prefix = 2;
+  string key_marker = 3;
+  string version_id_marker = 4;
+  int32 max_keys = 5;
+  string delimiter = 6;
+}
+message ListObjectVersionsResponse {
+  repeated VersionEntry versions = 1;
+  repeated DeleteMarkerProto delete_markers = 2;
+  repeated string common_prefixes = 3;
+  bool is_truncated = 4;
+  string next_key_marker = 5;
+  string next_version_id_marker = 6;
+}
+message VersionEntry {
+  string key = 1;
+  string version_id = 2;
+  string etag = 3;
+  uint64 size = 4;
+  uint64 last_modified = 5;
+  bool is_latest = 6;
+  string content_type = 7;
+}
+message DeleteMarkerProto {
+  string key = 1;
+  string version_id = 2;
+  uint64 last_modified = 3;
+  bool is_latest = 4;
+}
+
+// ============================================================
 // Admin
 // ============================================================
 
@@ -212,6 +288,9 @@ message StatsResponse {
   repeated SegmentStat segments = 2;
   uint64 total_size = 3;
   uint64 total_dead_bytes = 4;
+  uint64 version_count = 5;
+  uint64 delete_marker_count = 6;
+  uint64 total_versioned_size = 7;
 }
 
 message SegmentStat {

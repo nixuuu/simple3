@@ -95,6 +95,9 @@ enum Command {
         /// List all objects recursively
         #[arg(long)]
         recursive: bool,
+        /// List all object versions
+        #[arg(long)]
+        versions: bool,
         #[command(flatten)]
         client: client::ClientArgs,
     },
@@ -110,6 +113,9 @@ enum Command {
         /// Number of concurrent transfers
         #[arg(long, short = 'j', default_value_t = 5)]
         concurrency: usize,
+        /// Download a specific object version
+        #[arg(long)]
+        version_id: Option<String>,
         #[command(flatten)]
         client: client::ClientArgs,
     },
@@ -121,6 +127,9 @@ enum Command {
         /// Delete all objects under prefix recursively
         #[arg(long)]
         recursive: bool,
+        /// Delete a specific object version
+        #[arg(long)]
+        version_id: Option<String>,
         #[command(flatten)]
         client: client::ClientArgs,
     },
@@ -199,28 +208,39 @@ pub async fn run() -> anyhow::Result<()> {
         Some(Command::Ls {
             uri,
             recursive,
+            versions,
             client: args,
         }) => {
             let transport = args.build_transport().await?;
-            client::ls::run(&*transport, uri.as_deref(), recursive).await
+            client::ls::run(&*transport, uri.as_deref(), recursive, versions).await
         }
         Some(Command::Rm {
             uri,
             recursive,
+            version_id,
             client: args,
         }) => {
             let transport = args.build_transport().await?;
-            client::rm::run(&*transport, &uri, recursive).await
+            client::rm::run(&*transport, &uri, recursive, version_id.as_deref()).await
         }
         Some(Command::Cp {
             src,
             dest,
             recursive,
             concurrency,
+            version_id,
             client: args,
         }) => {
             let transport = args.build_transport().await?;
-            client::cp::run(transport, &src, &dest, recursive, concurrency).await
+            client::cp::run(
+                transport,
+                &src,
+                &dest,
+                recursive,
+                concurrency,
+                version_id.as_deref(),
+            )
+            .await
         }
         Some(Command::Sync {
             src,

@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 
-use super::{BucketEntry, ListResult, ObjectEntry, ObjectHead, Transport, build_s3_client};
+use super::{
+    BucketEntry, ListResult, ListVersionsResult, ObjectEntry, ObjectHead, Transport,
+    VersionEntryInfo, build_s3_client,
+};
 
 pub struct HttpTransport {
     client: aws_sdk_s3::Client,
@@ -150,6 +153,44 @@ impl Transport for HttpTransport {
         Ok(())
     }
 
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        dest: &Path,
+    ) -> anyhow::Result<u64> {
+        let resp = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await?;
+        let data = resp.body.collect().await?;
+        let bytes = data.into_bytes();
+        let len = bytes.len() as u64;
+        tokio::fs::write(dest, bytes).await?;
+        Ok(len)
+    }
+
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await?;
+        Ok(())
+    }
+
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> anyhow::Result<()> {
         if keys.is_empty() {
             return Ok(());
@@ -168,5 +209,61 @@ impl Transport for HttpTransport {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<&str>,
+    ) -> anyhow::Result<ListVersionsResult> {
+        let mut req = self.client.list_object_versions().bucket(bucket);
+        if let Some(p) = prefix {
+            req = req.prefix(p);
+        }
+        if let Some(km) = key_marker {
+            req = req.key_marker(km);
+        }
+        if let Some(vm) = version_id_marker {
+            req = req.version_id_marker(vm);
+        }
+        let resp = req.send().await?;
+
+        let mut entries = Vec::new();
+
+        for ver in resp.versions() {
+            entries.push(VersionEntryInfo {
+                key: ver.key().unwrap_or_default().to_owned(),
+                version_id: ver.version_id().unwrap_or("null").to_owned(),
+                #[allow(clippy::cast_sign_loss)]
+                size: ver.size().unwrap_or_default() as u64,
+                last_modified: ver
+                    .last_modified()
+                    .map_or(0, millis_to_epoch_secs),
+                is_latest: ver.is_latest().unwrap_or_default(),
+                is_delete_marker: false,
+            });
+        }
+
+        for dm in resp.delete_markers() {
+            entries.push(VersionEntryInfo {
+                key: dm.key().unwrap_or_default().to_owned(),
+                version_id: dm.version_id().unwrap_or("null").to_owned(),
+                size: 0,
+                last_modified: dm
+                    .last_modified()
+                    .map_or(0, millis_to_epoch_secs),
+                is_latest: dm.is_latest().unwrap_or_default(),
+                is_delete_marker: true,
+            });
+        }
+
+        Ok(ListVersionsResult {
+            entries,
+            is_truncated: resp.is_truncated().unwrap_or_default(),
+            next_key_marker: resp.next_key_marker().map(String::from),
+            next_version_id_marker: resp.next_version_id_marker().map(String::from),
+        })
     }
 }

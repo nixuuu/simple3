@@ -9,7 +9,10 @@ use simple3::grpc::proto::simple3_client::Simple3Client;
 #[allow(clippy::wildcard_imports)]
 use simple3::grpc::proto::*;
 
-use super::{BucketEntry, ListResult, ObjectEntry, ObjectHead, Transport};
+use super::{
+    BucketEntry, ListResult, ListVersionsResult, ObjectEntry, ObjectHead, Transport,
+    VersionEntryInfo,
+};
 
 const CHUNK_SIZE: usize = 256 * 1024;
 
@@ -54,6 +57,38 @@ impl GrpcTransport {
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE);
         Ok(Self { client })
+    }
+
+    async fn download_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        dest: &Path,
+    ) -> anyhow::Result<u64> {
+        let resp = self
+            .client
+            .clone()
+            .get_object(GetObjectRequest {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                range_start: None,
+                range_end: None,
+                version_id: version_id.map(str::to_owned),
+            })
+            .await?;
+        let mut stream = resp.into_inner();
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut total: u64 = 0;
+
+        while let Some(msg) = stream.message().await? {
+            if let Some(get_object_response::Response::Data(chunk)) = msg.response {
+                file.write_all(&chunk).await?;
+                total += chunk.len() as u64;
+            }
+        }
+        file.flush().await?;
+        Ok(total)
     }
 }
 
@@ -183,28 +218,7 @@ impl Transport for GrpcTransport {
     }
 
     async fn get_object(&self, bucket: &str, key: &str, dest: &Path) -> anyhow::Result<u64> {
-        let resp = self
-            .client
-            .clone()
-            .get_object(GetObjectRequest {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                range_start: None,
-                range_end: None,
-            })
-            .await?;
-        let mut stream = resp.into_inner();
-        let mut file = tokio::fs::File::create(dest).await?;
-        let mut total: u64 = 0;
-
-        while let Some(msg) = stream.message().await? {
-            if let Some(get_object_response::Response::Data(chunk)) = msg.response {
-                file.write_all(&chunk).await?;
-                total += chunk.len() as u64;
-            }
-        }
-        file.flush().await?;
-        Ok(total)
+        self.download_object(bucket, key, None, dest).await
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<Option<ObjectHead>> {
@@ -214,6 +228,7 @@ impl Transport for GrpcTransport {
             .head_object(HeadObjectRequest {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
+                version_id: None,
             })
             .await
         {
@@ -241,6 +256,35 @@ impl Transport for GrpcTransport {
             .delete_object(DeleteObjectRequest {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
+                version_id: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        dest: &Path,
+    ) -> anyhow::Result<u64> {
+        self.download_object(bucket, key, Some(version_id), dest)
+            .await
+    }
+
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .clone()
+            .delete_object(DeleteObjectRequest {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                version_id: Some(version_id.to_owned()),
             })
             .await?;
         Ok(())
@@ -255,10 +299,77 @@ impl Transport for GrpcTransport {
                 .clone()
                 .delete_objects(DeleteObjectsRequest {
                     bucket: bucket.to_owned(),
-                    keys: chunk.to_vec(),
+                    items: chunk
+                        .iter()
+                        .map(|k| DeleteObjectIdentifier {
+                            key: k.clone(),
+                            version_id: None,
+                        })
+                        .collect(),
                 })
                 .await?;
         }
         Ok(())
+    }
+
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<&str>,
+    ) -> anyhow::Result<ListVersionsResult> {
+        let resp = self
+            .client
+            .clone()
+            .list_object_versions(ListObjectVersionsRequest {
+                bucket: bucket.to_owned(),
+                prefix: prefix.unwrap_or_default().to_owned(),
+                key_marker: key_marker.unwrap_or_default().to_owned(),
+                version_id_marker: version_id_marker.unwrap_or_default().to_owned(),
+                max_keys: 1000,
+                delimiter: String::new(),
+            })
+            .await?;
+        let inner = resp.into_inner();
+
+        let mut entries = Vec::new();
+
+        for ver in inner.versions {
+            entries.push(VersionEntryInfo {
+                key: ver.key,
+                version_id: ver.version_id,
+                size: ver.size,
+                last_modified: ver.last_modified,
+                is_latest: ver.is_latest,
+                is_delete_marker: false,
+            });
+        }
+
+        for dm in inner.delete_markers {
+            entries.push(VersionEntryInfo {
+                key: dm.key,
+                version_id: dm.version_id,
+                size: 0,
+                last_modified: dm.last_modified,
+                is_latest: dm.is_latest,
+                is_delete_marker: true,
+            });
+        }
+
+        Ok(ListVersionsResult {
+            entries,
+            is_truncated: inner.is_truncated,
+            next_key_marker: if inner.next_key_marker.is_empty() {
+                None
+            } else {
+                Some(inner.next_key_marker)
+            },
+            next_version_id_marker: if inner.next_version_id_marker.is_empty() {
+                None
+            } else {
+                Some(inner.next_version_id_marker)
+            },
+        })
     }
 }

@@ -8,18 +8,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::TryStreamExt;
 use md5::{Digest, Md5};
 use s3s::dto::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
-    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
+    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
     CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-    DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetObjectInput,
-    GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput,
-    StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
+    DeleteBucketInput, DeleteBucketOutput, DeleteMarkerEntry, DeleteObjectInput,
+    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput,
+    HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
+    Object, ObjectVersion, PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput,
+    PutObjectOutput, StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
+use crate::storage::versioning::VersioningState;
 use crate::storage::{BucketStore, Storage};
+use crate::types::ObjectMeta;
 
 /// Monotonic counter for unique temp file names across concurrent requests.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +75,30 @@ async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<(S
     writer.flush().map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
 
     Ok((format!("{:x}", hasher.finalize()), crc))
+}
+
+fn version_id_string(vid: Option<&str>) -> Option<String> {
+    vid.map(str::to_owned)
+}
+
+/// Resolve an object by key, optionally looking up a specific version.
+/// Uses a single read transaction to avoid TOCTOU between tables.
+/// Returns the meta or an `io::Error` with appropriate `ErrorKind`.
+fn resolve_object_version(
+    store: &BucketStore,
+    key: &str,
+    version_id: Option<&str>,
+) -> io::Result<ObjectMeta> {
+    let not_found_msg = if version_id.is_some() { "NoSuchVersion" } else { "NoSuchKey" };
+    let meta = store
+        .get_object_or_version(key, version_id)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, not_found_msg))?;
+
+    if meta.is_delete_marker {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "DeleteMarker"));
+    }
+
+    Ok(meta)
 }
 
 #[async_trait::async_trait]
@@ -141,6 +169,73 @@ impl S3 for SimpleStorage {
         Ok(S3Response::new(output))
     }
 
+    // === Bucket versioning ===
+
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let input = req.input;
+        let store = self.bucket(&input.bucket)?;
+
+        let status = input.versioning_configuration.status;
+
+        blocking(move || {
+            if let Some(s) = status {
+                let state = if s.as_str() == BucketVersioningStatus::ENABLED {
+                    VersioningState::Enabled
+                } else if s.as_str() == BucketVersioningStatus::SUSPENDED {
+                    VersioningState::Suspended
+                } else {
+                    return Err(io::Error::other(format!(
+                        "MalformedXML: invalid versioning status '{}'",
+                        s.as_str()
+                    )));
+                };
+                store.set_versioning_state(state)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            if e.to_string().starts_with("MalformedXML") {
+                return s3_error!(MalformedXML);
+            }
+            tracing::error!("put_bucket_versioning: {e}");
+            s3_error!(e, InternalError)
+        })?;
+
+        Ok(S3Response::new(PutBucketVersioningOutput::default()))
+    }
+
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        let store = self.bucket(&req.input.bucket)?;
+
+        let state = blocking(move || store.get_versioning_state())
+            .await
+            .map_err(|e| { tracing::error!("get_bucket_versioning: {e}"); s3_error!(e, InternalError) })?;
+
+        let status = state.map(|s| match s {
+            VersioningState::Enabled => {
+                BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)
+            }
+            VersioningState::Suspended => {
+                BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)
+            }
+        });
+
+        let output = GetBucketVersioningOutput {
+            status,
+            mfa_delete: None,
+        };
+        Ok(S3Response::new(output))
+    }
+
+    // === Object operations ===
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
@@ -170,17 +265,17 @@ impl S3 for SimpleStorage {
         let content_type = input.content_type;
         let etag_clone = etag_hex.clone();
         let metadata = input.metadata.unwrap_or_default();
-        blocking(move || {
+        let meta = blocking(move || {
             store.put_object_streamed(
                 &key, &tmp_path, content_type, etag_clone, now, metadata, Some(crc),
             )
-            .map(|_| ())
         })
         .await
         .map_err(|e| { tracing::error!("put_object: {e}"); s3_error!(e, InternalError) })?;
 
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag_hex)),
+            version_id: version_id_string(meta.version_id.as_deref()),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -195,11 +290,12 @@ impl S3 for SimpleStorage {
 
         let key = input.key;
         let range = input.range;
+        let req_version_id = input.version_id;
 
         let (meta, data, content_range) = blocking(move || {
-            let meta = store
-                .get_meta(&key)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NoSuchKey"))?;
+            let meta = resolve_object_version(
+                &store, &key, req_version_id.as_deref(),
+            )?;
 
             let obj_size = meta.data_length();
 
@@ -256,6 +352,7 @@ impl S3 for SimpleStorage {
             e_tag: Some(ETag::Strong(meta.etag)),
             last_modified: Some(last_modified),
             metadata,
+            version_id: version_id_string(meta.version_id.as_deref()),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -269,9 +366,10 @@ impl S3 for SimpleStorage {
         let store = self.bucket(&input.bucket)?;
 
         let key = input.key;
+        let req_version_id = input.version_id;
+
         let meta = blocking(move || {
-            store.get_meta(&key)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NoSuchKey"))
+            resolve_object_version(&store, &key, req_version_id.as_deref())
         })
         .await
         .map_err(|e| {
@@ -297,6 +395,7 @@ impl S3 for SimpleStorage {
             e_tag: Some(ETag::Strong(meta.etag)),
             last_modified: Some(last_modified),
             metadata,
+            version_id: version_id_string(meta.version_id.as_deref()),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -310,13 +409,36 @@ impl S3 for SimpleStorage {
         let store = self.bucket(&input.bucket)?;
 
         let key = input.key;
-        blocking(move || store.delete_object(&key).map(|_| ()))
-            .await
-            .map_err(|e| { tracing::error!("delete_object: {e}"); s3_error!(e, InternalError) })?;
+        let req_version_id = input.version_id;
 
-        Ok(S3Response::new(DeleteObjectOutput::default()))
+        let result_meta = blocking(move || {
+            if let Some(vid) = req_version_id {
+                // Version-specific delete: permanently remove.
+                // Return metadata for the response (AWS returns version_id).
+                if let Some(meta) = store.delete_current_version(&key, &vid)? {
+                    return Ok(Some(meta));
+                }
+                // Try versions table
+                Ok(store.delete_version(&key, &vid)?)
+            } else {
+                // No version_id: hard delete or create delete marker
+                store.delete_object(&key)
+            }
+        })
+        .await
+        .map_err(|e| { tracing::error!("delete_object: {e}"); s3_error!(e, InternalError) })?;
+
+        let mut output = DeleteObjectOutput::default();
+        if let Some(meta) = result_meta {
+            output.version_id = version_id_string(meta.version_id.as_deref());
+            if meta.is_delete_marker {
+                output.delete_marker = Some(true);
+            }
+        }
+        Ok(S3Response::new(output))
     }
 
+    #[allow(clippy::too_many_lines)] // per-item version/non-version branching in batch delete
     async fn delete_objects(
         &self,
         req: S3Request<DeleteObjectsInput>,
@@ -326,22 +448,85 @@ impl S3 for SimpleStorage {
         let quiet = input.delete.quiet.unwrap_or(false);
         let objects = input.delete.objects;
 
-        let (deleted_keys, errors) = blocking(move || {
-            let mut deleted_keys = Vec::new();
+        let (deleted_list, errors) = blocking(move || {
+            let mut deleted_list: Vec<DeletedObject> = Vec::new();
             let mut errors: Vec<s3s::dto::Error> = Vec::new();
+
             for obj_id in objects {
                 let key = obj_id.key;
-                match store.delete_object(&key) {
-                    Ok(_) => deleted_keys.push(key),
-                    Err(e) => errors.push(s3s::dto::Error {
-                        code: Some("InternalError".to_owned()),
-                        key: Some(key),
-                        message: Some(e.to_string()),
-                        version_id: None,
-                    }),
+                let version_id = obj_id.version_id;
+
+                if let Some(vid) = version_id {
+                    // Version-specific delete
+                    match store.delete_current_version(&key, &vid) {
+                        Ok(Some(meta)) => {
+                            deleted_list.push(DeletedObject {
+                                key: Some(key),
+                                version_id: Some(vid),
+                                delete_marker: Some(meta.is_delete_marker),
+                                ..Default::default()
+                            });
+                        }
+                        Ok(None) => {
+                            // Try versions table
+                            match store.delete_version(&key, &vid) {
+                                Ok(Some(meta)) => {
+                                    deleted_list.push(DeletedObject {
+                                        key: Some(key),
+                                        version_id: Some(vid),
+                                        delete_marker: if meta.is_delete_marker { Some(true) } else { None },
+                                        ..Default::default()
+                                    });
+                                }
+                                Ok(None) => {
+                                    deleted_list.push(DeletedObject {
+                                        key: Some(key),
+                                        version_id: Some(vid),
+                                        ..Default::default()
+                                    });
+                                }
+                                Err(e) => errors.push(s3s::dto::Error {
+                                    code: Some("InternalError".to_owned()),
+                                    key: Some(key),
+                                    message: Some(e.to_string()),
+                                    version_id: Some(vid),
+                                }),
+                            }
+                        }
+                        Err(e) => errors.push(s3s::dto::Error {
+                            code: Some("InternalError".to_owned()),
+                            key: Some(key),
+                            message: Some(e.to_string()),
+                            version_id: Some(vid),
+                        }),
+                    }
+                } else {
+                    // No version_id: hard delete or create delete marker
+                    match store.delete_object(&key) {
+                        Ok(Some(meta)) => {
+                            deleted_list.push(DeletedObject {
+                                key: Some(key),
+                                version_id: version_id_string(meta.version_id.as_deref()),
+                                delete_marker: if meta.is_delete_marker { Some(true) } else { None },
+                                ..Default::default()
+                            });
+                        }
+                        Ok(None) => {
+                            deleted_list.push(DeletedObject {
+                                key: Some(key),
+                                ..Default::default()
+                            });
+                        }
+                        Err(e) => errors.push(s3s::dto::Error {
+                            code: Some("InternalError".to_owned()),
+                            key: Some(key),
+                            message: Some(e.to_string()),
+                            version_id: None,
+                        }),
+                    }
                 }
             }
-            Ok((deleted_keys, errors))
+            Ok((deleted_list, errors))
         })
         .await
         .map_err(|e| {
@@ -349,25 +534,8 @@ impl S3 for SimpleStorage {
             s3_error!(e, InternalError)
         })?;
 
-        let deleted = if quiet {
-            None
-        } else {
-            Some(
-                deleted_keys
-                    .into_iter()
-                    .map(|key| DeletedObject {
-                        key: Some(key),
-                        ..Default::default()
-                    })
-                    .collect(),
-            )
-        };
-
-        let errors = if errors.is_empty() {
-            None
-        } else {
-            Some(errors)
-        };
+        let deleted = if quiet { None } else { Some(deleted_list) };
+        let errors = if errors.is_empty() { None } else { Some(errors) };
 
         let output = DeleteObjectsOutput {
             deleted,
@@ -455,6 +623,94 @@ impl S3 for SimpleStorage {
         Ok(S3Response::new(output))
     }
 
+    // === ListObjectVersions ===
+
+    #[allow(clippy::too_many_lines)] // maps storage entries to S3 DTOs with version/delete-marker split
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let input = req.input;
+        let store = self.bucket(&input.bucket)?;
+
+        #[allow(clippy::cast_sign_loss)]
+        let max_keys = input.max_keys.unwrap_or(1000).max(0) as usize;
+        let prefix = input.prefix.clone();
+        let delimiter = input.delimiter.clone();
+        let key_marker = input.key_marker.clone();
+        let version_id_marker = input.version_id_marker.clone();
+
+        let result = blocking(move || {
+            store.list_object_versions(
+                prefix.as_deref(),
+                delimiter.as_deref(),
+                max_keys,
+                key_marker.as_deref(),
+                version_id_marker.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| { tracing::error!("list_object_versions: {e}"); s3_error!(e, InternalError) })?;
+
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+
+        for entry in result.entries {
+            let last_modified =
+                Timestamp::from(UNIX_EPOCH + Duration::from_secs(entry.meta.last_modified));
+
+            if entry.meta.is_delete_marker {
+                delete_markers.push(DeleteMarkerEntry {
+                    is_latest: Some(entry.is_latest),
+                    key: Some(entry.key),
+                    last_modified: Some(last_modified),
+                    version_id: Some(entry.version_id),
+                    ..Default::default()
+                });
+            } else {
+                let size = entry.meta.data_length().cast_signed();
+                versions.push(ObjectVersion {
+                    e_tag: Some(ETag::Strong(entry.meta.etag)),
+                    is_latest: Some(entry.is_latest),
+                    key: Some(entry.key),
+                    last_modified: Some(last_modified),
+                    size: Some(size),
+                    version_id: Some(entry.version_id),
+                    ..Default::default()
+                });
+            }
+        }
+
+        let cp: Option<Vec<CommonPrefix>> = if result.common_prefixes.is_empty() {
+            None
+        } else {
+            Some(
+                result.common_prefixes
+                    .into_iter()
+                    .map(|p| CommonPrefix { prefix: Some(p) })
+                    .collect(),
+            )
+        };
+
+        let output = ListObjectVersionsOutput {
+            versions: if versions.is_empty() { None } else { Some(versions) },
+            delete_markers: if delete_markers.is_empty() { None } else { Some(delete_markers) },
+            common_prefixes: cp,
+            delimiter: input.delimiter,
+            is_truncated: Some(result.is_truncated),
+            key_marker: input.key_marker,
+            version_id_marker: input.version_id_marker,
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            max_keys: Some(max_keys as i32),
+            name: Some(input.bucket),
+            prefix: input.prefix,
+            next_key_marker: result.next_key_marker,
+            next_version_id_marker: result.next_version_id_marker,
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
     // === Multipart upload ===
 
     async fn create_multipart_upload(
@@ -536,7 +792,7 @@ impl S3 for SimpleStorage {
         let upload_id = input.upload_id;
         let key = input.key;
         let bucket = input.bucket;
-        let (_meta, etag) = blocking(move || {
+        let (meta, etag) = blocking(move || {
             store.complete_multipart_upload(
                 &upload_id,
                 &key,
@@ -553,6 +809,7 @@ impl S3 for SimpleStorage {
             bucket: Some(bucket),
             key: None,
             e_tag: Some(ETag::Strong(etag)),
+            version_id: version_id_string(meta.version_id.as_deref()),
             ..Default::default()
         };
         Ok(S3Response::new(output))

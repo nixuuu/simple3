@@ -6,7 +6,12 @@ pub async fn run(
     transport: &dyn Transport,
     uri: Option<&str>,
     recursive: bool,
+    versions: bool,
 ) -> anyhow::Result<()> {
+    if versions {
+        return list_versions(transport, uri).await;
+    }
+
     let Some(uri) = uri else {
         return list_buckets(transport).await;
     };
@@ -51,5 +56,50 @@ async fn list_buckets(transport: &dyn Transport) -> anyhow::Result<()> {
     for b in &buckets {
         println!("{}", b.name);
     }
+    Ok(())
+}
+
+async fn list_versions(transport: &dyn Transport, uri: Option<&str>) -> anyhow::Result<()> {
+    let uri = uri.ok_or_else(|| anyhow::anyhow!("--versions requires an s3:// URI"))?;
+    let parsed = S3Uri::parse(uri)?;
+    let bucket = parsed.bucket();
+    let prefix = parsed.key();
+
+    let mut key_marker: Option<String> = None;
+    let mut vid_marker: Option<String> = None;
+    loop {
+        let result = transport
+            .list_object_versions(
+                bucket,
+                prefix,
+                key_marker.as_deref(),
+                vid_marker.as_deref(),
+            )
+            .await?;
+
+        for entry in &result.entries {
+            let dt = format_epoch(entry.last_modified);
+            let latest = if entry.is_latest { " [LATEST]" } else { "" };
+            if entry.is_delete_marker {
+                println!(
+                    "{}           0  {}  {}  [DELETE MARKER]{}",
+                    entry.version_id, dt, entry.key, latest,
+                );
+            } else {
+                println!(
+                    "{}  {:>10}  {}  {}{}",
+                    entry.version_id, entry.size, dt, entry.key, latest,
+                );
+            }
+        }
+
+        if result.is_truncated {
+            key_marker = result.next_key_marker;
+            vid_marker = result.next_version_id_marker;
+        } else {
+            break;
+        }
+    }
+
     Ok(())
 }

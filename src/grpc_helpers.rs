@@ -39,6 +39,8 @@ pub fn meta_to_proto(key: &str, meta: &ObjectMeta) -> ObjectMetadata {
         last_modified: meta.last_modified,
         user_metadata: meta.user_metadata.clone(),
         content_md5: meta.content_md5.clone().unwrap_or_default(),
+        version_id: meta.version_id.clone(),
+        is_delete_marker: if meta.is_delete_marker { Some(true) } else { None },
     }
 }
 

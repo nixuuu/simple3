@@ -14,6 +14,7 @@ use crate::grpc_helpers::{
     bulk_get_header, bulk_get_not_found, bulk_put_one_object, map_io_err, meta_to_proto,
     segments_to_proto, spawn_download_stream, stream_to_tmp, TMP_COUNTER,
 };
+use crate::storage::versioning::VersioningState;
 use crate::storage::{BucketStore, Storage};
 
 #[allow(
@@ -147,6 +148,7 @@ impl Simple3 for GrpcService {
             etag,
             content_md5: meta.content_md5.unwrap_or_default(),
             size,
+            version_id: meta.version_id,
         }))
     }
 
@@ -154,18 +156,31 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
-        let resource = format!("arn:s3:::{}/{}", request.get_ref().bucket, request.get_ref().key);
-        self.check_auth(&request, "s3:GetObject", &resource)?;
+        let input = request.get_ref();
+        let resource = format!("arn:s3:::{}/{}", input.bucket, input.key);
+        let action = if input.version_id.is_some() {
+            "s3:GetObjectVersion"
+        } else {
+            "s3:GetObject"
+        };
+        self.check_auth(&request, action, &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
         let key = input.key.clone();
+        let version_id = input.version_id.clone();
         let s = Arc::clone(&store);
-        let meta = tokio::task::spawn_blocking(move || s.get_meta(&key))
-            .await
-            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
-            .map_err(map_io_err)?
-            .ok_or_else(|| Status::not_found("object not found"))?;
+        let meta = tokio::task::spawn_blocking(move || {
+            s.get_object_or_version(&key, version_id.as_deref())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+        .map_err(map_io_err)?
+        .ok_or_else(|| Status::not_found("object not found"))?;
+
+        if meta.is_delete_marker {
+            return Err(Status::not_found("object is a delete marker"));
+        }
 
         let obj_size = meta.data_length();
         let (range_offset, range_len) = if let Some(start) = input.range_start {
@@ -198,17 +213,31 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<HeadObjectResponse>, Status> {
-        let resource = format!("arn:s3:::{}/{}", request.get_ref().bucket, request.get_ref().key);
-        self.check_auth(&request, "s3:GetObject", &resource)?;
+        let input = request.get_ref();
+        let resource = format!("arn:s3:::{}/{}", input.bucket, input.key);
+        let action = if input.version_id.is_some() {
+            "s3:GetObjectVersion"
+        } else {
+            "s3:GetObject"
+        };
+        self.check_auth(&request, action, &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
         let key = input.key.clone();
-        let meta = tokio::task::spawn_blocking(move || store.get_meta(&key))
-            .await
-            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
-            .map_err(map_io_err)?
-            .ok_or_else(|| Status::not_found("object not found"))?;
+        let version_id = input.version_id.clone();
+        let s = Arc::clone(&store);
+        let meta = tokio::task::spawn_blocking(move || {
+            s.get_object_or_version(&key, version_id.as_deref())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+        .map_err(map_io_err)?
+        .ok_or_else(|| Status::not_found("object not found"))?;
+
+        if meta.is_delete_marker {
+            return Err(Status::not_found("object is a delete marker"));
+        }
 
         Ok(Response::new(HeadObjectResponse {
             metadata: Some(meta_to_proto(&input.key, &meta)),
@@ -219,39 +248,110 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<DeleteObjectRequest>,
     ) -> Result<Response<DeleteObjectResponse>, Status> {
-        let resource = format!("arn:s3:::{}/{}", request.get_ref().bucket, request.get_ref().key);
-        self.check_auth(&request, "s3:DeleteObject", &resource)?;
+        let input = request.get_ref();
+        let resource = format!("arn:s3:::{}/{}", input.bucket, input.key);
+        let action = if input.version_id.is_some() {
+            "s3:DeleteObjectVersion"
+        } else {
+            "s3:DeleteObject"
+        };
+        self.check_auth(&request, action, &resource)?;
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
         let key = input.key;
-        tokio::task::spawn_blocking(move || store.delete_object(&key))
+        let version_id = input.version_id;
+
+        let result_meta = if let Some(vid) = version_id {
+            // Versioned delete — permanently remove specific version
+            let vid_clone = vid.clone();
+            let s = Arc::clone(&store);
+            let k = key.clone();
+            tokio::task::spawn_blocking(move || {
+                // Try deleting from current first, then from versions table
+                if let Some(m) = s.delete_current_version(&k, &vid_clone)? {
+                    return Ok(Some(m));
+                }
+                s.delete_version(&k, &vid_clone)
+            })
             .await
             .map_err(|e| Status::internal(format!("task panicked: {e}")))?
-            .map_err(map_io_err)?;
+            .map_err(map_io_err)?
+        } else {
+            // Normal delete (may create delete marker when versioned)
+            tokio::task::spawn_blocking(move || store.delete_object(&key))
+                .await
+                .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+                .map_err(map_io_err)?
+        };
 
-        Ok(Response::new(DeleteObjectResponse {}))
+        let (resp_vid, resp_is_dm) = result_meta
+            .as_ref()
+            .map_or((None, None), |m| {
+                (m.version_id.clone(), Some(m.is_delete_marker))
+            });
+
+        Ok(Response::new(DeleteObjectResponse {
+            version_id: resp_vid,
+            is_delete_marker: resp_is_dm,
+        }))
     }
 
     async fn delete_objects(
         &self,
         request: Request<DeleteObjectsRequest>,
     ) -> Result<Response<DeleteObjectsResponse>, Status> {
-        let resource = format!("arn:s3:::{}/*", request.get_ref().bucket);
-        self.check_auth(&request, "s3:DeleteObject", &resource)?;
+        // Per-item auth: version-specific deletes require s3:DeleteObjectVersion
+        let bucket = &request.get_ref().bucket;
+        for item in &request.get_ref().items {
+            let resource = format!("arn:s3:::{bucket}/{}", item.key);
+            let action = if item.version_id.is_some() {
+                "s3:DeleteObjectVersion"
+            } else {
+                "s3:DeleteObject"
+            };
+            self.check_auth(&request, action, &resource)?;
+        }
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
-        let keys = input.keys;
+        let items = input.items;
         let (deleted, errors) = tokio::task::spawn_blocking(move || {
             let mut deleted = Vec::new();
             let mut errors = Vec::new();
-            for key in keys {
-                match store.delete_object(&key) {
-                    Ok(_) => deleted.push(key),
+            for item in items {
+                let result = if let Some(vid) = &item.version_id {
+                    let s = Arc::clone(&store);
+                    let k = item.key.clone();
+                    let v = vid.clone();
+                    // Try current version first, then versions table
+                    (|| -> io::Result<Option<crate::types::ObjectMeta>> {
+                        if let Some(m) = s.delete_current_version(&k, &v)? {
+                            return Ok(Some(m));
+                        }
+                        s.delete_version(&k, &v)
+                    })()
+                } else {
+                    store.delete_object(&item.key)
+                };
+
+                match result {
+                    Ok(meta) => {
+                        let (vid, dm) = meta
+                            .as_ref()
+                            .map_or((None, None), |m| {
+                                (m.version_id.clone(), Some(m.is_delete_marker))
+                            });
+                        deleted.push(DeletedObjectResult {
+                            key: item.key,
+                            version_id: vid,
+                            delete_marker: dm,
+                        });
+                    }
                     Err(e) => errors.push(DeleteError {
-                        key,
+                        key: item.key,
                         message: e.to_string(),
+                        version_id: item.version_id,
                     }),
                 }
             }
@@ -319,6 +419,7 @@ impl Simple3 for GrpcService {
                 size: meta.data_length(),
                 etag: meta.etag,
                 last_modified: meta.last_modified,
+                version_id: meta.version_id,
             })
             .collect();
 
@@ -527,6 +628,145 @@ impl Simple3 for GrpcService {
     }
 
     // ================================================================
+    // Versioning
+    // ================================================================
+
+    async fn get_bucket_versioning(
+        &self,
+        request: Request<GetBucketVersioningRequest>,
+    ) -> Result<Response<GetBucketVersioningResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:GetBucketVersioning", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let state = tokio::task::spawn_blocking(move || store.get_versioning_state())
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+            .map_err(map_io_err)?;
+
+        let status = match state {
+            Some(VersioningState::Enabled) => "Enabled".to_owned(),
+            Some(VersioningState::Suspended) => "Suspended".to_owned(),
+            None => String::new(),
+        };
+
+        Ok(Response::new(GetBucketVersioningResponse { status }))
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        request: Request<PutBucketVersioningRequest>,
+    ) -> Result<Response<PutBucketVersioningResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:PutBucketVersioning", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let state = match input.status.as_str() {
+            "Enabled" => VersioningState::Enabled,
+            "Suspended" => VersioningState::Suspended,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "invalid versioning status: '{other}', expected 'Enabled' or 'Suspended'"
+                )));
+            }
+        };
+
+        tokio::task::spawn_blocking(move || store.set_versioning_state(state))
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+            .map_err(map_io_err)?;
+
+        Ok(Response::new(PutBucketVersioningResponse {}))
+    }
+
+    async fn list_object_versions(
+        &self,
+        request: Request<ListObjectVersionsRequest>,
+    ) -> Result<Response<ListObjectVersionsResponse>, Status> {
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:ListBucketVersions", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let prefix = if input.prefix.is_empty() {
+            None
+        } else {
+            Some(input.prefix)
+        };
+        let delimiter = if input.delimiter.is_empty() {
+            None
+        } else {
+            Some(input.delimiter)
+        };
+        #[allow(clippy::cast_sign_loss)]
+        let max_keys = if input.max_keys <= 0 {
+            1000
+        } else {
+            input.max_keys as usize
+        };
+        let key_marker = if input.key_marker.is_empty() {
+            None
+        } else {
+            Some(input.key_marker)
+        };
+        let vid_marker = if input.version_id_marker.is_empty() {
+            None
+        } else {
+            Some(input.version_id_marker)
+        };
+
+        let result = tokio::task::spawn_blocking(move || {
+            store.list_object_versions(
+                prefix.as_deref(),
+                delimiter.as_deref(),
+                max_keys,
+                key_marker.as_deref(),
+                vid_marker.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+        .map_err(map_io_err)?;
+
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+
+        for entry in result.entries {
+            if entry.meta.is_delete_marker {
+                delete_markers.push(DeleteMarkerProto {
+                    key: entry.key,
+                    version_id: entry.version_id,
+                    last_modified: entry.meta.last_modified,
+                    is_latest: entry.is_latest,
+                });
+            } else {
+                let size = entry.meta.data_length();
+                let last_modified = entry.meta.last_modified;
+                versions.push(proto::VersionEntry {
+                    key: entry.key,
+                    version_id: entry.version_id,
+                    etag: entry.meta.etag,
+                    size,
+                    last_modified,
+                    is_latest: entry.is_latest,
+                    content_type: entry.meta.content_type.unwrap_or_default(),
+                });
+            }
+        }
+
+        Ok(Response::new(ListObjectVersionsResponse {
+            versions,
+            delete_markers,
+            common_prefixes: result.common_prefixes,
+            is_truncated: result.is_truncated,
+            next_key_marker: result.next_key_marker.unwrap_or_default(),
+            next_version_id_marker: result.next_version_id_marker.unwrap_or_default(),
+        }))
+    }
+
+    // ================================================================
     // Admin
     // ================================================================
 
@@ -539,19 +779,28 @@ impl Simple3 for GrpcService {
         let bucket = request.into_inner().bucket;
         let store = self.bucket(&bucket)?;
 
-        let stats = tokio::task::spawn_blocking(move || store.segment_stats())
-            .await
-            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
-            .map_err(map_io_err)?;
+        let s = Arc::clone(&store);
+        let (stats, vstats) = tokio::task::spawn_blocking(move || {
+            let seg = s.segment_stats()?;
+            let ver = s.version_stats()?;
+            Ok::<_, io::Error>((seg, ver))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+        .map_err(map_io_err)?;
 
         let total_size: u64 = stats.iter().map(|s| s.size).sum();
         let total_dead_bytes: u64 = stats.iter().map(|s| s.dead_bytes).sum();
+        let (version_count, delete_marker_count, total_versioned_size) = vstats;
 
         Ok(Response::new(StatsResponse {
             bucket,
             segments: segments_to_proto(stats),
             total_size,
             total_dead_bytes,
+            version_count,
+            delete_marker_count,
+            total_versioned_size,
         }))
     }
 

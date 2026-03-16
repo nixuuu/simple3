@@ -1,6 +1,7 @@
 mod compaction;
 mod multipart;
 mod verify;
+pub mod versioning;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -132,6 +133,12 @@ impl BucketStore {
             let _ = txn.open_table(OBJECTS).map_err(io::Error::other)?;
             let _ = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
             let _ = txn.open_table(SEG_COMPACTING).map_err(io::Error::other)?;
+            let _ = txn
+                .open_table(versioning::VERSIONS)
+                .map_err(io::Error::other)?;
+            let _ = txn
+                .open_table(versioning::BUCKET_CONFIG)
+                .map_err(io::Error::other)?;
             txn.commit().map_err(io::Error::other)?;
         }
 
@@ -264,11 +271,25 @@ impl BucketStore {
         let mut max_end: u64 = 0;
         {
             let txn = self.db.begin_read().map_err(io::Error::other)?;
+
+            // Scan objects table
             let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
             for result in table.iter().map_err(io::Error::other)? {
                 let (_k, v) = result.map_err(io::Error::other)?;
                 let obj = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
                 if obj.segment_id == active_id {
+                    max_end = max_end.max(obj.offset + obj.length);
+                }
+            }
+
+            // Scan versions table
+            let ver_table = txn
+                .open_table(versioning::VERSIONS)
+                .map_err(io::Error::other)?;
+            for result in ver_table.iter().map_err(io::Error::other)? {
+                let (_k, v) = result.map_err(io::Error::other)?;
+                let obj = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
+                if obj.segment_id == active_id && !obj.is_delete_marker {
                     max_end = max_end.max(obj.offset + obj.length);
                 }
             }
@@ -459,7 +480,7 @@ impl BucketStore {
         }
     }
 
-    pub fn put_meta(&self, key: &str, meta: &ObjectMeta) -> io::Result<()> {
+    pub fn put_meta(&self, key: &str, meta: &mut ObjectMeta) -> io::Result<()> {
         self.commit_put(key, meta)
     }
 
@@ -475,37 +496,11 @@ impl BucketStore {
         }
     }
 
-    /// Atomically insert/update an object and track dead bytes from the previous version.
+    /// Atomically insert/update an object and handle versioning.
     ///
-    /// Reads the old meta **inside** the write transaction to avoid TOCTOU races
-    /// where concurrent overwrites double-count dead bytes.
-    fn commit_put(&self, key: &str, meta: &ObjectMeta) -> io::Result<()> {
-        let v = bincode::serialize(meta).map_err(io::Error::other)?;
-        let txn = self.db.begin_write().map_err(io::Error::other)?;
-        let old_meta = {
-            let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
-            let old = table
-                .get(key)
-                .map_err(io::Error::other)?
-                .map(|v| ObjectMeta::from_bytes(v.value()))
-                .transpose()
-                .map_err(io::Error::other)?;
-            table
-                .insert(key, v.as_slice())
-                .map_err(io::Error::other)?;
-            old
-        };
-        if let Some(old) = old_meta {
-            let mut dead = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
-            let current = dead
-                .get(old.segment_id)
-                .map_err(io::Error::other)?
-                .map_or(0, |g| g.value());
-            dead.insert(old.segment_id, current + old.length)
-                .map_err(io::Error::other)?;
-        }
-        txn.commit().map_err(io::Error::other)?;
-        Ok(())
+    /// Reads versioning state **inside** the write transaction to avoid TOCTOU races.
+    fn commit_put(&self, key: &str, meta: &mut ObjectMeta) -> io::Result<()> {
+        self.commit_put_versioned(key, meta)
     }
 
     pub fn bucket_dir(&self) -> &Path {
@@ -585,7 +580,7 @@ impl BucketStore {
             self.write_to_segment(&mut w, tmp_path, tmp, tmp_size, content_crc32c)?;
 
         let content_md5 = Some(etag.clone());
-        let meta = ObjectMeta {
+        let mut meta = ObjectMeta {
             segment_id,
             offset,
             length,
@@ -595,9 +590,11 @@ impl BucketStore {
             user_metadata,
             content_md5,
             content_crc32c,
+            version_id: None,
+            is_delete_marker: false,
         };
 
-        if let Err(e) = self.commit_put(key, &meta) {
+        if let Err(e) = self.commit_put(key, &mut meta) {
             w.file.set_len(offset).ok();
             w.size = offset;
             fs::remove_file(tmp_path).ok();
@@ -611,29 +608,15 @@ impl BucketStore {
 
     // === Delete ===
 
+    /// Delete an object. Behavior depends on versioning state:
+    /// - Absent: hard delete, mark data as dead.
+    /// - Enabled: insert delete marker, move current to versions table.
+    /// - Suspended: insert delete marker with vid="null".
+    ///
+    /// Reads versioning state inside the write transaction to avoid TOCTOU races.
+    /// Returns the delete marker meta (if versioned) or the removed meta (if not).
     pub fn delete_object(&self, key: &str) -> io::Result<Option<ObjectMeta>> {
-        let txn = self.db.begin_write().map_err(io::Error::other)?;
-
-        let meta = {
-            let mut table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
-            match table.remove(key).map_err(io::Error::other)? {
-                Some(v) => ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?,
-                None => return Ok(None),
-            }
-        };
-
-        {
-            let mut dead = txn.open_table(SEG_DEAD).map_err(io::Error::other)?;
-            let current = dead
-                .get(meta.segment_id)
-                .map_err(io::Error::other)?
-                .map_or(0, |g| g.value());
-            dead.insert(meta.segment_id, current + meta.length)
-                .map_err(io::Error::other)?;
-        }
-
-        txn.commit().map_err(io::Error::other)?;
-        Ok(Some(meta))
+        self.delete_object_versioned(key)
     }
 
     // === List objects ===
@@ -689,6 +672,12 @@ impl BucketStore {
                 continue;
             }
 
+            // Skip delete markers — they must not appear in normal ListObjects
+            let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
+            if meta.is_delete_marker {
+                continue;
+            }
+
             if let Some(delim) = delimiter {
                 let rest = &obj_key[prefix_len..];
                 if let Some(pos) = rest.find(delim) {
@@ -712,7 +701,6 @@ impl BucketStore {
                 break;
             }
 
-            let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
             results.push((obj_key.to_owned(), meta));
         }
 
@@ -721,8 +709,14 @@ impl BucketStore {
 
     pub fn is_empty(&self) -> io::Result<bool> {
         let txn = self.db.begin_read().map_err(io::Error::other)?;
-        let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
-        table.is_empty().map_err(io::Error::other)
+        let objects = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+        if !objects.is_empty().map_err(io::Error::other)? {
+            return Ok(false);
+        }
+        let versions = txn
+            .open_table(versioning::VERSIONS)
+            .map_err(io::Error::other)?;
+        versions.is_empty().map_err(io::Error::other)
     }
 }
 
