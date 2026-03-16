@@ -405,24 +405,30 @@ impl Simple3 for GrpcService {
         let tmp_id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = dest_store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}"));
 
-        let etag = format!("{:x}", <md5::Md5 as md5::Digest>::digest(&src_data));
-        let crc = crc32c::crc32c(&src_data);
-        std::fs::write(&tmp_path, &src_data)
-            .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
             .as_secs();
 
         let dest_key = input.dest_key;
-        let etag_clone = etag.clone();
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_truncation)] // src_data.len() bounded by memory; always fits u64
         let size = src_data.len() as u64;
-        let meta = tokio::task::spawn_blocking(move || {
-            dest_store.put_object_streamed(
-                &dest_key, &tmp_path, content_type, etag_clone, now, user_metadata, Some(crc),
-            )
+        let (etag, meta) = tokio::task::spawn_blocking(move || {
+            let etag = format!("{:x}", <md5::Md5 as md5::Digest>::digest(&src_data));
+            let crc = crc32c::crc32c(&src_data);
+            if let Err(e) = std::fs::write(&tmp_path, &src_data) {
+                std::fs::remove_file(&tmp_path).ok();
+                return Err(e);
+            }
+            match dest_store.put_object_streamed(
+                &dest_key, &tmp_path, content_type, etag.clone(), now, user_metadata, Some(crc),
+            ) {
+                Ok(m) => Ok((etag, m)),
+                Err(e) => {
+                    std::fs::remove_file(&tmp_path).ok();
+                    Err(e)
+                }
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?

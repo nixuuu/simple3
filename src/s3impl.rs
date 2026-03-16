@@ -457,28 +457,33 @@ impl S3 for SimpleStorage {
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = dest_store.bucket_dir().join(format!(".tmp_{tmp_id:020}"));
 
-        let mut hasher = Md5::new();
-        let mut crc: u32 = 0;
-        hasher.update(&src_data);
-        crc = crc32c::crc32c_append(crc, &src_data);
-        std::fs::write(&tmp_path, &src_data)
-            .map_err(|e| { tracing::error!("copy_object write tmp: {e}"); s3_error!(e, InternalError) })?;
-        let etag_hex = format!("{:x}", hasher.finalize());
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
         let dest_key = input.key;
-        let etag_clone = etag_hex.clone();
         let meta = blocking(move || {
-            dest_store.put_object_streamed(
-                &dest_key, &tmp_path, content_type, etag_clone, now, user_metadata, Some(crc),
-            )
+            let etag_hex = format!("{:x}", Md5::digest(&src_data));
+            let crc = crc32c::crc32c(&src_data);
+            if let Err(e) = std::fs::write(&tmp_path, &src_data) {
+                std::fs::remove_file(&tmp_path).ok();
+                return Err(e);
+            }
+            match dest_store.put_object_streamed(
+                &dest_key, &tmp_path, content_type, etag_hex.clone(), now, user_metadata, Some(crc),
+            ) {
+                Ok(m) => Ok((etag_hex, m)),
+                Err(e) => {
+                    std::fs::remove_file(&tmp_path).ok();
+                    Err(e)
+                }
+            }
         })
         .await
         .map_err(|e| { tracing::error!("copy_object put dest: {e}"); s3_error!(e, InternalError) })?;
+
+        let (etag_hex, meta) = meta;
 
         let last_modified = Timestamp::from(UNIX_EPOCH + Duration::from_secs(now));
 
