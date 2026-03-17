@@ -15,7 +15,7 @@ pub struct MintResult {
     pub name: Option<String>,
     pub function: Option<String>,
     pub args: Option<serde_json::Value>,
-    pub duration: Option<u64>,
+    pub duration: Option<serde_json::Value>,
     pub status: String,
     pub alert: Option<String>,
     pub message: Option<String>,
