@@ -23,7 +23,7 @@ async fn compat_mint_core() {
 
     // Mint runs its test suite, writes JSON logs to /mint/log/log.json, then exits.
     // We override CMD to also cat the log to stdout so we can read it.
-    let image = GenericImage::new("minio/mint", "latest")
+    let image = GenericImage::new("minio/mint", "edge")
         .with_wait_for(WaitFor::Duration {
             length: Duration::from_secs(2),
         });
@@ -60,6 +60,11 @@ async fn compat_mint_core() {
     let log_content = String::from_utf8_lossy(&stdout);
 
     let results = parse_mint_log(&log_content);
+    assert!(
+        !results.is_empty(),
+        "no Mint test cases parsed from log output"
+    );
+
     let known = mint_known_failures();
     let report = build_mint_report(&results, &known);
 

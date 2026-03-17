@@ -64,8 +64,12 @@ fn build_s3_service(
 fn spawn_accept_loop(listener: TcpListener, svc: s3s::service::S3Service) {
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    eprintln!("test server accept error: {err}");
+                    continue;
+                }
             };
             let svc = svc.clone();
             tokio::spawn(async move {

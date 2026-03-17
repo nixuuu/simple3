@@ -24,8 +24,12 @@ pub struct MintResult {
 
 pub fn parse_mint_log(raw: &str) -> Vec<MintResult> {
     raw.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<MintResult>(l).ok())
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .map(|(idx, l)| {
+            serde_json::from_str::<MintResult>(l)
+                .unwrap_or_else(|e| panic!("invalid Mint JSON at line {}: {e}", idx + 1))
+        })
         .collect()
 }
 
@@ -40,7 +44,10 @@ pub fn parse_pytest_summary(output: &str) -> (usize, usize, usize) {
 
     for line in output.lines().rev() {
         let trimmed = line.trim().trim_matches('=').trim();
-        if trimmed.contains("passed") || trimmed.contains("failed") || trimmed.contains("skipped")
+        if trimmed.contains("passed")
+            || trimmed.contains("failed")
+            || trimmed.contains("skipped")
+            || trimmed.contains("error")
         {
             for part in trimmed.split(',') {
                 // Strip trailing " in N.NNs" suffix that pytest appends to the last segment.
@@ -49,6 +56,8 @@ pub fn parse_pytest_summary(output: &str) -> (usize, usize, usize) {
                     passed = parse_count(part);
                 } else if part.ends_with("failed") {
                     failed = parse_count(part);
+                } else if part.ends_with("error") || part.ends_with("errors") {
+                    failed += parse_count(part);
                 } else if part.ends_with("skipped") {
                     skipped = parse_count(part);
                 }
@@ -94,18 +103,18 @@ impl fmt::Display for CompatReport {
             self.passed, self.total, self.skipped, self.failed
         )?;
 
-        let known_count = self.failures.iter().filter(|f| f.known_issue.is_some()).count();
-        let unexpected_count = self.failures.iter().filter(|f| f.known_issue.is_none()).count();
+        let known_count = self.failures.iter().filter(|fd| fd.known_issue.is_some()).count();
+        let unexpected_count = self.failures.iter().filter(|fd| fd.known_issue.is_none()).count();
 
         if known_count > 0 {
             writeln!(f, "\nKnown failures ({known_count}):")?;
-            for fd in self.failures.iter().filter(|f| f.known_issue.is_some()) {
+            for fd in self.failures.iter().filter(|fd| fd.known_issue.is_some()) {
                 writeln!(f, "  - {} -> {}", fd.test_name, fd.known_issue.unwrap_or(""))?;
             }
         }
         if unexpected_count > 0 {
             writeln!(f, "\nUnexpected failures ({unexpected_count}):")?;
-            for fd in self.failures.iter().filter(|f| f.known_issue.is_none()) {
+            for fd in self.failures.iter().filter(|fd| fd.known_issue.is_none()) {
                 writeln!(f, "  - {}", fd.test_name)?;
                 if !fd.error.is_empty() {
                     for line in fd.error.lines().take(3) {

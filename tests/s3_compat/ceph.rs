@@ -82,10 +82,11 @@ fn build_ceph_report(output: &str) -> CompatReport {
     let known = ceph_known_failures();
     let failures: Vec<FailureDetail> = output
         .lines()
-        .filter(|l| l.starts_with("FAILED"))
+        .filter(|l| l.starts_with("FAILED ") || l.starts_with("ERROR "))
         .map(|l| {
             let name = l
                 .strip_prefix("FAILED ")
+                .or_else(|| l.strip_prefix("ERROR "))
                 .unwrap_or(l)
                 .split(" - ")
                 .next()
@@ -153,6 +154,19 @@ async fn compat_ceph_s3_tests() {
         .unwrap();
 
     let output = run_pytest(&container).await;
+
+    // Validate pytest actually ran (exit 0 = all passed, 1 = some failed, >=2 = execution error).
+    let exit_code = output
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("EXIT:"))
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .expect("missing pytest EXIT marker in output");
+    assert!(
+        matches!(exit_code, 0 | 1),
+        "pytest execution failed (exit code {exit_code}); check container setup"
+    );
+
     let report = build_ceph_report(&output);
     print!("{report}");
 
