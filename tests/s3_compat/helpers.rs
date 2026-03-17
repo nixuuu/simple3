@@ -22,10 +22,13 @@ pub struct MintResult {
     pub error: Option<String>,
 }
 
+/// Parse Mint's newline-delimited JSON log from stdout.
+/// Mint emits non-JSON progress text before the log — only lines starting
+/// with `{` are treated as JSON records. Malformed JSON records panic.
 pub fn parse_mint_log(raw: &str) -> Vec<MintResult> {
     raw.lines()
         .enumerate()
-        .filter(|(_, l)| !l.trim().is_empty())
+        .filter(|(_, l)| l.trim_start().starts_with('{'))
         .map(|(idx, l)| {
             serde_json::from_str::<MintResult>(l)
                 .unwrap_or_else(|e| panic!("invalid Mint JSON at line {}: {e}", idx + 1))
