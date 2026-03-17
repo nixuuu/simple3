@@ -1,0 +1,34 @@
+name: S3 Compat - Ceph s3-tests
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ceph:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check protoc
+        run: protoc --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Ceph s3-tests image
+        run: docker build -t simple3-ceph-s3-tests docker/ceph-s3-tests/
+
+      - name: Run Ceph s3-tests
+        run: cargo test --test s3_compat compat_ceph -- --ignored --nocapture
+        timeout-minutes: 150
