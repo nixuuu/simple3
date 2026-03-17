@@ -44,6 +44,7 @@ pub fn parse_pytest_summary(output: &str) -> (usize, usize, usize) {
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
+    let mut found_summary = false;
 
     for line in output.lines().rev() {
         let trimmed = line.trim().trim_matches('=').trim();
@@ -52,16 +53,18 @@ pub fn parse_pytest_summary(output: &str) -> (usize, usize, usize) {
             || trimmed.contains("skipped")
             || trimmed.contains("error")
         {
+            found_summary = true;
             for part in trimmed.split(',') {
                 // Strip trailing " in N.NNs" suffix that pytest appends to the last segment.
                 let part = part.trim().split(" in ").next().unwrap_or("").trim();
-                if part.ends_with("passed") {
+                let kind = part.split_whitespace().last().unwrap_or("");
+                if kind == "passed" {
                     passed = parse_count(part);
-                } else if part.ends_with("failed") {
+                } else if kind == "failed" {
                     failed = parse_count(part);
-                } else if part.ends_with("error") || part.ends_with("errors") {
+                } else if kind == "error" || kind == "errors" {
                     failed += parse_count(part);
-                } else if part.ends_with("skipped") {
+                } else if kind == "skipped" {
                     skipped = parse_count(part);
                 }
             }
@@ -69,6 +72,10 @@ pub fn parse_pytest_summary(output: &str) -> (usize, usize, usize) {
         }
     }
 
+    assert!(
+        found_summary,
+        "pytest summary line not found; output may be truncated or run may have aborted"
+    );
     (passed, failed, skipped)
 }
 

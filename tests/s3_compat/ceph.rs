@@ -101,6 +101,14 @@ fn build_ceph_report(output: &str) -> CompatReport {
         })
         .collect();
 
+    assert_eq!(
+        failures.len(),
+        failed,
+        "pytest summary/detail mismatch: summary reported {failed} failures, \
+         but {} FAILED/ERROR lines were extracted",
+        failures.len()
+    );
+
     CompatReport {
         suite: "Ceph s3-tests (boto3)".to_owned(),
         total,
