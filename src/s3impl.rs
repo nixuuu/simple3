@@ -15,7 +15,8 @@ use s3s::dto::{
     DeleteBucketInput, DeleteBucketOutput, DeleteMarkerEntry, DeleteObjectInput,
     DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
     GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput,
-    HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
+    ListBucketsInput, ListBucketsOutput,
     ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
     MetadataDirective, Object, ObjectVersion, PutBucketVersioningInput,
     PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
@@ -105,6 +106,15 @@ fn resolve_object_version(
 
 #[async_trait::async_trait]
 impl S3 for SimpleStorage {
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        let bucket = req.input.bucket;
+        let _store = self.bucket(&bucket)?;
+        Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
     async fn create_bucket(
         &self,
         req: S3Request<CreateBucketInput>,
