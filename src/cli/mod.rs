@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod admin_auth;
 mod compact;
 mod health;
 mod metrics;
+mod request_id;
 pub mod client;
 pub mod config;
 pub mod keys;
@@ -24,8 +25,37 @@ pub struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
+    /// Log output format
+    #[arg(long, global = true, value_enum)]
+    log_format: Option<LogFormat>,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+fn init_logging(format: LogFormat) {
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    match format {
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        }
+        LogFormat::Text => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .init();
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -188,6 +218,12 @@ enum Command {
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // For non-serve commands, init text logging immediately.
+    // Serve path defers init until after config load to support JSON format from TOML.
+    if !matches!(&cli.command, None | Some(Command::Serve { .. })) {
+        init_logging(cli.log_format.unwrap_or_default());
+    }
+
     match cli.command {
         Some(Command::Health) => health::run(&cli.data_dir, cli.config.as_deref()).await,
         Some(Command::Compact { bucket }) => compact::run(&cli.data_dir, bucket),
@@ -270,6 +306,11 @@ pub async fn run() -> anyhow::Result<()> {
         }
         cmd => {
             let cfg = config::load_config(cli.config.as_deref(), &cli.data_dir)?;
+            let log_format = cli
+                .log_format
+                .or(cfg.server.log_format)
+                .unwrap_or_default();
+            init_logging(log_format);
             let (
                 host,
                 port,
