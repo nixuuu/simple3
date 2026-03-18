@@ -63,7 +63,11 @@ where
             request_id = %request_id,
             path = %path,
         );
+        // Clone-and-swap: `self.inner` was marked ready by `poll_ready`, so we
+        // move it into the future and replace it with a fresh clone. This follows
+        // the tower `Service` contract — the ready instance is the one that gets called.
         let mut inner = self.inner.clone();
+        std::mem::swap(&mut self.inner, &mut inner);
         Box::pin(
             async move {
                 let mut resp = inner.call(req).await?;
