@@ -167,6 +167,34 @@ impl BucketStore {
 
     /// Compact a single segment. Only locks that segment during the swap phase.
     pub fn compact_segment(&self, segment_id: u32) -> io::Result<()> {
+        let start = std::time::Instant::now();
+        let bucket_name = self
+            .bucket_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_owned();
+
+        let result = self.compact_segment_inner(segment_id);
+
+        let status = if result.is_ok() { "ok" } else { "error" };
+        metrics::histogram!(
+            "simple3_compaction_duration_seconds",
+            "bucket" => bucket_name.clone(),
+            "status" => status,
+        )
+        .record(start.elapsed().as_secs_f64());
+        metrics::counter!(
+            "simple3_compaction_runs_total",
+            "bucket" => bucket_name,
+            "status" => status,
+        )
+        .increment(1);
+
+        result
+    }
+
+    fn compact_segment_inner(&self, segment_id: u32) -> io::Result<()> {
         // If compacting active segment, rotate first so it becomes non-active
         {
             let mut w = self

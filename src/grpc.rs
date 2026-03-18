@@ -10,6 +10,7 @@ use crate::auth::grpc_auth::{
     check_grpc_access, extract_credentials, extract_credentials_from_metadata,
 };
 use crate::auth::AuthStore;
+use crate::metrics_util::DurationRecorder;
 use crate::grpc_helpers::{
     bulk_get_header, bulk_get_not_found, bulk_put_one_object, map_io_err, meta_to_proto,
     segments_to_proto, spawn_download_stream, stream_to_tmp, TMP_COUNTER,
@@ -96,6 +97,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<Streaming<PutObjectRequest>>,
     ) -> Result<Response<PutObjectResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "PutObject");
         let (metadata, _, stream) = request.into_parts();
         let mut stream = stream;
 
@@ -156,6 +158,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
+        // Timer measures time-to-first-byte; data streams asynchronously after return.
+        let _timer = DurationRecorder::new("gRPC", "GetObject");
         let input = request.get_ref();
         let resource = format!("arn:s3:::{}/{}", input.bucket, input.key);
         let action = if input.version_id.is_some() {
@@ -213,6 +217,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<HeadObjectResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "HeadObject");
         let input = request.get_ref();
         let resource = format!("arn:s3:::{}/{}", input.bucket, input.key);
         let action = if input.version_id.is_some() {
@@ -248,6 +253,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<DeleteObjectRequest>,
     ) -> Result<Response<DeleteObjectResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "DeleteObject");
         let input = request.get_ref();
         let resource = format!("arn:s3:::{}/{}", input.bucket, input.key);
         let action = if input.version_id.is_some() {
@@ -301,6 +307,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<DeleteObjectsRequest>,
     ) -> Result<Response<DeleteObjectsResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "DeleteObjects");
         // Per-item auth: version-specific deletes require s3:DeleteObjectVersion
         let bucket = &request.get_ref().bucket;
         for item in &request.get_ref().items {
@@ -367,6 +374,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<CopyObjectRequest>,
     ) -> Result<Response<CopyObjectResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "CopyObject");
         let input = request.get_ref();
         let src_resource = format!("arn:s3:::{}/{}", input.source_bucket, input.source_key);
         let dest_resource = format!("arn:s3:::{}/{}", input.dest_bucket, input.dest_key);
@@ -437,6 +445,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "ListObjects");
         let resource = format!("arn:s3:::{}", request.get_ref().bucket);
         self.check_auth(&request, "s3:ListBucket", &resource)?;
         let input = request.into_inner();
@@ -511,6 +520,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<BulkGetRequest>,
     ) -> Result<Response<Self::BulkGetStream>, Status> {
+        // Timer measures time-to-first-byte; data streams asynchronously after return.
+        let _timer = DurationRecorder::new("gRPC", "BulkGet");
         let resource = format!("arn:s3:::{}/*", request.get_ref().bucket);
         self.check_auth(&request, "s3:GetObject", &resource)?;
         let input = request.into_inner();
@@ -563,6 +574,8 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<Streaming<BulkPutRequest>>,
     ) -> Result<Response<Self::BulkPutStream>, Status> {
+        // Timer measures time-to-first-byte; stream consumed asynchronously after return.
+        let _timer = DurationRecorder::new("gRPC", "BulkPut");
         // For bulk_put we check auth at the request level with a wildcard resource
         // since we don't know buckets/keys until we read the stream
         let (metadata, _, stream) = request.into_parts();
@@ -638,6 +651,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<HeadBucketRequest>,
     ) -> Result<Response<HeadBucketResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "HeadBucket");
         let resource = format!("arn:s3:::{}", request.get_ref().name);
         self.check_auth(&request, "s3:HeadBucket", &resource)?;
         let name = request.into_inner().name;
@@ -649,6 +663,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<CreateBucketRequest>,
     ) -> Result<Response<CreateBucketResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "CreateBucket");
         let resource = format!("arn:s3:::{}", request.get_ref().name);
         self.check_auth(&request, "s3:CreateBucket", &resource)?;
         let name = request.into_inner().name;
@@ -667,6 +682,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<DeleteBucketRequest>,
     ) -> Result<Response<DeleteBucketResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "DeleteBucket");
         let resource = format!("arn:s3:::{}", request.get_ref().name);
         self.check_auth(&request, "s3:DeleteBucket", &resource)?;
         let name = request.into_inner().name;
@@ -698,6 +714,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<ListBucketsRequest>,
     ) -> Result<Response<ListBucketsResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "ListBuckets");
         self.check_auth(&request, "s3:ListAllMyBuckets", "arn:s3:::*")?;
         let storage = Arc::clone(&self.storage);
         let buckets = tokio::task::spawn_blocking(move || storage.list_buckets())
@@ -716,6 +733,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<GetBucketVersioningRequest>,
     ) -> Result<Response<GetBucketVersioningResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "GetBucketVersioning");
         let resource = format!("arn:s3:::{}", request.get_ref().bucket);
         self.check_auth(&request, "s3:GetBucketVersioning", &resource)?;
         let input = request.into_inner();
@@ -739,6 +757,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<PutBucketVersioningRequest>,
     ) -> Result<Response<PutBucketVersioningResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "PutBucketVersioning");
         let resource = format!("arn:s3:::{}", request.get_ref().bucket);
         self.check_auth(&request, "s3:PutBucketVersioning", &resource)?;
         let input = request.into_inner();
@@ -766,6 +785,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<ListObjectVersionsRequest>,
     ) -> Result<Response<ListObjectVersionsResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "ListObjectVersions");
         let resource = format!("arn:s3:::{}", request.get_ref().bucket);
         self.check_auth(&request, "s3:ListBucketVersions", &resource)?;
         let input = request.into_inner();
@@ -855,6 +875,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<StatsRequest>,
     ) -> Result<Response<StatsResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "Stats");
         let resource = format!("arn:s3:::{}", request.get_ref().bucket);
         self.check_auth(&request, "admin:Stats", &resource)?;
         let bucket = request.into_inner().bucket;
@@ -889,6 +910,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<CompactRequest>,
     ) -> Result<Response<CompactResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "Compact");
         let resource = format!("arn:s3:::{}", request.get_ref().bucket);
         self.check_auth(&request, "admin:Compact", &resource)?;
         let bucket = request.into_inner().bucket;
@@ -923,6 +945,7 @@ impl Simple3 for GrpcService {
         &self,
         request: Request<VerifyRequest>,
     ) -> Result<Response<VerifyResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "Verify");
         let resource = format!("arn:s3:::{}", request.get_ref().bucket);
         self.check_auth(&request, "admin:Verify", &resource)?;
         let bucket = request.into_inner().bucket;

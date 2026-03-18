@@ -37,6 +37,8 @@ rand = "0.10"
 reqwest = { version = "0.12", default-features = false }
 toml = "1.0"
 nix = { version = "0.29", default-features = false, features = ["fs"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = "0.6"

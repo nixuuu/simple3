@@ -126,6 +126,7 @@ struct AdminService {
     storage: Arc<Storage>,
     auth_store: Arc<AuthStore>,
     min_disk_free_mb: u64,
+    prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 type ServiceFuture =
@@ -138,7 +139,18 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
 
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let path = req.uri().path().to_owned();
-        if *req.method() == hyper::Method::GET && path == "/health" {
+        if *req.method() == hyper::Method::GET && path == "/metrics" {
+            let body = self.prometheus_handle.render();
+            Box::pin(async move {
+                Ok(hyper::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                    .body(s3s::Body::from(body))
+                    .unwrap_or_else(|e| {
+                        json_response(500, &serde_json::json!({"error": format!("metrics render: {e}")}))
+                    }))
+            })
+        } else if *req.method() == hyper::Method::GET && path == "/health" {
             Box::pin(async {
                 Ok(json_response(200, &serde_json::json!({"status": "ok"})))
             })
@@ -174,7 +186,12 @@ pub fn json_response(status: u16, body: &impl Serialize) -> s3s::HttpResponse {
         .status(status)
         .header("content-type", "application/json")
         .body(s3s::Body::from(json))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            hyper::Response::builder()
+                .status(500)
+                .body(s3s::Body::from(format!(r#"{{"error":"{e}"}}"#)))
+                .expect("fallback response with no custom headers cannot fail")
+        })
 }
 
 fn stats_to_json(stats: &[simple3::storage::SegmentStat]) -> Vec<SegmentStatJson> {
@@ -365,6 +382,8 @@ impl Drop for CompactingGuard<'_> {
     }
 }
 
+use super::metrics::{ConnectionGuard, spawn_metrics_updater};
+
 fn spawn_signal_handler(
     mut sigterm: tokio::signal::unix::Signal,
     mut sigint: tokio::signal::unix::Signal,
@@ -513,7 +532,53 @@ async fn drain_connections(connections: &mut JoinSet<()>, timeout_secs: u64) {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // server config values passed through; a struct would add indirection without benefit
+/// Accept HTTP connections until a shutdown signal is received.
+/// Returns the in-flight connection set for draining by the caller.
+async fn accept_loop(
+    listener: TcpListener,
+    service: AdminService,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> anyhow::Result<JoinSet<()>> {
+    let mut connections: JoinSet<()> = JoinSet::new();
+    let mut shutdown_rx_accept = shutdown_rx.clone();
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = result?;
+                let conn_guard = ConnectionGuard::new();
+                let svc = service.clone();
+                let mut rx = shutdown_rx.clone();
+                connections.spawn(async move {
+                    let _conn_guard = conn_guard;
+                    let io = TokioIo::new(stream);
+                    let conn = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        result = conn.as_mut() => {
+                            if let Err(e) = result {
+                                tracing::error!("connection error: {e}");
+                            }
+                        }
+                        _ = rx.changed() => {
+                            conn.as_mut().graceful_shutdown();
+                            if let Err(e) = conn.await {
+                                tracing::error!("connection error during drain: {e}");
+                            }
+                        }
+                    }
+                });
+            }
+            _ = shutdown_rx_accept.changed() => break,
+        }
+    }
+
+    drop(listener);
+    Ok(connections)
+}
+
+#[allow(clippy::too_many_arguments)] // server config values passed through
 pub async fn run(
     data_dir: &Path,
     host: &str,
@@ -563,6 +628,12 @@ pub async fn run(
         bg_tasks.push(spawn_scrub(&storage, scrub_interval, &shutdown_rx));
     }
 
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| anyhow::anyhow!("prometheus recorder: {e}"))?;
+
+    bg_tasks.push(spawn_metrics_updater(&storage, &shutdown_rx));
+
     let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(auth_provider.clone());
@@ -574,6 +645,7 @@ pub async fn run(
         storage: Arc::clone(&storage),
         auth_store: Arc::clone(&auth_store),
         min_disk_free_mb,
+        prometheus_handle,
     };
 
     if grpc_port > 0 {
@@ -583,40 +655,8 @@ pub async fn run(
     let listener = TcpListener::bind((host, port)).await?;
     tracing::info!("S3 HTTP listening on {}:{}", host, port);
 
-    let mut connections: JoinSet<()> = JoinSet::new();
-    let mut shutdown_rx_accept = shutdown_rx.clone();
+    let mut connections = accept_loop(listener, service, &shutdown_rx).await?;
 
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (stream, _addr) = result?;
-                let svc = service.clone();
-                let mut rx = shutdown_rx.clone();
-                connections.spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let conn = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc);
-                    tokio::pin!(conn);
-                    tokio::select! {
-                        result = conn.as_mut() => {
-                            if let Err(e) = result {
-                                tracing::error!("connection error: {e}");
-                            }
-                        }
-                        _ = rx.changed() => {
-                            conn.as_mut().graceful_shutdown();
-                            if let Err(e) = conn.await {
-                                tracing::error!("connection error during drain: {e}");
-                            }
-                        }
-                    }
-                });
-            }
-            _ = shutdown_rx_accept.changed() => break,
-        }
-    }
-
-    drop(listener);
     tokio::join!(
         drain_connections(&mut connections, shutdown_timeout),
         await_bg_tasks(&mut bg_tasks, shutdown_timeout),
@@ -692,4 +732,5 @@ mod tests {
         storage.end_compacting();
         assert!(!storage.is_compacting());
     }
+
 }

@@ -84,6 +84,8 @@ pub async fn stream_to_tmp(
     file.flush()
         .map_err(|e| Status::internal(format!("flush tmp: {e}")))?;
 
+    metrics::counter!("simple3_bytes_received_total").increment(size);
+
     let etag = format!("{:x}", hasher.finalize());
     Ok((etag, size, crc))
 }
@@ -110,6 +112,7 @@ pub fn spawn_download_stream(
 
             match data {
                 Ok(bytes) => {
+                    metrics::counter!("simple3_bytes_sent_total").increment(bytes.len() as u64);
                     let resp = GetObjectResponse {
                         response: Some(proto::get_object_response::Response::Data(bytes)),
                     };
@@ -145,6 +148,7 @@ pub async fn stream_object_chunks(
 
         match data {
             Ok(Ok(bytes)) => {
+                metrics::counter!("simple3_bytes_sent_total").increment(bytes.len() as u64);
                 let resp = BulkGetResponse {
                     response: Some(proto::bulk_get_response::Response::Data(bytes)),
                 };
@@ -231,6 +235,8 @@ pub async fn bulk_put_one_object(
     let etag_clone = etag.clone();
     let metadata = init.user_metadata.clone();
     let s = Arc::clone(store);
+
+    metrics::counter!("simple3_bytes_received_total").increment(size);
 
     let meta = tokio::task::spawn_blocking(move || {
         s.put_object_streamed(&key, &tmp_path, content_type, etag_clone, now, metadata, Some(crc))
