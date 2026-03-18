@@ -175,6 +175,26 @@ impl BucketStore {
             .unwrap_or("unknown")
             .to_owned();
 
+        let result = self.compact_segment_inner(segment_id);
+
+        let status = if result.is_ok() { "ok" } else { "error" };
+        metrics::histogram!(
+            "simple3_compaction_duration_seconds",
+            "bucket" => bucket_name.clone(),
+            "status" => status,
+        )
+        .record(start.elapsed().as_secs_f64());
+        metrics::counter!(
+            "simple3_compaction_runs_total",
+            "bucket" => bucket_name,
+            "status" => status,
+        )
+        .increment(1);
+
+        result
+    }
+
+    fn compact_segment_inner(&self, segment_id: u32) -> io::Result<()> {
         // If compacting active segment, rotate first so it becomes non-active
         {
             let mut w = self
@@ -203,24 +223,7 @@ impl BucketStore {
         self.set_seg_compacting(segment_id, true)?;
 
         // Phase 2: Swap file + update redb under per-segment write lock
-        let result =
-            self.apply_compaction(&seg_arc, &tmp_path, &seg_path, &updated, segment_id);
-
-        let status = if result.is_ok() { "ok" } else { "error" };
-        metrics::histogram!(
-            "simple3_compaction_duration_seconds",
-            "bucket" => bucket_name.clone(),
-            "status" => status,
-        )
-        .record(start.elapsed().as_secs_f64());
-        metrics::counter!(
-            "simple3_compaction_runs_total",
-            "bucket" => bucket_name,
-            "status" => status,
-        )
-        .increment(1);
-
-        result
+        self.apply_compaction(&seg_arc, &tmp_path, &seg_path, &updated, segment_id)
     }
 
     /// Compact all segments that have dead bytes.

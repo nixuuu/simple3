@@ -612,11 +612,11 @@ pub async fn run(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _addr) = result?;
-                metrics::gauge!("simple3_connections_active").increment(1.0);
+                let conn_guard = ConnectionGuard::new();
                 let svc = service.clone();
                 let mut rx = shutdown_rx.clone();
                 connections.spawn(async move {
-                    let _conn_guard = ConnectionGuard;
+                    let _conn_guard = conn_guard;
                     let io = TokioIo::new(stream);
                     let conn = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, svc);
