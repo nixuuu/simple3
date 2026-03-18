@@ -24,6 +24,7 @@ use s3s::dto::{
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
+use crate::metrics_util::DurationRecorder;
 use crate::storage::versioning::VersioningState;
 use crate::storage::{BucketStore, Storage};
 use crate::types::ObjectMeta;
@@ -66,6 +67,7 @@ async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<(S
     let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
     let mut hasher = Md5::new();
     let mut crc: u32 = 0;
+    let mut total_bytes = 0u64;
     let mut stream = body;
 
     while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("read request body: {e}"); s3_error!(InternalError) })? {
@@ -74,9 +76,11 @@ async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<(S
             .map_err(|e| { tracing::error!("write tmp file: {e}"); s3_error!(e, InternalError) })?;
         hasher.update(&chunk);
         crc = crc32c::crc32c_append(crc, &chunk);
+        total_bytes += chunk.len() as u64;
     }
     writer.flush().map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
 
+    metrics::counter!("simple3_bytes_received_total").increment(total_bytes);
     Ok((format!("{:x}", hasher.finalize()), crc))
 }
 
@@ -110,6 +114,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
+        let _timer = DurationRecorder::new("S3", "HeadBucket");
         let bucket = req.input.bucket;
         let _store = self.bucket(&bucket)?;
         Ok(S3Response::new(HeadBucketOutput::default()))
@@ -119,6 +124,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
+        let _timer = DurationRecorder::new("S3", "CreateBucket");
         let bucket = req.input.bucket;
         let storage = Arc::clone(&self.inner);
         let existed = blocking(move || storage.create_bucket(&bucket))
@@ -134,6 +140,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let _timer = DurationRecorder::new("S3", "DeleteBucket");
         let bucket = req.input.bucket;
         let store = self.bucket(&bucket)?;
         let storage = Arc::clone(&self.inner);
@@ -162,6 +169,7 @@ impl S3 for SimpleStorage {
         &self,
         _req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
+        let _timer = DurationRecorder::new("S3", "ListBuckets");
         let storage = Arc::clone(&self.inner);
         let names = blocking(move || storage.list_buckets())
             .await
@@ -187,6 +195,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let _timer = DurationRecorder::new("S3", "PutBucketVersioning");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -224,6 +233,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        let _timer = DurationRecorder::new("S3", "GetBucketVersioning");
         let store = self.bucket(&req.input.bucket)?;
 
         let state = blocking(move || store.get_versioning_state())
@@ -252,6 +262,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        let _timer = DurationRecorder::new("S3", "PutObject");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -297,6 +308,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        let _timer = DurationRecorder::new("S3", "GetObject");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -344,6 +356,7 @@ impl S3 for SimpleStorage {
 
         #[allow(clippy::cast_possible_wrap)]
         let content_length = data.len() as i64;
+        metrics::counter!("simple3_bytes_sent_total").increment(data.len() as u64);
         let stream =
             futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from(data)) });
         let body = StreamingBlob::wrap(stream);
@@ -374,6 +387,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let _timer = DurationRecorder::new("S3", "HeadObject");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -417,6 +431,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let _timer = DurationRecorder::new("S3", "CopyObject");
         let input = req.input;
 
         let (src_bucket, src_key, src_version_id) = match input.copy_source {
@@ -506,6 +521,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let _timer = DurationRecorder::new("S3", "DeleteObject");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -544,6 +560,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let _timer = DurationRecorder::new("S3", "DeleteObjects");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
         let quiet = input.delete.quiet.unwrap_or(false);
@@ -650,6 +667,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let _timer = DurationRecorder::new("S3", "ListObjectsV2");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -731,6 +749,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let _timer = DurationRecorder::new("S3", "ListObjectVersions");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -818,6 +837,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let _timer = DurationRecorder::new("S3", "CreateMultipartUpload");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -836,6 +856,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        let _timer = DurationRecorder::new("S3", "UploadPart");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -846,6 +867,8 @@ impl S3 for SimpleStorage {
         while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("upload_part: read body: {e}"); s3_error!(InternalError) })? {
             data.extend_from_slice(&chunk);
         }
+
+        metrics::counter!("simple3_bytes_received_total").increment(data.len() as u64);
 
         let upload_id = input.upload_id;
         let part_number = input.part_number;
@@ -864,6 +887,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let _timer = DurationRecorder::new("S3", "CompleteMultipartUpload");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
@@ -920,6 +944,7 @@ impl S3 for SimpleStorage {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let _timer = DurationRecorder::new("S3", "AbortMultipartUpload");
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
