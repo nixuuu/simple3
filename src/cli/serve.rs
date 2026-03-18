@@ -186,7 +186,12 @@ pub fn json_response(status: u16, body: &impl Serialize) -> s3s::HttpResponse {
         .status(status)
         .header("content-type", "application/json")
         .body(s3s::Body::from(json))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            hyper::Response::builder()
+                .status(500)
+                .body(s3s::Body::from(format!(r#"{{"error":"{e}"}}"#)))
+                .expect("fallback response with no custom headers cannot fail")
+        })
 }
 
 fn stats_to_json(stats: &[simple3::storage::SegmentStat]) -> Vec<SegmentStatJson> {
