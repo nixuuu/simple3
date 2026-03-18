@@ -527,12 +527,13 @@ async fn drain_connections(connections: &mut JoinSet<()>, timeout_secs: u64) {
     }
 }
 
-/// Accept HTTP connections until a shutdown signal is received, then drain in-flight requests.
+/// Accept HTTP connections until a shutdown signal is received.
+/// Returns the in-flight connection set for draining by the caller.
 async fn accept_loop(
     listener: TcpListener,
     service: AdminService,
     shutdown_rx: &watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<JoinSet<()>> {
     let mut connections: JoinSet<()> = JoinSet::new();
     let mut shutdown_rx_accept = shutdown_rx.clone();
 
@@ -569,8 +570,7 @@ async fn accept_loop(
     }
 
     drop(listener);
-    drain_connections(&mut connections, 30).await;
-    Ok(())
+    Ok(connections)
 }
 
 #[allow(clippy::too_many_arguments)] // server config values passed through
@@ -650,9 +650,12 @@ pub async fn run(
     let listener = TcpListener::bind((host, port)).await?;
     tracing::info!("S3 HTTP listening on {}:{}", host, port);
 
-    accept_loop(listener, service, &shutdown_rx).await?;
+    let mut connections = accept_loop(listener, service, &shutdown_rx).await?;
 
-    await_bg_tasks(&mut bg_tasks, shutdown_timeout).await;
+    tokio::join!(
+        drain_connections(&mut connections, shutdown_timeout),
+        await_bg_tasks(&mut bg_tasks, shutdown_timeout),
+    );
 
     match tokio::task::spawn_blocking(move || storage.sync_all()).await {
         Ok(Ok(())) => {}
