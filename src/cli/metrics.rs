@@ -91,8 +91,9 @@ pub fn spawn_metrics_updater(
                     pb
                 })
                 .await;
-                if let Ok(pb) = result {
-                    prev_buckets = pb;
+                match result {
+                    Ok(pb) => prev_buckets = pb,
+                    Err(e) => tracing::error!("metrics gauge refresh task panicked: {e}"),
                 }
             }
             tokio::select! {

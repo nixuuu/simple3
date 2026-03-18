@@ -527,8 +527,53 @@ async fn drain_connections(connections: &mut JoinSet<()>, timeout_secs: u64) {
     }
 }
 
+/// Accept HTTP connections until a shutdown signal is received, then drain in-flight requests.
+async fn accept_loop(
+    listener: TcpListener,
+    service: AdminService,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut connections: JoinSet<()> = JoinSet::new();
+    let mut shutdown_rx_accept = shutdown_rx.clone();
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = result?;
+                let conn_guard = ConnectionGuard::new();
+                let svc = service.clone();
+                let mut rx = shutdown_rx.clone();
+                connections.spawn(async move {
+                    let _conn_guard = conn_guard;
+                    let io = TokioIo::new(stream);
+                    let conn = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        result = conn.as_mut() => {
+                            if let Err(e) = result {
+                                tracing::error!("connection error: {e}");
+                            }
+                        }
+                        _ = rx.changed() => {
+                            conn.as_mut().graceful_shutdown();
+                            if let Err(e) = conn.await {
+                                tracing::error!("connection error during drain: {e}");
+                            }
+                        }
+                    }
+                });
+            }
+            _ = shutdown_rx_accept.changed() => break,
+        }
+    }
+
+    drop(listener);
+    drain_connections(&mut connections, 30).await;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // server config values passed through
-#[allow(clippy::too_many_lines)] // sequential server setup (storage, auth, signals, prometheus, listener)
 pub async fn run(
     data_dir: &Path,
     host: &str,
@@ -605,46 +650,9 @@ pub async fn run(
     let listener = TcpListener::bind((host, port)).await?;
     tracing::info!("S3 HTTP listening on {}:{}", host, port);
 
-    let mut connections: JoinSet<()> = JoinSet::new();
-    let mut shutdown_rx_accept = shutdown_rx.clone();
+    accept_loop(listener, service, &shutdown_rx).await?;
 
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (stream, _addr) = result?;
-                let conn_guard = ConnectionGuard::new();
-                let svc = service.clone();
-                let mut rx = shutdown_rx.clone();
-                connections.spawn(async move {
-                    let _conn_guard = conn_guard;
-                    let io = TokioIo::new(stream);
-                    let conn = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc);
-                    tokio::pin!(conn);
-                    tokio::select! {
-                        result = conn.as_mut() => {
-                            if let Err(e) = result {
-                                tracing::error!("connection error: {e}");
-                            }
-                        }
-                        _ = rx.changed() => {
-                            conn.as_mut().graceful_shutdown();
-                            if let Err(e) = conn.await {
-                                tracing::error!("connection error during drain: {e}");
-                            }
-                        }
-                    }
-                });
-            }
-            _ = shutdown_rx_accept.changed() => break,
-        }
-    }
-
-    drop(listener);
-    tokio::join!(
-        drain_connections(&mut connections, shutdown_timeout),
-        await_bg_tasks(&mut bg_tasks, shutdown_timeout),
-    );
+    await_bg_tasks(&mut bg_tasks, shutdown_timeout).await;
 
     match tokio::task::spawn_blocking(move || storage.sync_all()).await {
         Ok(Ok(())) => {}
