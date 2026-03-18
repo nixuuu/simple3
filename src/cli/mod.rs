@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 mod admin_auth;
 mod compact;
 mod health;
+mod metrics;
 pub mod client;
 pub mod config;
 pub mod keys;

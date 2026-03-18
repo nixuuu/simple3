@@ -146,7 +146,9 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
                     .status(200)
                     .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
                     .body(s3s::Body::from(body))
-                    .expect("valid response"))
+                    .unwrap_or_else(|e| {
+                        json_response(500, &serde_json::json!({"error": format!("metrics render: {e}")}))
+                    }))
             })
         } else if *req.method() == hyper::Method::GET && path == "/health" {
             Box::pin(async {
@@ -375,13 +377,7 @@ impl Drop for CompactingGuard<'_> {
     }
 }
 
-struct ConnectionGuard;
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        metrics::gauge!("simple3_connections_active").decrement(1.0);
-    }
-}
+use super::metrics::{ConnectionGuard, spawn_metrics_updater};
 
 fn spawn_signal_handler(
     mut sigterm: tokio::signal::unix::Signal,
@@ -462,84 +458,6 @@ fn spawn_scrub(
     handle
 }
 
-fn update_storage_gauges(
-    storage: &Storage,
-    prev_buckets: &mut std::collections::HashSet<String>,
-) {
-    let Ok(buckets) = storage.list_buckets() else {
-        return;
-    };
-    let current: std::collections::HashSet<String> = buckets.iter().cloned().collect();
-
-    // Zero out gauges for deleted buckets
-    for removed in prev_buckets.difference(&current) {
-        let b = removed.clone();
-        metrics::gauge!("simple3_segments_total", "bucket" => b.clone()).set(0.0);
-        metrics::gauge!("simple3_dead_bytes", "bucket" => b.clone()).set(0.0);
-        metrics::gauge!("simple3_dead_space_ratio", "bucket" => b).set(0.0);
-    }
-
-    for name in &buckets {
-        let Some(store) = storage.get_bucket(name).ok().flatten() else {
-            continue;
-        };
-        let Ok(stats) = store.segment_stats() else {
-            continue;
-        };
-        let seg_count = stats.len();
-        let total_dead: u64 = stats.iter().map(|s| s.dead_bytes).sum();
-        let total_size: u64 = stats.iter().map(|s| s.size).sum();
-
-        #[allow(clippy::cast_precision_loss)] // u64 -> f64: gauge values; sub-ULP loss irrelevant for monitoring
-        let ratio = if total_size > 0 {
-            total_dead as f64 / total_size as f64
-        } else {
-            0.0
-        };
-
-        let bucket = name.clone();
-        #[allow(clippy::cast_precision_loss)] // u64/usize -> f64: gauge values; sub-ULP loss irrelevant
-        {
-            metrics::gauge!("simple3_segments_total", "bucket" => bucket.clone())
-                .set(seg_count as f64);
-            metrics::gauge!("simple3_dead_bytes", "bucket" => bucket.clone())
-                .set(total_dead as f64);
-        }
-        metrics::gauge!("simple3_dead_space_ratio", "bucket" => bucket).set(ratio);
-    }
-
-    *prev_buckets = current;
-}
-
-fn spawn_metrics_updater(
-    storage: &Arc<Storage>,
-    shutdown_rx: &watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    let storage = Arc::clone(storage);
-    let mut rx = shutdown_rx.clone();
-    tokio::spawn(async move {
-        let mut prev_buckets = std::collections::HashSet::new();
-        loop {
-            {
-                let s = Arc::clone(&storage);
-                let mut pb = std::mem::take(&mut prev_buckets);
-                let result = tokio::task::spawn_blocking(move || {
-                    update_storage_gauges(&s, &mut pb);
-                    pb
-                })
-                .await;
-                if let Ok(pb) = result {
-                    prev_buckets = pb;
-                }
-            }
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(15)) => {}
-                _ = rx.changed() => break,
-            }
-        }
-    })
-}
-
 async fn spawn_grpc(
     storage: &Arc<Storage>,
     auth_store: &Arc<AuthStore>,
@@ -610,7 +528,7 @@ async fn drain_connections(connections: &mut JoinSet<()>, timeout_secs: u64) {
 }
 
 #[allow(clippy::too_many_arguments)] // server config values passed through
-#[allow(clippy::too_many_lines)] // sequential setup (storage, auth, signals, prometheus, listener) resists splitting
+#[allow(clippy::too_many_lines)] // sequential server setup (storage, auth, signals, prometheus, listener)
 pub async fn run(
     data_dir: &Path,
     host: &str,
@@ -799,67 +717,4 @@ mod tests {
         assert!(!storage.is_compacting());
     }
 
-    #[test]
-    fn test_update_storage_gauges_sets_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
-        storage.create_bucket("metrics-test").unwrap();
-
-        let mut prev = std::collections::HashSet::new();
-        update_storage_gauges(&storage, &mut prev);
-
-        assert_eq!(prev.len(), 1);
-        assert!(prev.contains("metrics-test"));
-    }
-
-    #[test]
-    fn test_update_storage_gauges_cleans_deleted_buckets() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
-        storage.create_bucket("alive").unwrap();
-        storage.create_bucket("doomed").unwrap();
-
-        let mut prev = std::collections::HashSet::new();
-        update_storage_gauges(&storage, &mut prev);
-        assert_eq!(prev.len(), 2);
-
-        // Delete one bucket
-        storage.delete_bucket("doomed").unwrap();
-        update_storage_gauges(&storage, &mut prev);
-
-        // prev_buckets should now only contain "alive"
-        assert_eq!(prev.len(), 1);
-        assert!(prev.contains("alive"));
-        assert!(!prev.contains("doomed"));
-    }
-
-    #[test]
-    fn test_prometheus_render_contains_metrics() {
-        // Build a recorder + handle without installing globally
-        let recorder =
-            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        // Install so metrics macros work (may fail if another test already installed)
-        let _ = metrics::set_global_recorder(recorder);
-
-        // Record a metric via the facade
-        metrics::histogram!(
-            "simple3_request_duration_seconds",
-            "method" => "S3",
-            "operation" => "PutObject",
-        )
-        .record(0.042);
-
-        metrics::counter!("simple3_bytes_received_total").increment(1024);
-
-        let output = handle.render();
-        assert!(
-            output.contains("simple3_request_duration_seconds"),
-            "render output should contain histogram: {output}"
-        );
-        assert!(
-            output.contains("simple3_bytes_received_total"),
-            "render output should contain counter: {output}"
-        );
-    }
 }

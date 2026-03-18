@@ -236,14 +236,14 @@ pub async fn bulk_put_one_object(
     let metadata = init.user_metadata.clone();
     let s = Arc::clone(store);
 
+    metrics::counter!("simple3_bytes_received_total").increment(size);
+
     let meta = tokio::task::spawn_blocking(move || {
         s.put_object_streamed(&key, &tmp_path, content_type, etag_clone, now, metadata, Some(crc))
     })
     .await
     .map_err(|e| Status::internal(format!("task panicked: {e}")))?
     .map_err(map_io_err)?;
-
-    metrics::counter!("simple3_bytes_received_total").increment(size);
 
     let content_md5 = meta.content_md5.unwrap_or_default();
     Ok((etag, content_md5, size))
