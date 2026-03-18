@@ -13,6 +13,8 @@ use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 
+use tracing::Instrument;
+
 use simple3::auth::s3_auth::AuthProvider;
 use simple3::auth::types::BootstrapResult;
 use simple3::auth::AuthStore;
@@ -138,8 +140,36 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
     type Future = ServiceFuture;
 
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        let request_id = super::request_id::generate_request_id();
+        let method = req.method().clone();
         let path = req.uri().path().to_owned();
-        if *req.method() == hyper::Method::GET && path == "/metrics" {
+        let span = tracing::info_span!(
+            "http_request",
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+        );
+
+        let fut = self.dispatch(req, &method, &path);
+        Box::pin(
+            async move {
+                let mut resp = fut.await?;
+                super::request_id::set_request_id_header(&mut resp, &request_id);
+                Ok(resp)
+            }
+            .instrument(span),
+        )
+    }
+}
+
+impl AdminService {
+    fn dispatch(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+        method: &hyper::Method,
+        path: &str,
+    ) -> ServiceFuture {
+        if *method == hyper::Method::GET && path == "/metrics" {
             let body = self.prometheus_handle.render();
             Box::pin(async move {
                 Ok(hyper::Response::builder()
@@ -150,11 +180,11 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
                         json_response(500, &serde_json::json!({"error": format!("metrics render: {e}")}))
                     }))
             })
-        } else if *req.method() == hyper::Method::GET && path == "/health" {
+        } else if *method == hyper::Method::GET && path == "/health" {
             Box::pin(async {
                 Ok(json_response(200, &serde_json::json!({"status": "ok"})))
             })
-        } else if *req.method() == hyper::Method::GET && path == "/ready" {
+        } else if *method == hyper::Method::GET && path == "/ready" {
             let storage = Arc::clone(&self.storage);
             let min_free = self.min_disk_free_mb;
             Box::pin(async move {
@@ -166,7 +196,8 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
             })
         } else if path.starts_with("/_/keys") || path.starts_with("/_/policies") {
             let auth_store = Arc::clone(&self.auth_store);
-            let method = req.method().clone();
+            let method = method.clone();
+            let path = path.to_owned();
             Box::pin(async move {
                 Ok(super::admin_auth::handle_admin_auth(req, &path, &method, auth_store).await)
             })
@@ -478,6 +509,7 @@ async fn spawn_grpc(
     let mut rx = shutdown_rx.clone();
     let handle = tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
+            .layer(super::request_id::RequestIdLayer)
             .add_service(
                 simple3::grpc::proto::simple3_server::Simple3Server::new(grpc_svc)
                     .max_decoding_message_size(64 * 1024 * 1024)
@@ -681,6 +713,99 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_admin_service(dir: &std::path::Path) -> AdminService {
+        let storage = Arc::new(Storage::open(dir).unwrap());
+        let s3 = SimpleStorage::new(Arc::clone(&storage));
+        let (auth_store, _) = simple3::auth::AuthStore::open(dir).unwrap();
+        let auth_store = Arc::new(auth_store);
+        let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
+        let mut builder = S3ServiceBuilder::new(s3);
+        builder.set_auth(auth_provider.clone());
+        builder.set_access(auth_provider);
+        let s3_service = builder.build();
+        let recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let prometheus_handle = recorder.handle();
+
+        AdminService {
+            s3: s3_service,
+            storage,
+            auth_store,
+            min_disk_free_mb: 0,
+            prometheus_handle,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_id_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service(dir.path());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let header = resp
+            .headers()
+            .get("x-request-id")
+            .expect("response must include x-request-id header");
+        let id_str = header.to_str().unwrap();
+        uuid::Uuid::parse_str(id_str).expect("x-request-id must be a valid UUID");
+    }
+
+    #[tokio::test]
+    async fn test_request_id_unique_per_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service(dir.path());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+                let svc = service.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let r1 = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap();
+        let r2 = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap();
+
+        let id1 = r1.headers().get("x-request-id").unwrap().to_str().unwrap();
+        let id2 = r2.headers().get("x-request-id").unwrap().to_str().unwrap();
+        assert_ne!(id1, id2, "each request must get a unique request ID");
+    }
 
     #[test]
     fn test_ready_ok() {

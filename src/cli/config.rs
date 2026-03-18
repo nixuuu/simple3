@@ -20,6 +20,7 @@ pub struct ServerConfig {
     pub port: Option<u16>,
     pub grpc_port: Option<u16>,
     pub shutdown_timeout: Option<u64>,
+    pub log_format: Option<super::LogFormat>,
 }
 
 #[derive(Deserialize, Default)]
