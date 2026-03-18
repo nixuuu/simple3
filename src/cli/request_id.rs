@@ -57,11 +57,10 @@ where
 
     fn call(&mut self, req: hyper::Request<ReqBody>) -> Self::Future {
         let request_id = generate_request_id();
-        let path = req.uri().path().to_owned();
         let span = tracing::info_span!(
             "grpc_request",
             request_id = %request_id,
-            path = %path,
+            path = %req.uri().path(),
         );
         // Clone-and-swap: `self.inner` was marked ready by `poll_ready`, so we
         // move it into the future and replace it with a fresh clone. This follows
