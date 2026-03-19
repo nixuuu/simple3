@@ -511,6 +511,9 @@ impl S3 for SimpleStorage {
             if e.kind() == io::ErrorKind::NotFound {
                 return s3_error!(NoSuchKey);
             }
+            if e.kind() == io::ErrorKind::InvalidData {
+                return s3_error!(EntityTooLarge);
+            }
             tracing::error!("copy_object: {e}");
             s3_error!(e, InternalError)
         })?;
@@ -878,10 +881,14 @@ impl S3 for SimpleStorage {
 
         let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
+        let max_size = self.limits.max_object_size;
         let mut data = Vec::new();
         let mut stream = body;
         while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("upload_part: read body: {e}"); s3_error!(InternalError) })? {
             data.extend_from_slice(&chunk);
+            if max_size > 0 && data.len() as u64 > max_size {
+                return Err(s3_error!(EntityTooLarge));
+            }
         }
 
         metrics::counter!("simple3_bytes_received_total").increment(data.len() as u64);
@@ -946,7 +953,13 @@ impl S3 for SimpleStorage {
             )
         })
         .await
-        .map_err(|e| { tracing::error!("complete_multipart_upload: {e}"); s3_error!(e, InternalError) })?;
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidData {
+                return s3_error!(EntityTooLarge);
+            }
+            tracing::error!("complete_multipart_upload: {e}");
+            s3_error!(e, InternalError)
+        })?;
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),

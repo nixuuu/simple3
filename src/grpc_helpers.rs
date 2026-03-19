@@ -26,6 +26,7 @@ pub fn map_io_err(e: io::Error) -> Status {
         io::ErrorKind::NotFound => Status::not_found(e.to_string()),
         io::ErrorKind::AlreadyExists => Status::already_exists(e.to_string()),
         io::ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
+        io::ErrorKind::InvalidData => Status::invalid_argument(e.to_string()),
         _ => Status::internal(e.to_string()),
     }
 }
