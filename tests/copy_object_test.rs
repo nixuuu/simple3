@@ -326,3 +326,46 @@ async fn test_copy_special_chars_key() {
     let data = get.body.collect().await.unwrap().into_bytes();
     assert_eq!(&data[..], body);
 }
+
+/// Regression test: keys containing characters that require percent-encoding
+/// (?, #, %) must round-trip through CopyObject correctly. The s3s library
+/// decodes these at parse time; this test guards against regressions.
+#[tokio::test]
+async fn test_copy_percent_encoded_chars_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_server(dir.path()).await;
+    let client = make_client(srv.port, &srv.access_key, &srv.secret_key);
+
+    client.create_bucket().bucket("test").send().await.unwrap();
+
+    let body = b"percent encoded data";
+    let key = "docs/file?version=2#section&tag=100%done.txt";
+
+    client
+        .put_object()
+        .bucket("test")
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .copy_object()
+        .bucket("test")
+        .key("backup/encoded-copy.txt")
+        .copy_source(format!("test/{}", urlencoding::encode(key)))
+        .send()
+        .await
+        .unwrap();
+
+    let get = client
+        .get_object()
+        .bucket("test")
+        .key("backup/encoded-copy.txt")
+        .send()
+        .await
+        .unwrap();
+    let data = get.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&data[..], body);
+}

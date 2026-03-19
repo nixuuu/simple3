@@ -1,3 +1,6 @@
+mod common;
+use common::write_part;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -173,8 +176,8 @@ fn test_crash_during_multipart_before_commit() {
 
     // Start multipart but don't complete
     let upload_id = bucket.create_multipart_upload();
-    bucket.upload_part(&upload_id, 1, b"part-one-").unwrap();
-    bucket.upload_part(&upload_id, 2, b"part-two").unwrap();
+    write_part(&bucket, &upload_id, 1, b"part-one-");
+    write_part(&bucket, &upload_id, 2, b"part-two");
 
     let bd = bucket.bucket_dir().to_path_buf();
     drop(bucket);
@@ -220,8 +223,8 @@ fn test_crash_during_multipart_after_commit() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let upload_id = bucket.create_multipart_upload();
-    let e1 = bucket.upload_part(&upload_id, 1, b"part-one-").unwrap();
-    let e2 = bucket.upload_part(&upload_id, 2, b"part-two").unwrap();
+    let e1 = write_part(&bucket, &upload_id, 1, b"part-one-");
+    let e2 = write_part(&bucket, &upload_id, 2, b"part-two");
     let parts = vec![(1, e1), (2, e2)];
     bucket
         .complete_multipart_upload(&upload_id, "mpu_obj", &parts, None, 1000, HashMap::new(), 0)

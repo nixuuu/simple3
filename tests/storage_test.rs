@@ -1,3 +1,6 @@
+mod common;
+use common::write_part;
+
 use md5::{Digest, Md5};
 use simple3::storage::Storage;
 use simple3::types::ObjectMeta;
@@ -482,9 +485,9 @@ fn test_multipart_upload_basic() {
     assert!(!upload_id.is_empty());
 
     // Upload 3 parts
-    let etag1 = bucket.upload_part(&upload_id, 1, b"AAAA").unwrap();
-    let etag2 = bucket.upload_part(&upload_id, 2, b"BBBB").unwrap();
-    let etag3 = bucket.upload_part(&upload_id, 3, b"CCCC").unwrap();
+    let etag1 = write_part(&bucket, &upload_id, 1, b"AAAA");
+    let etag2 = write_part(&bucket, &upload_id, 2, b"BBBB");
+    let etag3 = write_part(&bucket, &upload_id, 3, b"CCCC");
 
     // Complete
     let parts = vec![(1, etag1), (2, etag2), (3, etag3)];
@@ -524,9 +527,9 @@ fn test_multipart_upload_out_of_order() {
     let upload_id = bucket.create_multipart_upload();
 
     // Upload parts out of order
-    let etag3 = bucket.upload_part(&upload_id, 3, b"CCC").unwrap();
-    let etag1 = bucket.upload_part(&upload_id, 1, b"AAA").unwrap();
-    let etag2 = bucket.upload_part(&upload_id, 2, b"BBB").unwrap();
+    let etag3 = write_part(&bucket, &upload_id, 3, b"CCC");
+    let etag1 = write_part(&bucket, &upload_id, 1, b"AAA");
+    let etag2 = write_part(&bucket, &upload_id, 2, b"BBB");
 
     let parts = vec![(3, etag3), (1, etag1), (2, etag2)];
     let (meta, _) = bucket
@@ -546,8 +549,8 @@ fn test_abort_multipart_upload() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let upload_id = bucket.create_multipart_upload();
-    bucket.upload_part(&upload_id, 1, b"data").unwrap();
-    bucket.upload_part(&upload_id, 2, b"more").unwrap();
+    write_part(&bucket, &upload_id, 1, b"data");
+    write_part(&bucket, &upload_id, 2, b"more");
 
     // Part files exist
     let bucket_dir = dir.path().join("b");
@@ -657,8 +660,8 @@ fn test_multipart_overwrite_compacts() {
 
     // Overwrite via multipart: 6 bytes data total (append-only: file grows)
     let uid = bucket.create_multipart_upload();
-    let e1 = bucket.upload_part(&uid, 1, b"AAA").unwrap();
-    let e2 = bucket.upload_part(&uid, 2, b"BBB").unwrap();
+    let e1 = write_part(&bucket, &uid, 1, b"AAA");
+    let e2 = write_part(&bucket, &uid, 2, b"BBB");
     let (meta, _) = bucket
         .complete_multipart_upload(&uid, "key", &[(1, e1), (2, e2)], None, 0, HashMap::new(), 0)
         .unwrap();
@@ -959,8 +962,8 @@ fn test_verify_multipart_upload() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let upload_id = bucket.create_multipart_upload();
-    let etag1 = bucket.upload_part(&upload_id, 1, b"part one ").unwrap();
-    let etag2 = bucket.upload_part(&upload_id, 2, b"part two").unwrap();
+    let etag1 = write_part(&bucket, &upload_id, 1, b"part one ");
+    let etag2 = write_part(&bucket, &upload_id, 2, b"part two");
     let parts = vec![(1, etag1), (2, etag2)];
     bucket
         .complete_multipart_upload(&upload_id, "mpu_obj", &parts, None, 0, HashMap::new(), 0)
@@ -1084,8 +1087,8 @@ fn test_backup_restore_cold_copy() {
 
     // 3) Multipart upload
     let upload_id = bucket.create_multipart_upload();
-    let etag_p1 = bucket.upload_part(&upload_id, 1, b"alpha-").unwrap();
-    let etag_p2 = bucket.upload_part(&upload_id, 2, b"beta").unwrap();
+    let etag_p1 = write_part(&bucket, &upload_id, 1, b"alpha-");
+    let etag_p2 = write_part(&bucket, &upload_id, 2, b"beta");
     let parts = vec![(1, etag_p1), (2, etag_p2)];
     bucket
         .complete_multipart_upload(&upload_id, "multi.bin", &parts, None, 300, HashMap::new(), 0)

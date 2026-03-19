@@ -1,7 +1,10 @@
 // Included by multiple test binaries; not all items used by each.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use md5::Digest;
 
 use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
 use hyper_util::rt::TokioIo;
@@ -141,6 +144,25 @@ pub fn container_host() -> &'static str {
     } else {
         "host.docker.internal"
     }
+}
+
+static TEST_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// Write data to a temp file and upload as a multipart part.
+/// Shared helper used by storage_test and crash_recovery_test.
+pub fn write_part(
+    bucket: &simple3::storage::BucketStore,
+    upload_id: &str,
+    part_number: i32,
+    data: &[u8],
+) -> String {
+    let id = TEST_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = bucket.bucket_dir().join(format!(".tmp_test_{id}"));
+    std::fs::write(&tmp, data).unwrap();
+    let md5_hex = format!("{:x}", md5::Md5::digest(data));
+    bucket
+        .upload_part(upload_id, part_number, &tmp, &md5_hex)
+        .unwrap()
 }
 
 pub fn make_client(port: u16, access_key: &str, secret_key: &str) -> aws_sdk_s3::Client {
