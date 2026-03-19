@@ -26,6 +26,7 @@ pub fn map_io_err(e: io::Error) -> Status {
         io::ErrorKind::NotFound => Status::not_found(e.to_string()),
         io::ErrorKind::AlreadyExists => Status::already_exists(e.to_string()),
         io::ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
+        io::ErrorKind::InvalidData => Status::invalid_argument(e.to_string()),
         _ => Status::internal(e.to_string()),
     }
 }
@@ -56,9 +57,11 @@ pub fn segments_to_proto(stats: Vec<SegmentStat>) -> Vec<proto::SegmentStat> {
 }
 
 /// Write incoming stream chunks to a temp file, computing MD5 and CRC32C.
+/// When `max_size > 0`, rejects uploads exceeding the limit.
 pub async fn stream_to_tmp(
     stream: &mut Streaming<PutObjectRequest>,
     tmp_path: &std::path::Path,
+    max_size: u64,
 ) -> Result<(String, u64, u32), Status> {
     let mut file =
         std::fs::File::create(tmp_path).map_err(|e| Status::internal(format!("create tmp: {e}")))?;
@@ -72,14 +75,20 @@ pub async fn stream_to_tmp(
                 "expected data chunk after init message",
             ));
         };
-        file.write_all(&chunk)
-            .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
-        hasher.update(&chunk);
-        crc = crc32c::crc32c_append(crc, &chunk);
         #[allow(clippy::cast_possible_truncation)]
         {
             size += chunk.len() as u64;
         }
+        if max_size > 0 && size > max_size {
+            std::fs::remove_file(tmp_path).ok();
+            return Err(Status::invalid_argument(format!(
+                "EntityTooLarge: object size {size} exceeds limit {max_size}"
+            )));
+        }
+        file.write_all(&chunk)
+            .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
+        hasher.update(&chunk);
+        crc = crc32c::crc32c_append(crc, &chunk);
     }
     file.flush()
         .map_err(|e| Status::internal(format!("flush tmp: {e}")))?;
@@ -175,6 +184,7 @@ pub async fn bulk_put_one_object(
     init: &PutObjectInit,
     stream: &mut Streaming<BulkPutRequest>,
     store: &Arc<BucketStore>,
+    max_size: u64,
 ) -> Result<(String, String, u64), Status> {
     let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_path = store
@@ -199,16 +209,22 @@ pub async fn bulk_put_one_object(
 
         match msg.request {
             Some(proto::bulk_put_request::Request::Data(chunk)) => {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    size += chunk.len() as u64;
+                }
+                if max_size > 0 && size > max_size {
+                    std::fs::remove_file(&tmp_path).ok();
+                    return Err(Status::invalid_argument(format!(
+                        "EntityTooLarge: object size {size} exceeds limit {max_size}"
+                    )));
+                }
                 if let Err(e) = file.write_all(&chunk) {
                     std::fs::remove_file(&tmp_path).ok();
                     return Err(Status::internal(e.to_string()));
                 }
                 hasher.update(&chunk);
                 crc = crc32c::crc32c_append(crc, &chunk);
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    size += chunk.len() as u64;
-                }
             }
             Some(proto::bulk_put_request::Request::Init(_)) => break,
             None => {}

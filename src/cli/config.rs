@@ -21,6 +21,8 @@ pub struct ServerConfig {
     pub grpc_port: Option<u16>,
     pub shutdown_timeout: Option<u64>,
     pub log_format: Option<super::LogFormat>,
+    /// Per-IP rate limit in requests/second (0 = disabled)
+    pub rate_limit_rps: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -30,6 +32,10 @@ pub struct StorageConfig {
     pub autovacuum_threshold: Option<f64>,
     pub scrub_interval: Option<u64>,
     pub min_disk_free_mb: Option<u64>,
+    /// Maximum object size in megabytes (0 = unlimited)
+    pub max_object_size_mb: Option<u64>,
+    /// Maximum keys per `ListObjects` page
+    pub max_list_keys: Option<u32>,
 }
 
 // Parsed from TOML but not yet wired into server startup

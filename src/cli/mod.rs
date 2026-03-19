@@ -6,12 +6,14 @@ mod admin_auth;
 mod compact;
 mod health;
 mod metrics;
+pub mod rate_limit;
 mod request_id;
 pub mod client;
 pub mod config;
 pub mod keys;
 pub mod policy_cmd;
 pub mod serve;
+pub mod serve_config;
 pub mod util;
 mod verify;
 
@@ -87,6 +89,15 @@ enum Command {
         /// Minimum free disk space in MB; /ready returns 503 below this (0 = disabled)
         #[arg(long)]
         min_disk_free_mb: Option<u64>,
+        /// Maximum object size in megabytes (0 = unlimited, default 5120 = 5 GB)
+        #[arg(long)]
+        max_object_size_mb: Option<u64>,
+        /// Maximum keys per `ListObjects` page (default 1000)
+        #[arg(long)]
+        max_list_keys: Option<u32>,
+        /// Per-IP rate limit in requests/second (0 = disabled)
+        #[arg(long)]
+        rate_limit_rps: Option<u32>,
     },
     /// Check if the running server is healthy
     Health,
@@ -214,6 +225,23 @@ enum Command {
     },
 }
 
+/// Resolve `Limits` from CLI args (if provided) falling back to TOML config, then defaults.
+fn resolve_limits(
+    max_obj_mb: Option<u64>,
+    max_list: Option<u32>,
+    cfg: &config::StorageConfig,
+) -> simple3::limits::Limits {
+    let mb = max_obj_mb.or(cfg.max_object_size_mb).unwrap_or(5120);
+    // saturating_mul guards against overflow on very large MB values
+    let max_object_size = mb.saturating_mul(1024 * 1024);
+    #[allow(clippy::cast_possible_truncation)] // u32 -> usize: max_list_keys fits in usize on all platforms
+    let max_list_keys = max_list.or(cfg.max_list_keys).unwrap_or(1000) as usize;
+    simple3::limits::Limits {
+        max_object_size,
+        max_list_keys,
+    }
+}
+
 #[allow(clippy::too_many_lines)] // single dispatch for all subcommands, splitting would hurt readability
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -311,17 +339,7 @@ pub async fn run() -> anyhow::Result<()> {
                 .or(cfg.server.log_format)
                 .unwrap_or_default();
             init_logging(log_format);
-            let (
-                host,
-                port,
-                av_interval,
-                av_threshold,
-                max_seg_mb,
-                grpc_port,
-                scrub_interval,
-                shutdown_timeout,
-                min_disk_free_mb,
-            ) = match cmd {
+            let serve_cfg = match cmd {
                 Some(Command::Serve {
                     host,
                     port,
@@ -332,46 +350,43 @@ pub async fn run() -> anyhow::Result<()> {
                     scrub_interval,
                     shutdown_timeout,
                     min_disk_free_mb,
-                }) => (
+                    max_object_size_mb,
+                    max_list_keys,
+                    rate_limit_rps,
+                }) => serve_config::ServeConfig {
                     host,
                     port,
+                    grpc_port,
                     autovacuum_interval,
                     autovacuum_threshold,
                     max_segment_size_mb,
-                    grpc_port,
                     scrub_interval,
-                    shutdown_timeout
+                    shutdown_timeout: shutdown_timeout
                         .or(cfg.server.shutdown_timeout)
                         .unwrap_or(30),
-                    min_disk_free_mb
+                    min_disk_free_mb: min_disk_free_mb
                         .or(cfg.storage.min_disk_free_mb)
                         .unwrap_or(0),
-                ),
-                _ => (
-                    cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
-                    cfg.server.port.unwrap_or(8080),
-                    cfg.storage.autovacuum_interval.unwrap_or(300),
-                    cfg.storage.autovacuum_threshold.unwrap_or(0.5),
-                    cfg.storage.max_segment_size_mb.unwrap_or(4096),
-                    cfg.server.grpc_port.unwrap_or(50051),
-                    cfg.storage.scrub_interval.unwrap_or(3600),
-                    cfg.server.shutdown_timeout.unwrap_or(30),
-                    cfg.storage.min_disk_free_mb.unwrap_or(0),
-                ),
+                    rate_limit_rps: rate_limit_rps
+                        .or(cfg.server.rate_limit_rps)
+                        .unwrap_or(0),
+                    limits: resolve_limits(max_object_size_mb, max_list_keys, &cfg.storage),
+                },
+                _ => serve_config::ServeConfig {
+                    host: cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
+                    port: cfg.server.port.unwrap_or(8080),
+                    grpc_port: cfg.server.grpc_port.unwrap_or(50051),
+                    autovacuum_interval: cfg.storage.autovacuum_interval.unwrap_or(300),
+                    autovacuum_threshold: cfg.storage.autovacuum_threshold.unwrap_or(0.5),
+                    max_segment_size_mb: cfg.storage.max_segment_size_mb.unwrap_or(4096),
+                    scrub_interval: cfg.storage.scrub_interval.unwrap_or(3600),
+                    shutdown_timeout: cfg.server.shutdown_timeout.unwrap_or(30),
+                    min_disk_free_mb: cfg.storage.min_disk_free_mb.unwrap_or(0),
+                    rate_limit_rps: cfg.server.rate_limit_rps.unwrap_or(0),
+                    limits: resolve_limits(None, None, &cfg.storage),
+                },
             };
-            serve::run(
-                &cli.data_dir,
-                &host,
-                port,
-                grpc_port,
-                av_interval,
-                av_threshold,
-                max_seg_mb,
-                scrub_interval,
-                shutdown_timeout,
-                min_disk_free_mb,
-            )
-            .await
+            serve::run(&cli.data_dir, serve_cfg).await
         }
     }
 }

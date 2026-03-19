@@ -24,6 +24,7 @@ use s3s::dto::{
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
+use crate::limits::Limits;
 use crate::metrics_util::DurationRecorder;
 use crate::storage::versioning::VersioningState;
 use crate::storage::{BucketStore, Storage};
@@ -45,11 +46,12 @@ where
 
 pub struct SimpleStorage {
     inner: Arc<Storage>,
+    limits: Limits,
 }
 
 impl SimpleStorage {
-    pub const fn new(storage: Arc<Storage>) -> Self {
-        Self { inner: storage }
+    pub const fn new(storage: Arc<Storage>, limits: Limits) -> Self {
+        Self { inner: storage, limits }
     }
 
     fn bucket(&self, name: &str) -> S3Result<Arc<BucketStore>> {
@@ -61,7 +63,8 @@ impl SimpleStorage {
 }
 
 /// Stream request body to a temp file, returning `(md5_hex, crc32c)`.
-async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<(String, u32)> {
+/// When `max_size > 0`, aborts with `EntityTooLarge` if the body exceeds the limit.
+async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path, max_size: u64) -> S3Result<(String, u32)> {
     let file = std::fs::File::create(tmp_path)
         .map_err(|e| { tracing::error!("create tmp file: {e}"); s3_error!(e, InternalError) })?;
     let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
@@ -71,12 +74,17 @@ async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path) -> S3Result<(S
     let mut stream = body;
 
     while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("read request body: {e}"); s3_error!(InternalError) })? {
+        total_bytes += chunk.len() as u64;
+        if max_size > 0 && total_bytes > max_size {
+            drop(writer);
+            std::fs::remove_file(tmp_path).ok();
+            return Err(s3_error!(EntityTooLarge));
+        }
         writer
             .write_all(&chunk)
             .map_err(|e| { tracing::error!("write tmp file: {e}"); s3_error!(e, InternalError) })?;
         hasher.update(&chunk);
         crc = crc32c::crc32c_append(crc, &chunk);
-        total_bytes += chunk.len() as u64;
     }
     writer.flush().map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
 
@@ -271,7 +279,7 @@ impl S3 for SimpleStorage {
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = store.bucket_dir().join(format!(".tmp_{tmp_id:020}"));
 
-        let (etag_hex, crc) = match stream_body_to_tmp(body, &tmp_path).await {
+        let (etag_hex, crc) = match stream_body_to_tmp(body, &tmp_path, self.limits.max_object_size).await {
             Ok(v) => v,
             Err(e) => {
                 std::fs::remove_file(&tmp_path).ok();
@@ -469,8 +477,16 @@ impl S3 for SimpleStorage {
         let src_vid = src_version_id.clone();
         let ss = Arc::clone(&src_store);
         let dest_key = input.key;
+        let max_obj_size = self.limits.max_object_size;
         let result = blocking(move || {
             let src_meta = resolve_object_version(&ss, &src_key, src_vid.as_deref())?;
+
+            if max_obj_size > 0 && src_meta.data_length() > max_obj_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EntityTooLarge: source object exceeds max_object_size",
+                ));
+            }
 
             let (content_type, user_metadata) = if replace_metadata {
                 (req_content_type, req_metadata)
@@ -494,6 +510,9 @@ impl S3 for SimpleStorage {
         .map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 return s3_error!(NoSuchKey);
+            }
+            if e.kind() == io::ErrorKind::InvalidData {
+                return s3_error!(EntityTooLarge);
             }
             tracing::error!("copy_object: {e}");
             s3_error!(e, InternalError)
@@ -672,7 +691,7 @@ impl S3 for SimpleStorage {
         let store = self.bucket(&input.bucket)?;
 
         #[allow(clippy::cast_sign_loss)] // max(0) guarantees non-negative
-        let max_keys = input.max_keys.unwrap_or(1000).max(0) as usize;
+        let max_keys = (input.max_keys.unwrap_or(1000).max(0) as usize).min(self.limits.max_list_keys);
         let prefix = input.prefix.clone();
         let delimiter = input.delimiter.clone();
         let continuation = input.continuation_token.clone();
@@ -754,7 +773,7 @@ impl S3 for SimpleStorage {
         let store = self.bucket(&input.bucket)?;
 
         #[allow(clippy::cast_sign_loss)]
-        let max_keys = input.max_keys.unwrap_or(1000).max(0) as usize;
+        let max_keys = (input.max_keys.unwrap_or(1000).max(0) as usize).min(self.limits.max_list_keys);
         let prefix = input.prefix.clone();
         let delimiter = input.delimiter.clone();
         let key_marker = input.key_marker.clone();
@@ -862,10 +881,14 @@ impl S3 for SimpleStorage {
 
         let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
+        let max_size = self.limits.max_object_size;
         let mut data = Vec::new();
         let mut stream = body;
         while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("upload_part: read body: {e}"); s3_error!(InternalError) })? {
             data.extend_from_slice(&chunk);
+            if max_size > 0 && data.len() as u64 > max_size {
+                return Err(s3_error!(EntityTooLarge));
+            }
         }
 
         metrics::counter!("simple3_bytes_received_total").increment(data.len() as u64);
@@ -917,6 +940,7 @@ impl S3 for SimpleStorage {
         let upload_id = input.upload_id;
         let key = input.key;
         let bucket = input.bucket;
+        let max_obj_size = self.limits.max_object_size;
         let (meta, etag) = blocking(move || {
             store.complete_multipart_upload(
                 &upload_id,
@@ -925,10 +949,17 @@ impl S3 for SimpleStorage {
                 None, // content_type from CreateMultipartUpload not stored yet
                 now,
                 HashMap::new(),
+                max_obj_size,
             )
         })
         .await
-        .map_err(|e| { tracing::error!("complete_multipart_upload: {e}"); s3_error!(e, InternalError) })?;
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidData {
+                return s3_error!(EntityTooLarge);
+            }
+            tracing::error!("complete_multipart_upload: {e}");
+            s3_error!(e, InternalError)
+        })?;
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),

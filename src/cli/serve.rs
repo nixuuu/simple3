@@ -129,6 +129,7 @@ struct AdminService {
     auth_store: Arc<AuthStore>,
     min_disk_free_mb: u64,
     prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
+    rate_limiter: Option<Arc<super::rate_limit::IpRateLimiter>>,
 }
 
 type ServiceFuture =
@@ -150,7 +151,54 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
             path = %path,
         );
 
-        let fut = self.dispatch(req, &method, &path);
+        // Rate limit check (exempt health/ready/metrics endpoints)
+        let rate_limited = path != "/health"
+            && path != "/ready"
+            && path != "/metrics"
+            && self.rate_limiter.as_ref().is_some_and(|limiter| {
+                let peer_ip = req
+                    .extensions()
+                    .get::<std::net::IpAddr>()
+                    .copied()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                limiter.check_key(&peer_ip).is_err()
+            });
+
+        let fut: ServiceFuture = if rate_limited {
+            metrics::counter!("simple3_rate_limited_total", "protocol" => "http").increment(1);
+            if path.starts_with("/_/") {
+                // Admin endpoints use JSON
+                Box::pin(async {
+                    let mut resp = json_response(
+                        503,
+                        &serde_json::json!({"error": "SlowDown", "message": "Rate limit exceeded"}),
+                    );
+                    resp.headers_mut()
+                        .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
+                    Ok(resp)
+                })
+            } else {
+                // S3 endpoints use XML
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                    <Error><Code>SlowDown</Code>\
+                    <Message>Rate limit exceeded</Message></Error>"
+                    .to_owned();
+                Box::pin(async {
+                    Ok(hyper::Response::builder()
+                        .status(503)
+                        .header("content-type", "application/xml")
+                        .header("retry-after", "1")
+                        .body(s3s::Body::from(body))
+                        .unwrap_or_else(|e| json_response(
+                            500,
+                            &serde_json::json!({"error": format!("rate limit response: {e}")}),
+                        )))
+                })
+            }
+        } else {
+            self.dispatch(req, &method, &path)
+        };
+
         Box::pin(
             async move {
                 let mut resp = fut.await?;
@@ -500,26 +548,42 @@ async fn spawn_grpc(
     host: &str,
     port: u16,
     shutdown_rx: &watch::Receiver<bool>,
+    limits: simple3::limits::Limits,
+    rate_limiter: Option<Arc<super::rate_limit::IpRateLimiter>>,
 ) -> anyhow::Result<JoinHandle<()>> {
-    let grpc_svc =
-        simple3::grpc::GrpcService::new(Arc::clone(storage), Some(Arc::clone(auth_store)));
+    let grpc_svc = simple3::grpc::GrpcService::new(
+        Arc::clone(storage),
+        Some(Arc::clone(auth_store)),
+        limits,
+    );
     let listener = TcpListener::bind(format!("{host}:{port}")).await?;
     tracing::info!("gRPC listening on {}:{}", host, port);
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let mut rx = shutdown_rx.clone();
+    let grpc_service =
+        simple3::grpc::proto::simple3_server::Simple3Server::new(grpc_svc)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024);
     let handle = tokio::spawn(async move {
-        if let Err(e) = tonic::transport::Server::builder()
-            .layer(super::request_id::RequestIdLayer)
-            .add_service(
-                simple3::grpc::proto::simple3_server::Simple3Server::new(grpc_svc)
-                    .max_decoding_message_size(64 * 1024 * 1024)
-                    .max_encoding_message_size(64 * 1024 * 1024),
-            )
-            .serve_with_incoming_shutdown(incoming, async move {
-                let _ = rx.changed().await;
-            })
-            .await
-        {
+        let result = if let Some(limiter) = rate_limiter {
+            tonic::transport::Server::builder()
+                .layer(super::request_id::RequestIdLayer)
+                .layer(super::rate_limit::RateLimitLayer::new(limiter))
+                .add_service(grpc_service)
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = rx.changed().await;
+                })
+                .await
+        } else {
+            tonic::transport::Server::builder()
+                .layer(super::request_id::RequestIdLayer)
+                .add_service(grpc_service)
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = rx.changed().await;
+                })
+                .await
+        };
+        if let Err(e) = result {
             tracing::error!("gRPC server error: {e}");
         }
     });
@@ -564,6 +628,24 @@ async fn drain_connections(connections: &mut JoinSet<()>, timeout_secs: u64) {
     }
 }
 
+/// Wrapper that injects peer IP into request extensions before forwarding.
+#[derive(Clone)]
+struct PeerIpService {
+    inner: AdminService,
+    peer_ip: std::net::IpAddr,
+}
+
+impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for PeerIpService {
+    type Response = s3s::HttpResponse;
+    type Error = s3s::HttpError;
+    type Future = ServiceFuture;
+
+    fn call(&self, mut req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        req.extensions_mut().insert(self.peer_ip);
+        self.inner.call(req)
+    }
+}
+
 /// Accept HTTP connections until a shutdown signal is received.
 /// Returns the in-flight connection set for draining by the caller.
 async fn accept_loop(
@@ -577,9 +659,9 @@ async fn accept_loop(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, _addr) = result?;
+                let (stream, addr) = result?;
                 let conn_guard = ConnectionGuard::new();
-                let svc = service.clone();
+                let svc = PeerIpService { inner: service.clone(), peer_ip: addr.ip() };
                 let mut rx = shutdown_rx.clone();
                 connections.spawn(async move {
                     let _conn_guard = conn_guard;
@@ -610,22 +692,13 @@ async fn accept_loop(
     Ok(connections)
 }
 
-#[allow(clippy::too_many_arguments)] // server config values passed through
 pub async fn run(
     data_dir: &Path,
-    host: &str,
-    port: u16,
-    grpc_port: u16,
-    autovacuum_interval: u64,
-    autovacuum_threshold: f64,
-    max_segment_size_mb: u64,
-    scrub_interval: u64,
-    shutdown_timeout: u64,
-    min_disk_free_mb: u64,
+    cfg: super::serve_config::ServeConfig,
 ) -> anyhow::Result<()> {
-    let max_seg_bytes = max_segment_size_mb * 1024 * 1024;
+    let max_seg_bytes = cfg.max_segment_size_mb.saturating_mul(1024 * 1024);
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
-    let s3 = SimpleStorage::new(Arc::clone(&storage));
+    let s3 = SimpleStorage::new(Arc::clone(&storage), cfg.limits.clone());
 
     // Open auth database and bootstrap root key if needed
     let (auth_store, bootstrap) = AuthStore::open(data_dir)?;
@@ -643,6 +716,8 @@ pub async fn run(
         eprintln!("================================================================");
     }
 
+    let rate_limiter = super::rate_limit::build_rate_limiter(cfg.rate_limit_rps);
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let sigterm = tokio::signal::unix::signal(SignalKind::terminate())?;
     let sigint = tokio::signal::unix::signal(SignalKind::interrupt())?;
@@ -650,14 +725,21 @@ pub async fn run(
 
     let mut bg_tasks: Vec<JoinHandle<()>> = Vec::new();
 
-    if autovacuum_interval > 0 {
-        bg_tasks.push(spawn_autovacuum(
-            &storage, autovacuum_interval, autovacuum_threshold, &shutdown_rx,
+    if let Some(ref limiter) = rate_limiter {
+        bg_tasks.push(super::rate_limit::spawn_cleanup(
+            Arc::clone(limiter),
+            &shutdown_rx,
         ));
     }
 
-    if scrub_interval > 0 {
-        bg_tasks.push(spawn_scrub(&storage, scrub_interval, &shutdown_rx));
+    if cfg.autovacuum_interval > 0 {
+        bg_tasks.push(spawn_autovacuum(
+            &storage, cfg.autovacuum_interval, cfg.autovacuum_threshold, &shutdown_rx,
+        ));
+    }
+
+    if cfg.scrub_interval > 0 {
+        bg_tasks.push(spawn_scrub(&storage, cfg.scrub_interval, &shutdown_rx));
     }
 
     let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -676,22 +758,34 @@ pub async fn run(
         s3: s3_service,
         storage: Arc::clone(&storage),
         auth_store: Arc::clone(&auth_store),
-        min_disk_free_mb,
+        min_disk_free_mb: cfg.min_disk_free_mb,
         prometheus_handle,
+        rate_limiter: rate_limiter.clone(),
     };
 
-    if grpc_port > 0 {
-        bg_tasks.push(spawn_grpc(&storage, &auth_store, host, grpc_port, &shutdown_rx).await?);
+    if cfg.grpc_port > 0 {
+        bg_tasks.push(
+            spawn_grpc(
+                &storage,
+                &auth_store,
+                &cfg.host,
+                cfg.grpc_port,
+                &shutdown_rx,
+                cfg.limits.clone(),
+                rate_limiter,
+            )
+            .await?,
+        );
     }
 
-    let listener = TcpListener::bind((host, port)).await?;
-    tracing::info!("S3 HTTP listening on {}:{}", host, port);
+    let listener = TcpListener::bind((&*cfg.host, cfg.port)).await?;
+    tracing::info!("S3 HTTP listening on {}:{}", cfg.host, cfg.port);
 
     let mut connections = accept_loop(listener, service, &shutdown_rx).await?;
 
     tokio::join!(
-        drain_connections(&mut connections, shutdown_timeout),
-        await_bg_tasks(&mut bg_tasks, shutdown_timeout),
+        drain_connections(&mut connections, cfg.shutdown_timeout),
+        await_bg_tasks(&mut bg_tasks, cfg.shutdown_timeout),
     );
 
     match tokio::task::spawn_blocking(move || storage.sync_all()).await {
@@ -716,7 +810,7 @@ mod tests {
 
     fn build_admin_service(dir: &std::path::Path) -> AdminService {
         let storage = Arc::new(Storage::open(dir).unwrap());
-        let s3 = SimpleStorage::new(Arc::clone(&storage));
+        let s3 = SimpleStorage::new(Arc::clone(&storage), simple3::limits::Limits::default());
         let (auth_store, _) = simple3::auth::AuthStore::open(dir).unwrap();
         let auth_store = Arc::new(auth_store);
         let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
@@ -734,6 +828,7 @@ mod tests {
             auth_store,
             min_disk_free_mb: 0,
             prometheus_handle,
+            rate_limiter: None,
         }
     }
 

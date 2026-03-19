@@ -41,6 +41,7 @@ impl BucketStore {
     }
 
     #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::too_many_arguments)] // logically-distinct storage params; bundling into a struct adds indirection with no reuse benefit
     pub fn complete_multipart_upload(
         &self,
         upload_id: &str,
@@ -49,6 +50,7 @@ impl BucketStore {
         content_type: Option<String>,
         last_modified: u64,
         user_metadata: HashMap<String, String>,
+        max_object_size: u64,
     ) -> io::Result<(ObjectMeta, String)> {
         let mut sorted_parts: Vec<_> = parts.to_vec();
         sorted_parts.sort_by_key(|(num, _)| *num);
@@ -62,6 +64,15 @@ impl BucketStore {
                     .saturating_sub(16))
             })
             .sum::<io::Result<u64>>()?;
+
+        if max_object_size > 0 && total_expected > max_object_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "EntityTooLarge: multipart upload total size {total_expected} exceeds limit {max_object_size}"
+                ),
+            ));
+        }
 
         let mut w = self
             .writer
