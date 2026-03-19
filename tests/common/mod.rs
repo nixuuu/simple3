@@ -50,7 +50,7 @@ fn build_s3_service(
         }
     };
 
-    let s3 = SimpleStorage::new(Arc::clone(&storage));
+    let s3 = SimpleStorage::new(Arc::clone(&storage), simple3::limits::Limits::default());
     let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(auth_provider.clone());

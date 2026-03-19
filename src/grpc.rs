@@ -10,6 +10,7 @@ use crate::auth::grpc_auth::{
     check_grpc_access, extract_credentials, extract_credentials_from_metadata,
 };
 use crate::auth::AuthStore;
+use crate::limits::Limits;
 use crate::metrics_util::DurationRecorder;
 use crate::grpc_helpers::{
     bulk_get_header, bulk_get_not_found, bulk_put_one_object, map_io_err, meta_to_proto,
@@ -39,13 +40,15 @@ use proto::*;
 pub struct GrpcService {
     storage: Arc<Storage>,
     auth_store: Option<Arc<AuthStore>>,
+    limits: Limits,
 }
 
 impl GrpcService {
-    pub const fn new(storage: Arc<Storage>, auth_store: Option<Arc<AuthStore>>) -> Self {
+    pub const fn new(storage: Arc<Storage>, auth_store: Option<Arc<AuthStore>>, limits: Limits) -> Self {
         Self {
             storage,
             auth_store,
+            limits,
         }
     }
 
@@ -116,7 +119,7 @@ impl Simple3 for GrpcService {
         let tmp_id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}"));
 
-        let (etag, size, crc) = match stream_to_tmp(&mut stream, &tmp_path).await {
+        let (etag, size, crc) = match stream_to_tmp(&mut stream, &tmp_path, self.limits.max_object_size).await {
             Ok(result) => result,
             Err(e) => {
                 std::fs::remove_file(&tmp_path).ok();
@@ -401,12 +404,19 @@ impl Simple3 for GrpcService {
         let src_vid = input.source_version_id;
         let ss = Arc::clone(&src_store);
         let dest_key = input.dest_key;
+        let max_obj_size = self.limits.max_object_size;
         let (etag, meta, src_version_id_out, size) = tokio::task::spawn_blocking(move || {
             let src_meta = ss
                 .get_object_or_version(&src_key, src_vid.as_deref())?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source object not found"))?;
             if src_meta.is_delete_marker {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "source is a delete marker"));
+            }
+            if max_obj_size > 0 && src_meta.data_length() > max_obj_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EntityTooLarge: source object exceeds max_object_size",
+                ));
             }
 
             let (content_type, user_metadata) = if replace_metadata {
@@ -462,11 +472,12 @@ impl Simple3 for GrpcService {
             Some(input.delimiter)
         };
         #[allow(clippy::cast_sign_loss)]
-        let max_keys = if input.max_keys <= 0 {
+        let max_keys = (if input.max_keys <= 0 {
             1000
         } else {
             input.max_keys as usize
-        };
+        })
+        .min(self.limits.max_list_keys);
         let continuation = if input.continuation_token.is_empty() {
             None
         } else {
@@ -582,6 +593,7 @@ impl Simple3 for GrpcService {
         self.check_auth_meta(&metadata, "s3:PutObject", "arn:s3:::*")?;
         let mut stream = stream;
         let storage = Arc::clone(&self.storage);
+        let max_obj_size = self.limits.max_object_size;
 
         let (tx, rx) = mpsc::channel(8);
 
@@ -620,7 +632,7 @@ impl Simple3 for GrpcService {
                     }
                 };
 
-                match bulk_put_one_object(&init, &mut stream, &store).await {
+                match bulk_put_one_object(&init, &mut stream, &store, max_obj_size).await {
                     Ok((etag, content_md5, size)) => {
                         let resp = BulkPutResponse {
                             key: init.key,
@@ -802,11 +814,12 @@ impl Simple3 for GrpcService {
             Some(input.delimiter)
         };
         #[allow(clippy::cast_sign_loss)]
-        let max_keys = if input.max_keys <= 0 {
+        let max_keys = (if input.max_keys <= 0 {
             1000
         } else {
             input.max_keys as usize
-        };
+        })
+        .min(self.limits.max_list_keys);
         let key_marker = if input.key_marker.is_empty() {
             None
         } else {

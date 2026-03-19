@@ -224,7 +224,7 @@ fn test_crash_during_multipart_after_commit() {
     let e2 = bucket.upload_part(&upload_id, 2, b"part-two").unwrap();
     let parts = vec![(1, e1), (2, e2)];
     bucket
-        .complete_multipart_upload(&upload_id, "mpu_obj", &parts, None, 1000, HashMap::new())
+        .complete_multipart_upload(&upload_id, "mpu_obj", &parts, None, 1000, HashMap::new(), 0)
         .unwrap();
 
     let bd = bucket.bucket_dir().to_path_buf();
