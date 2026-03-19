@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use md5::{Digest, Md5};
@@ -27,17 +27,22 @@ impl BucketStore {
             .join(format!(".mpu_{upload_id}_{part_num:05}"))
     }
 
+    /// Store a part from a temp file that was streamed to disk.
+    /// `md5_hex` is the pre-computed MD5 hex string (from streaming).
+    /// The part file stores [data][16-byte raw MD5] for assembly.
     pub fn upload_part(
         &self,
         upload_id: &str,
         part_number: i32,
-        data: &[u8],
+        tmp_path: &Path,
+        md5_hex: &str,
     ) -> io::Result<String> {
-        let digest = Md5::digest(data);
-        let mut f = File::create(self.part_path(upload_id, part_number))?;
-        f.write_all(data)?;
+        let part_path = self.part_path(upload_id, part_number);
+        fs::rename(tmp_path, &part_path)?;
+        let mut f = OpenOptions::new().append(true).open(&part_path)?;
+        let digest = md5_hex_to_bytes(md5_hex)?;
         f.write_all(&digest)?;
-        Ok(format!("{digest:x}"))
+        Ok(md5_hex.to_owned())
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -198,4 +203,21 @@ impl BucketStore {
         }
         Ok(())
     }
+}
+
+/// Parse a 32-char hex MD5 string into 16 raw bytes.
+fn md5_hex_to_bytes(hex: &str) -> io::Result<[u8; 16]> {
+    let mut out = [0u8; 16];
+    if hex.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected 32-char MD5 hex, got {}", hex.len()),
+        ));
+    }
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid MD5 hex: {e}"))
+        })?;
+    }
+    Ok(out)
 }

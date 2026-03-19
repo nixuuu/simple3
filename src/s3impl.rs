@@ -881,21 +881,20 @@ impl S3 for SimpleStorage {
 
         let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
-        let max_size = self.limits.max_object_size;
-        let mut data = Vec::new();
-        let mut stream = body;
-        while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("upload_part: read body: {e}"); s3_error!(InternalError) })? {
-            data.extend_from_slice(&chunk);
-            if max_size > 0 && data.len() as u64 > max_size {
-                return Err(s3_error!(EntityTooLarge));
-            }
-        }
+        let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = store.bucket_dir().join(format!(".tmp_{tmp_id:020}"));
 
-        metrics::counter!("simple3_bytes_received_total").increment(data.len() as u64);
+        let (md5_hex, _crc) = match stream_body_to_tmp(body, &tmp_path, self.limits.max_object_size).await {
+            Ok(v) => v,
+            Err(e) => {
+                std::fs::remove_file(&tmp_path).ok();
+                return Err(e);
+            }
+        };
 
         let upload_id = input.upload_id;
         let part_number = input.part_number;
-        let etag = blocking(move || store.upload_part(&upload_id, part_number, &data))
+        let etag = blocking(move || store.upload_part(&upload_id, part_number, &tmp_path, &md5_hex))
             .await
             .map_err(|e| { tracing::error!("upload_part: {e}"); s3_error!(e, InternalError) })?;
 

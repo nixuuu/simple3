@@ -2,11 +2,22 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use md5::{Digest, Md5};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use simple3::storage::Storage;
+use simple3::storage::{BucketStore, Storage};
 use simple3::types::ObjectMeta;
+
+static TEST_TMP: AtomicU64 = AtomicU64::new(0);
+
+fn write_part(bucket: &BucketStore, upload_id: &str, part_number: i32, data: &[u8]) -> String {
+    let id = TEST_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = bucket.bucket_dir().join(format!(".tmp_test_{id}"));
+    fs::write(&tmp, data).unwrap();
+    let md5_hex = format!("{:x}", Md5::digest(data));
+    bucket.upload_part(upload_id, part_number, &tmp, &md5_hex).unwrap()
+}
 
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
 const SEG_COMPACTING: TableDefinition<u32, u8> = TableDefinition::new("seg_compacting");
@@ -173,8 +184,8 @@ fn test_crash_during_multipart_before_commit() {
 
     // Start multipart but don't complete
     let upload_id = bucket.create_multipart_upload();
-    bucket.upload_part(&upload_id, 1, b"part-one-").unwrap();
-    bucket.upload_part(&upload_id, 2, b"part-two").unwrap();
+    write_part(&bucket, &upload_id, 1, b"part-one-");
+    write_part(&bucket, &upload_id, 2, b"part-two");
 
     let bd = bucket.bucket_dir().to_path_buf();
     drop(bucket);
@@ -220,8 +231,8 @@ fn test_crash_during_multipart_after_commit() {
     let bucket = storage.get_bucket("b").unwrap().unwrap();
 
     let upload_id = bucket.create_multipart_upload();
-    let e1 = bucket.upload_part(&upload_id, 1, b"part-one-").unwrap();
-    let e2 = bucket.upload_part(&upload_id, 2, b"part-two").unwrap();
+    let e1 = write_part(&bucket, &upload_id, 1, b"part-one-");
+    let e2 = write_part(&bucket, &upload_id, 2, b"part-two");
     let parts = vec![(1, e1), (2, e2)];
     bucket
         .complete_multipart_upload(&upload_id, "mpu_obj", &parts, None, 1000, HashMap::new(), 0)
