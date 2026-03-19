@@ -97,6 +97,7 @@ fn test_put_get_object() {
     assert_eq!(got.offset, offset);
     assert_eq!(got.data_length(), data.len() as u64);
     assert_eq!(got.etag, "abc123");
+    assert_eq!(got.content_crc32c, Some(crc));
 }
 
 #[test]
