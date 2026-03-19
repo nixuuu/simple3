@@ -305,7 +305,7 @@ pub(crate) fn non_empty(s: String) -> Option<String> {
 
 /// Clamp a signed `max_keys` value from the client to a positive `usize`
 /// bounded by the server-configured limit.
-#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_sign_loss)] // negative values already handled by the <= 0 branch above
 pub(crate) fn clamp_max_keys(raw: i32, server_limit: usize) -> usize {
     (if raw <= 0 { 1000 } else { raw as usize }).min(server_limit)
 }

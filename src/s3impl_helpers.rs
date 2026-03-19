@@ -15,10 +15,10 @@ use crate::storage::BucketStore;
 use crate::types::ObjectMeta;
 
 /// Monotonic counter for unique temp file names across concurrent requests.
-pub(crate) static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Run a blocking closure on the tokio blocking thread pool.
-pub(crate) async fn blocking<F, T>(f: F) -> Result<T, io::Error>
+pub async fn blocking<F, T>(f: F) -> Result<T, io::Error>
 where
     F: FnOnce() -> io::Result<T> + Send + 'static,
     T: Send + 'static,
@@ -30,7 +30,7 @@ where
 
 /// Stream request body to a temp file, returning `(md5_hex, crc32c)`.
 /// When `max_size > 0`, aborts with `EntityTooLarge` if the body exceeds the limit.
-pub(crate) async fn stream_body_to_tmp(
+pub async fn stream_body_to_tmp(
     body: StreamingBlob,
     tmp_path: &Path,
     max_size: u64,
@@ -62,12 +62,12 @@ pub(crate) async fn stream_body_to_tmp(
     Ok((format!("{:x}", hasher.finalize()), crc))
 }
 
-pub(crate) fn version_id_string(vid: Option<&str>) -> Option<String> {
+pub fn version_id_string(vid: Option<&str>) -> Option<String> {
     vid.map(str::to_owned)
 }
 
 /// Delete a single object with a specific version ID.
-pub(crate) fn delete_one_versioned(
+pub fn delete_one_versioned(
     store: &BucketStore,
     key: String,
     vid: String,
@@ -108,7 +108,7 @@ pub(crate) fn delete_one_versioned(
 }
 
 /// Delete a single object without a version ID (hard delete or create delete marker).
-pub(crate) fn delete_one_unversioned(
+pub fn delete_one_unversioned(
     store: &BucketStore,
     key: String,
 ) -> Result<DeletedObject, s3s::dto::Error> {
@@ -133,7 +133,7 @@ pub(crate) fn delete_one_unversioned(
 }
 
 /// Build version/delete-marker lists from storage version entries.
-pub(crate) fn build_version_lists(
+pub fn build_version_lists(
     entries: Vec<VersionEntry>,
 ) -> (Vec<ObjectVersion>, Vec<DeleteMarkerEntry>) {
     let mut versions = Vec::new();
@@ -171,7 +171,7 @@ pub(crate) fn build_version_lists(
 /// Resolve an object by key, optionally looking up a specific version.
 /// Uses a single read transaction to avoid TOCTOU between tables.
 /// Returns the meta or an `io::Error` with appropriate `ErrorKind`.
-pub(crate) fn resolve_object_version(
+pub fn resolve_object_version(
     store: &BucketStore,
     key: &str,
     version_id: Option<&str>,
@@ -189,8 +189,8 @@ pub(crate) fn resolve_object_version(
 }
 
 /// Execute copy-object blocking operation: resolve source, copy to tmp, put in destination.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_copy_blocking(
+#[allow(clippy::too_many_arguments)] // all fields required for atomic copy-put; matches existing pattern in grpc_helpers::CopyParams
+pub fn execute_copy_blocking(
     src_store: &BucketStore,
     dest_store: &BucketStore,
     src_key: &str,

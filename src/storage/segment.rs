@@ -55,9 +55,9 @@ pub struct SegmentStat {
 // Compaction write-locks only the segment being compacted; all other segments remain readable.
 
 pub struct ActiveWriter {
-    pub id: u32,
-    pub file: File,
-    pub size: u64,
+    pub(super) id: u32,
+    pub(super) file: File,
+    pub(super) size: u64,
 }
 
 pub(super) fn discover_segments(bucket_dir: &Path) -> io::Result<Vec<u32>> {
@@ -94,7 +94,7 @@ pub(super) fn cleanup_temp_files(bucket_dir: &Path) -> io::Result<()> {
 
 // === BucketStore segment I/O ===
 
-#[allow(clippy::missing_errors_doc)]
+#[allow(clippy::missing_errors_doc)] // internal segment I/O — error conditions are self-evident from io::Result
 impl BucketStore {
     // === Segment management ===
 
