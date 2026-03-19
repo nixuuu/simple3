@@ -129,6 +129,7 @@ struct AdminService {
     auth_store: Arc<AuthStore>,
     min_disk_free_mb: u64,
     prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
+    metrics_auth: Option<(String, String)>,
 }
 
 type ServiceFuture =
@@ -170,6 +171,12 @@ impl AdminService {
         path: &str,
     ) -> ServiceFuture {
         if *method == hyper::Method::GET && path == "/metrics" {
+            if let Some((ref user, ref pass)) = self.metrics_auth
+                && !super::metrics_auth::check(&req, user, pass)
+            {
+                let resp = super::metrics_auth::unauthorized_response();
+                return Box::pin(async { Ok(resp) });
+            }
             let body = self.prometheus_handle.render();
             Box::pin(async move {
                 Ok(hyper::Response::builder()
@@ -622,6 +629,8 @@ pub async fn run(
     scrub_interval: u64,
     shutdown_timeout: u64,
     min_disk_free_mb: u64,
+    metrics_user: Option<String>,
+    metrics_password: Option<String>,
 ) -> anyhow::Result<()> {
     let max_seg_bytes = max_segment_size_mb * 1024 * 1024;
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
@@ -672,12 +681,25 @@ pub async fn run(
     builder.set_access(auth_provider);
     let s3_service = builder.build();
 
+    let metrics_auth = match (metrics_user, metrics_password) {
+        (Some(u), Some(p)) => {
+            tracing::info!("metrics endpoint auth enabled");
+            Some((u, p))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            tracing::warn!("metrics auth partially configured (need both username and password); metrics endpoint is open");
+            None
+        }
+        _ => None,
+    };
+
     let service = AdminService {
         s3: s3_service,
         storage: Arc::clone(&storage),
         auth_store: Arc::clone(&auth_store),
         min_disk_free_mb,
         prometheus_handle,
+        metrics_auth,
     };
 
     if grpc_port > 0 {
@@ -734,6 +756,7 @@ mod tests {
             auth_store,
             min_disk_free_mb: 0,
             prometheus_handle,
+            metrics_auth: None,
         }
     }
 
@@ -841,6 +864,166 @@ mod tests {
     fn test_disk_free_nonzero() {
         let dir = tempfile::tempdir().unwrap();
         assert!(disk_free(dir.path()) > 0);
+    }
+
+    fn build_admin_service_with_metrics_auth(
+        dir: &std::path::Path,
+        metrics_auth: Option<(String, String)>,
+    ) -> AdminService {
+        let mut svc = build_admin_service(dir);
+        svc.metrics_auth = metrics_auth;
+        svc
+    }
+
+    #[tokio::test]
+    async fn test_metrics_no_auth_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service(dir.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_auth_rejects_no_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service_with_metrics_auth(
+            dir.path(),
+            Some(("user".into(), "pass".into())),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            resp.headers().get("www-authenticate").unwrap().to_str().unwrap(),
+            "Basic realm=\"metrics\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_auth_accepts_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service_with_metrics_auth(
+            dir.path(),
+            Some(("user".into(), "pass".into())),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/metrics"))
+            .basic_auth("user", Some("pass"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_auth_rejects_wrong_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service_with_metrics_auth(
+            dir.path(),
+            Some(("user".into(), "pass".into())),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+                let svc = service.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        let client = reqwest::Client::new();
+
+        // Wrong password
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/metrics"))
+            .basic_auth("user", Some("wrong"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Wrong username
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/metrics"))
+            .basic_auth("wrong", Some("pass"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Malformed header (not base64)
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/metrics"))
+            .header("authorization", "Basic %%%notbase64%%%")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_auth_password_with_colons() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service_with_metrics_auth(
+            dir.path(),
+            Some(("user".into(), "p:a:ss".into())),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/metrics"))
+            .basic_auth("user", Some("p:a:ss"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
     }
 
     #[test]

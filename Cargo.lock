@@ -3555,6 +3555,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "base64 0.22.1",
  "bincode",
  "bytes",
  "clap",

@@ -6,6 +6,7 @@ mod admin_auth;
 mod compact;
 mod health;
 mod metrics;
+mod metrics_auth;
 mod request_id;
 pub mod client;
 pub mod config;
@@ -87,6 +88,12 @@ enum Command {
         /// Minimum free disk space in MB; /ready returns 503 below this (0 = disabled)
         #[arg(long)]
         min_disk_free_mb: Option<u64>,
+        /// Metrics endpoint HTTP Basic Auth username
+        #[arg(long, env = "SIMPLE3_METRICS_USER")]
+        metrics_user: Option<String>,
+        /// Metrics endpoint HTTP Basic Auth password
+        #[arg(long, env = "SIMPLE3_METRICS_PASSWORD")]
+        metrics_password: Option<String>,
     },
     /// Check if the running server is healthy
     Health,
@@ -321,6 +328,8 @@ pub async fn run() -> anyhow::Result<()> {
                 scrub_interval,
                 shutdown_timeout,
                 min_disk_free_mb,
+                metrics_user,
+                metrics_password,
             ) = match cmd {
                 Some(Command::Serve {
                     host,
@@ -332,6 +341,8 @@ pub async fn run() -> anyhow::Result<()> {
                     scrub_interval,
                     shutdown_timeout,
                     min_disk_free_mb,
+                    metrics_user,
+                    metrics_password,
                 }) => (
                     host,
                     port,
@@ -346,6 +357,8 @@ pub async fn run() -> anyhow::Result<()> {
                     min_disk_free_mb
                         .or(cfg.storage.min_disk_free_mb)
                         .unwrap_or(0),
+                    metrics_user.or(cfg.metrics.username),
+                    metrics_password.or(cfg.metrics.password),
                 ),
                 _ => (
                     cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
@@ -357,6 +370,8 @@ pub async fn run() -> anyhow::Result<()> {
                     cfg.storage.scrub_interval.unwrap_or(3600),
                     cfg.server.shutdown_timeout.unwrap_or(30),
                     cfg.storage.min_disk_free_mb.unwrap_or(0),
+                    cfg.metrics.username,
+                    cfg.metrics.password,
                 ),
             };
             serve::run(
@@ -370,6 +385,8 @@ pub async fn run() -> anyhow::Result<()> {
                 scrub_interval,
                 shutdown_timeout,
                 min_disk_free_mb,
+                metrics_user,
+                metrics_password,
             )
             .await
         }
