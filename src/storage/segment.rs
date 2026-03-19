@@ -134,8 +134,10 @@ impl BucketStore {
         }
 
         let seg_path = self.bucket_dir.join(segment_filename(segment_id));
-        if seg_path.exists() {
-            fs::remove_file(&seg_path)?;
+        if let Err(e) = fs::remove_file(&seg_path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return Err(e);
         }
 
         let txn = self.db.begin_write().map_err(io::Error::other)?;
