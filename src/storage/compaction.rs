@@ -34,33 +34,11 @@ impl BucketStore {
         let mut live = Vec::new();
         let txn = self.db.begin_read().map_err(io::Error::other)?;
 
-        // Scan objects table
-        let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
-        for result in table.iter().map_err(io::Error::other)? {
-            let (k, v) = result.map_err(io::Error::other)?;
-            let obj = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
-            if obj.segment_id == segment_id && !obj.is_delete_marker {
-                live.push(LiveEntry {
-                    source: TableSource::Objects,
-                    redb_key: k.value().to_owned(),
-                    meta: obj,
-                });
-            }
-        }
+        let obj_table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
+        collect_from_table(&obj_table, segment_id, TableSource::Objects, &mut live)?;
 
-        // Scan versions table
         let ver_table = txn.open_table(VERSIONS).map_err(io::Error::other)?;
-        for result in ver_table.iter().map_err(io::Error::other)? {
-            let (k, v) = result.map_err(io::Error::other)?;
-            let obj = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
-            if obj.segment_id == segment_id && !obj.is_delete_marker {
-                live.push(LiveEntry {
-                    source: TableSource::Versions,
-                    redb_key: k.value().to_owned(),
-                    meta: obj,
-                });
-            }
-        }
+        collect_from_table(&ver_table, segment_id, TableSource::Versions, &mut live)?;
 
         live.sort_by_key(|e| e.meta.offset);
         Ok(live)
@@ -89,18 +67,13 @@ impl BucketStore {
                 obj.offset = new_offset;
                 new_offset += obj.length;
                 let bytes = bincode::serialize(&obj).map_err(io::Error::other)?;
-                match entry.source {
-                    TableSource::Objects => {
-                        obj_table
-                            .insert(entry.redb_key.as_str(), bytes.as_slice())
-                            .map_err(io::Error::other)?;
-                    }
-                    TableSource::Versions => {
-                        ver_table
-                            .insert(entry.redb_key.as_str(), bytes.as_slice())
-                            .map_err(io::Error::other)?;
-                    }
-                }
+                let table = match entry.source {
+                    TableSource::Objects => &mut obj_table,
+                    TableSource::Versions => &mut ver_table,
+                };
+                table
+                    .insert(entry.redb_key.as_str(), bytes.as_slice())
+                    .map_err(io::Error::other)?;
             }
         }
 
@@ -282,6 +255,27 @@ fn copy_live_objects(
     drop(tmp);
 
     Ok(entries)
+}
+
+/// Collect live (non-delete-marker) entries from a single redb table for the given segment.
+fn collect_from_table(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    segment_id: u32,
+    source: TableSource,
+    live: &mut Vec<LiveEntry>,
+) -> io::Result<()> {
+    for result in table.iter().map_err(io::Error::other)? {
+        let (k, v) = result.map_err(io::Error::other)?;
+        let obj = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
+        if obj.segment_id == segment_id && !obj.is_delete_marker {
+            live.push(LiveEntry {
+                source,
+                redb_key: k.value().to_owned(),
+                meta: obj,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Update a single compacted entry in its table. Returns stale bytes if the

@@ -144,34 +144,36 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let request_id = super::request_id::generate_request_id();
         let method = req.method().clone();
-        let path = req.uri().path().to_owned();
         let span = tracing::info_span!(
             "http_request",
             request_id = %request_id,
             method = %method,
-            path = %path,
+            path = %req.uri().path(),
         );
 
         // Rate limit check (exempt health/ready/metrics endpoints)
-        let rate_limited = path != "/health"
-            && path != "/ready"
-            && path != "/metrics"
-            && self.rate_limiter.as_ref().is_some_and(|limiter| {
-                let peer_ip = req
-                    .extensions()
-                    .get::<std::net::IpAddr>()
-                    .copied()
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                limiter.check_key(&peer_ip).is_err()
-            });
+        let rate_limited = {
+            let p = req.uri().path();
+            p != "/health"
+                && p != "/ready"
+                && p != "/metrics"
+                && self.rate_limiter.as_ref().is_some_and(|limiter| {
+                    let peer_ip = req
+                        .extensions()
+                        .get::<std::net::IpAddr>()
+                        .copied()
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                    limiter.check_key(&peer_ip).is_err()
+                })
+        };
 
         let fut: ServiceFuture = if rate_limited {
             metrics::counter!("simple3_rate_limited_total", "protocol" => "http").increment(1);
-            if path.starts_with("/_/") {
+            if req.uri().path().starts_with("/_/") {
                 // Admin endpoints use JSON
                 Box::pin(async {
                     let mut resp = json_response(
-                        503,
+                        429,
                         &serde_json::json!({"error": "SlowDown", "message": "Rate limit exceeded"}),
                     );
                     resp.headers_mut()
@@ -180,16 +182,15 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
                 })
             } else {
                 // S3 endpoints use XML
-                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                    <Error><Code>SlowDown</Code>\
-                    <Message>Rate limit exceeded</Message></Error>"
-                    .to_owned();
                 Box::pin(async {
                     Ok(hyper::Response::builder()
-                        .status(503)
+                        .status(429)
                         .header("content-type", "application/xml")
                         .header("retry-after", "1")
-                        .body(s3s::Body::from(body))
+                        .body(s3s::Body::from(bytes::Bytes::from_static(
+                            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                            <Error><Code>SlowDown</Code>\
+                            <Message>Rate limit exceeded</Message></Error>")))
                         .unwrap_or_else(|e| json_response(
                             500,
                             &serde_json::json!({"error": format!("rate limit response: {e}")}),
@@ -197,6 +198,7 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
                 })
             }
         } else {
+            let path = req.uri().path().to_owned();
             self.dispatch(req, &method, &path)
         };
 
