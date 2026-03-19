@@ -318,19 +318,7 @@ pub async fn run() -> anyhow::Result<()> {
                 .or(cfg.server.log_format)
                 .unwrap_or_default();
             init_logging(log_format);
-            let (
-                host,
-                port,
-                av_interval,
-                av_threshold,
-                max_seg_mb,
-                grpc_port,
-                scrub_interval,
-                shutdown_timeout,
-                min_disk_free_mb,
-                metrics_user,
-                metrics_password,
-            ) = match cmd {
+            let serve_cfg = match cmd {
                 Some(Command::Serve {
                     host,
                     port,
@@ -343,52 +331,38 @@ pub async fn run() -> anyhow::Result<()> {
                     min_disk_free_mb,
                     metrics_user,
                     metrics_password,
-                }) => (
+                }) => serve::ServeConfig {
                     host,
                     port,
+                    grpc_port,
                     autovacuum_interval,
                     autovacuum_threshold,
                     max_segment_size_mb,
-                    grpc_port,
                     scrub_interval,
-                    shutdown_timeout
+                    shutdown_timeout: shutdown_timeout
                         .or(cfg.server.shutdown_timeout)
                         .unwrap_or(30),
-                    min_disk_free_mb
+                    min_disk_free_mb: min_disk_free_mb
                         .or(cfg.storage.min_disk_free_mb)
                         .unwrap_or(0),
-                    metrics_user.or(cfg.metrics.username),
-                    metrics_password.or(cfg.metrics.password),
-                ),
-                _ => (
-                    cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
-                    cfg.server.port.unwrap_or(8080),
-                    cfg.storage.autovacuum_interval.unwrap_or(300),
-                    cfg.storage.autovacuum_threshold.unwrap_or(0.5),
-                    cfg.storage.max_segment_size_mb.unwrap_or(4096),
-                    cfg.server.grpc_port.unwrap_or(50051),
-                    cfg.storage.scrub_interval.unwrap_or(3600),
-                    cfg.server.shutdown_timeout.unwrap_or(30),
-                    cfg.storage.min_disk_free_mb.unwrap_or(0),
-                    cfg.metrics.username,
-                    cfg.metrics.password,
-                ),
+                    metrics_user: metrics_user.or(cfg.metrics.username),
+                    metrics_password: metrics_password.or(cfg.metrics.password),
+                },
+                _ => serve::ServeConfig {
+                    host: cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
+                    port: cfg.server.port.unwrap_or(8080),
+                    grpc_port: cfg.server.grpc_port.unwrap_or(50051),
+                    autovacuum_interval: cfg.storage.autovacuum_interval.unwrap_or(300),
+                    autovacuum_threshold: cfg.storage.autovacuum_threshold.unwrap_or(0.5),
+                    max_segment_size_mb: cfg.storage.max_segment_size_mb.unwrap_or(4096),
+                    scrub_interval: cfg.storage.scrub_interval.unwrap_or(3600),
+                    shutdown_timeout: cfg.server.shutdown_timeout.unwrap_or(30),
+                    min_disk_free_mb: cfg.storage.min_disk_free_mb.unwrap_or(0),
+                    metrics_user: cfg.metrics.username,
+                    metrics_password: cfg.metrics.password,
+                },
             };
-            serve::run(
-                &cli.data_dir,
-                &host,
-                port,
-                grpc_port,
-                av_interval,
-                av_threshold,
-                max_seg_mb,
-                scrub_interval,
-                shutdown_timeout,
-                min_disk_free_mb,
-                metrics_user,
-                metrics_password,
-            )
-            .await
+            serve::run(&cli.data_dir, serve_cfg).await
         }
     }
 }

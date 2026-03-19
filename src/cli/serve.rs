@@ -617,22 +617,22 @@ async fn accept_loop(
     Ok(connections)
 }
 
-#[allow(clippy::too_many_arguments)] // server config values passed through
-pub async fn run(
-    data_dir: &Path,
-    host: &str,
-    port: u16,
-    grpc_port: u16,
-    autovacuum_interval: u64,
-    autovacuum_threshold: f64,
-    max_segment_size_mb: u64,
-    scrub_interval: u64,
-    shutdown_timeout: u64,
-    min_disk_free_mb: u64,
-    metrics_user: Option<String>,
-    metrics_password: Option<String>,
-) -> anyhow::Result<()> {
-    let max_seg_bytes = max_segment_size_mb * 1024 * 1024;
+pub struct ServeConfig {
+    pub host: String,
+    pub port: u16,
+    pub grpc_port: u16,
+    pub autovacuum_interval: u64,
+    pub autovacuum_threshold: f64,
+    pub max_segment_size_mb: u64,
+    pub scrub_interval: u64,
+    pub shutdown_timeout: u64,
+    pub min_disk_free_mb: u64,
+    pub metrics_user: Option<String>,
+    pub metrics_password: Option<String>,
+}
+
+pub async fn run(data_dir: &Path, cfg: ServeConfig) -> anyhow::Result<()> {
+    let max_seg_bytes = cfg.max_segment_size_mb * 1024 * 1024;
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
     let s3 = SimpleStorage::new(Arc::clone(&storage));
 
@@ -659,14 +659,14 @@ pub async fn run(
 
     let mut bg_tasks: Vec<JoinHandle<()>> = Vec::new();
 
-    if autovacuum_interval > 0 {
+    if cfg.autovacuum_interval > 0 {
         bg_tasks.push(spawn_autovacuum(
-            &storage, autovacuum_interval, autovacuum_threshold, &shutdown_rx,
+            &storage, cfg.autovacuum_interval, cfg.autovacuum_threshold, &shutdown_rx,
         ));
     }
 
-    if scrub_interval > 0 {
-        bg_tasks.push(spawn_scrub(&storage, scrub_interval, &shutdown_rx));
+    if cfg.scrub_interval > 0 {
+        bg_tasks.push(spawn_scrub(&storage, cfg.scrub_interval, &shutdown_rx));
     }
 
     let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -681,7 +681,7 @@ pub async fn run(
     builder.set_access(auth_provider);
     let s3_service = builder.build();
 
-    let metrics_auth = match (metrics_user, metrics_password) {
+    let metrics_auth = match (cfg.metrics_user, cfg.metrics_password) {
         (Some(u), Some(p)) => {
             tracing::info!("metrics endpoint auth enabled");
             Some((u, p))
@@ -698,23 +698,23 @@ pub async fn run(
         s3: s3_service,
         storage: Arc::clone(&storage),
         auth_store: Arc::clone(&auth_store),
-        min_disk_free_mb,
+        min_disk_free_mb: cfg.min_disk_free_mb,
         prometheus_handle,
         metrics_auth,
     };
 
-    if grpc_port > 0 {
-        bg_tasks.push(spawn_grpc(&storage, &auth_store, host, grpc_port, &shutdown_rx).await?);
+    if cfg.grpc_port > 0 {
+        bg_tasks.push(spawn_grpc(&storage, &auth_store, &cfg.host, cfg.grpc_port, &shutdown_rx).await?);
     }
 
-    let listener = TcpListener::bind((host, port)).await?;
-    tracing::info!("S3 HTTP listening on {}:{}", host, port);
+    let listener = TcpListener::bind((&*cfg.host, cfg.port)).await?;
+    tracing::info!("S3 HTTP listening on {}:{}", cfg.host, cfg.port);
 
     let mut connections = accept_loop(listener, service, &shutdown_rx).await?;
 
     tokio::join!(
-        drain_connections(&mut connections, shutdown_timeout),
-        await_bg_tasks(&mut bg_tasks, shutdown_timeout),
+        drain_connections(&mut connections, cfg.shutdown_timeout),
+        await_bg_tasks(&mut bg_tasks, cfg.shutdown_timeout),
     );
 
     match tokio::task::spawn_blocking(move || storage.sync_all()).await {

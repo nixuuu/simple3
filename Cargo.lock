@@ -3578,6 +3578,7 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "testcontainers",
  "tikv-jemallocator",

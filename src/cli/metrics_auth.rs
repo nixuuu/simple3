@@ -1,4 +1,5 @@
 use base64::Engine;
+use subtle::ConstantTimeEq;
 
 /// Validate HTTP Basic Auth credentials from the request.
 /// Returns `true` if the `Authorization: Basic ...` header is present and matches.
@@ -30,7 +31,9 @@ pub fn check(
             let Some((user, pass)) = creds.split_once(':') else {
                 return false;
             };
-            user == expected_user && pass == expected_pass
+            let user_ok = user.as_bytes().ct_eq(expected_user.as_bytes());
+            let pass_ok = pass.as_bytes().ct_eq(expected_pass.as_bytes());
+            (user_ok & pass_ok).into()
         })
 }
 
@@ -39,6 +42,8 @@ pub fn unauthorized_response() -> s3s::HttpResponse {
         .status(401)
         .header("www-authenticate", "Basic realm=\"metrics\"")
         .header("content-type", "application/json")
-        .body(s3s::Body::from(r#"{"error":"unauthorized"}"#.to_owned()))
+        .body(s3s::Body::from(bytes::Bytes::from_static(
+            br#"{"error":"unauthorized"}"#,
+        )))
         .expect("static 401 response")
 }
