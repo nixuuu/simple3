@@ -10,13 +10,34 @@ use governor::{Quota, RateLimiter};
 pub type IpRateLimiter = RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>;
 
 /// Build a per-IP token-bucket rate limiter. Returns `None` when `rps == 0` (disabled).
+///
+/// Uses `DashMapStateStore` which grows one entry per unique IP and never evicts.
+/// TODO: add periodic cleanup or bounded LRU store for long-running servers
+/// exposed to many unique IPs.
 pub fn build_rate_limiter(rps: u32) -> Option<Arc<IpRateLimiter>> {
     let rps = NonZeroU32::new(rps)?;
     let quota = Quota::per_second(rps);
     Some(Arc::new(RateLimiter::dashmap(quota)))
 }
 
-// --- Tower layer for gRPC rate limiting ---
+/// Extract peer IP from request extensions.
+/// Checks for direct `IpAddr` (set by HTTP `PeerIpService`) first,
+/// then falls back to tonic's `TcpConnectInfo` (set automatically for gRPC).
+fn extract_peer_ip<B>(req: &hyper::Request<B>) -> IpAddr {
+    if let Some(ip) = req.extensions().get::<IpAddr>().copied() {
+        return ip;
+    }
+    if let Some(info) = req
+        .extensions()
+        .get::<tonic::transport::server::TcpConnectInfo>()
+        && let Some(addr) = info.remote_addr()
+    {
+        return addr.ip();
+    }
+    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+}
+
+// --- Tower layer: per-IP rate limiting ---
 
 /// Tower layer that applies per-IP rate limiting.
 #[derive(Clone)]
@@ -71,11 +92,7 @@ where
     }
 
     fn call(&mut self, req: hyper::Request<ReqBody>) -> Self::Future {
-        let peer_ip = req
-            .extensions()
-            .get::<IpAddr>()
-            .copied()
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let peer_ip = extract_peer_ip(&req);
 
         if self.limiter.check_key(&peer_ip).is_err() {
             metrics::counter!("simple3_rate_limited_total", "protocol" => "grpc").increment(1);
@@ -85,7 +102,7 @@ where
                 .header("grpc-status", "8") // RESOURCE_EXHAUSTED
                 .header("grpc-message", "rate%20limit%20exceeded")
                 .body(ResBody::default())
-                .expect("static response");
+                .expect("static response"); // safe: all headers are static literals
             return futures::future::Either::Right(std::future::ready(Ok(resp)));
         }
 

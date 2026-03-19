@@ -74,17 +74,17 @@ async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path, max_size: u64)
     let mut stream = body;
 
     while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("read request body: {e}"); s3_error!(InternalError) })? {
-        writer
-            .write_all(&chunk)
-            .map_err(|e| { tracing::error!("write tmp file: {e}"); s3_error!(e, InternalError) })?;
-        hasher.update(&chunk);
-        crc = crc32c::crc32c_append(crc, &chunk);
         total_bytes += chunk.len() as u64;
         if max_size > 0 && total_bytes > max_size {
             drop(writer);
             std::fs::remove_file(tmp_path).ok();
             return Err(s3_error!(EntityTooLarge));
         }
+        writer
+            .write_all(&chunk)
+            .map_err(|e| { tracing::error!("write tmp file: {e}"); s3_error!(e, InternalError) })?;
+        hasher.update(&chunk);
+        crc = crc32c::crc32c_append(crc, &chunk);
     }
     writer.flush().map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
 

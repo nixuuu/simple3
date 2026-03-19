@@ -75,10 +75,6 @@ pub async fn stream_to_tmp(
                 "expected data chunk after init message",
             ));
         };
-        file.write_all(&chunk)
-            .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
-        hasher.update(&chunk);
-        crc = crc32c::crc32c_append(crc, &chunk);
         #[allow(clippy::cast_possible_truncation)]
         {
             size += chunk.len() as u64;
@@ -89,6 +85,10 @@ pub async fn stream_to_tmp(
                 "EntityTooLarge: object size {size} exceeds limit {max_size}"
             )));
         }
+        file.write_all(&chunk)
+            .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
+        hasher.update(&chunk);
+        crc = crc32c::crc32c_append(crc, &chunk);
     }
     file.flush()
         .map_err(|e| Status::internal(format!("flush tmp: {e}")))?;
@@ -209,12 +209,6 @@ pub async fn bulk_put_one_object(
 
         match msg.request {
             Some(proto::bulk_put_request::Request::Data(chunk)) => {
-                if let Err(e) = file.write_all(&chunk) {
-                    std::fs::remove_file(&tmp_path).ok();
-                    return Err(Status::internal(e.to_string()));
-                }
-                hasher.update(&chunk);
-                crc = crc32c::crc32c_append(crc, &chunk);
                 #[allow(clippy::cast_possible_truncation)]
                 {
                     size += chunk.len() as u64;
@@ -225,6 +219,12 @@ pub async fn bulk_put_one_object(
                         "EntityTooLarge: object size {size} exceeds limit {max_size}"
                     )));
                 }
+                if let Err(e) = file.write_all(&chunk) {
+                    std::fs::remove_file(&tmp_path).ok();
+                    return Err(Status::internal(e.to_string()));
+                }
+                hasher.update(&chunk);
+                crc = crc32c::crc32c_append(crc, &chunk);
             }
             Some(proto::bulk_put_request::Request::Init(_)) => break,
             None => {}

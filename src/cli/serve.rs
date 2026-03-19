@@ -151,9 +151,10 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
             path = %path,
         );
 
-        // Rate limit check (exempt health/ready endpoints)
+        // Rate limit check (exempt health/ready/metrics endpoints)
         if path != "/health"
             && path != "/ready"
+            && path != "/metrics"
             && let Some(ref limiter) = self.rate_limiter
         {
             let peer_ip = req
@@ -164,11 +165,14 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
             if limiter.check_key(&peer_ip).is_err() {
                 metrics::counter!("simple3_rate_limited_total", "protocol" => "http")
                     .increment(1);
-                let body = r#"{"error":"SlowDown","message":"Rate limit exceeded"}"#.to_owned();
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                    <Error><Code>SlowDown</Code>\
+                    <Message>Rate limit exceeded</Message></Error>"
+                    .to_owned();
                 return Box::pin(async {
                     Ok(hyper::Response::builder()
-                        .status(429)
-                        .header("content-type", "application/json")
+                        .status(503)
+                        .header("content-type", "application/xml")
                         .header("retry-after", "1")
                         .body(s3s::Body::from(body))
                         .unwrap_or_else(|e| json_response(

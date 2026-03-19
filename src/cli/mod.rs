@@ -225,6 +225,23 @@ enum Command {
     },
 }
 
+/// Resolve `Limits` from CLI args (if provided) falling back to TOML config, then defaults.
+fn resolve_limits(
+    max_obj_mb: Option<u64>,
+    max_list: Option<u32>,
+    cfg: &config::StorageConfig,
+) -> simple3::limits::Limits {
+    let mb = max_obj_mb.or(cfg.max_object_size_mb).unwrap_or(5120);
+    // checked_mul guards against overflow on very large MB values
+    let max_object_size = mb.saturating_mul(1024 * 1024);
+    #[allow(clippy::cast_possible_truncation)] // u32 -> usize: max_list_keys fits in usize on all platforms
+    let max_list_keys = max_list.or(cfg.max_list_keys).unwrap_or(1000) as usize;
+    simple3::limits::Limits {
+        max_object_size,
+        max_list_keys,
+    }
+}
+
 #[allow(clippy::too_many_lines)] // single dispatch for all subcommands, splitting would hurt readability
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -353,18 +370,7 @@ pub async fn run() -> anyhow::Result<()> {
                     rate_limit_rps: rate_limit_rps
                         .or(cfg.server.rate_limit_rps)
                         .unwrap_or(0),
-                    limits: simple3::limits::Limits {
-                        max_object_size: max_object_size_mb
-                            .or(cfg.storage.max_object_size_mb)
-                            .unwrap_or(5120)
-                            * 1024
-                            * 1024,
-                        #[allow(clippy::cast_possible_truncation)]
-                        max_list_keys: max_list_keys
-                            .or(cfg.storage.max_list_keys)
-                            .unwrap_or(1000)
-                            as usize,
-                    },
+                    limits: resolve_limits(max_object_size_mb, max_list_keys, &cfg.storage),
                 },
                 _ => serve_config::ServeConfig {
                     host: cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
@@ -377,20 +383,7 @@ pub async fn run() -> anyhow::Result<()> {
                     shutdown_timeout: cfg.server.shutdown_timeout.unwrap_or(30),
                     min_disk_free_mb: cfg.storage.min_disk_free_mb.unwrap_or(0),
                     rate_limit_rps: cfg.server.rate_limit_rps.unwrap_or(0),
-                    limits: simple3::limits::Limits {
-                        max_object_size: cfg
-                            .storage
-                            .max_object_size_mb
-                            .unwrap_or(5120)
-                            * 1024
-                            * 1024,
-                        #[allow(clippy::cast_possible_truncation)]
-                        max_list_keys: cfg
-                            .storage
-                            .max_list_keys
-                            .unwrap_or(1000)
-                            as usize,
-                    },
+                    limits: resolve_limits(None, None, &cfg.storage),
                 },
             };
             serve::run(&cli.data_dir, serve_cfg).await
