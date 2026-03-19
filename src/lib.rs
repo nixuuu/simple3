@@ -4,5 +4,6 @@ pub mod grpc_helpers;
 pub mod limits;
 pub mod metrics_util;
 pub mod s3impl;
+pub mod s3impl_helpers;
 pub mod storage;
 pub mod types;

@@ -15,6 +15,7 @@ pub mod keys;
 pub mod policy_cmd;
 pub mod serve;
 pub mod serve_config;
+mod serve_lifecycle;
 pub mod util;
 mod verify;
 

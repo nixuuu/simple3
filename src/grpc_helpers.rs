@@ -8,10 +8,13 @@ use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
 
 use crate::grpc::proto::{
-    self, BulkGetObjectStart, BulkGetResponse, BulkPutRequest, GetObjectResponse,
-    ObjectMetadata, PutObjectInit, PutObjectRequest,
+    self, BulkGetObjectStart, BulkGetResponse, BulkPutRequest, DeleteError,
+    DeleteMarkerProto, DeleteObjectIdentifier, DeletedObjectResult, GetObjectResponse,
+    ListObjectVersionsResponse, ListObjectsResponse, ObjectInfo, ObjectMetadata, PutObjectInit,
+    PutObjectRequest, StatsResponse, VerifyResponse,
 };
-use crate::storage::{BucketStore, SegmentStat};
+use crate::storage::versioning::ListVersionsResult;
+use crate::storage::{BucketStore, SegmentStat, VerifyResult};
 use crate::types::ObjectMeta;
 
 /// Monotonic counter for unique temp file names.
@@ -289,4 +292,233 @@ pub fn bulk_get_header(key: &str, meta: &ObjectMeta) -> BulkGetResponse {
             },
         )),
     }
+}
+
+// ================================================================
+// Helpers extracted from grpc.rs
+// ================================================================
+
+/// Convert an empty string to `None`.
+pub(crate) fn non_empty(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Clamp a signed `max_keys` value from the client to a positive `usize`
+/// bounded by the server-configured limit.
+#[allow(clippy::cast_sign_loss)]
+pub(crate) fn clamp_max_keys(raw: i32, server_limit: usize) -> usize {
+    (if raw <= 0 { 1000 } else { raw as usize }).min(server_limit)
+}
+
+/// Build a `ListObjectsResponse` from storage results.
+pub(crate) fn build_list_objects_response(
+    entries: Vec<(String, ObjectMeta)>,
+    common_prefixes: Vec<String>,
+    truncated: bool,
+) -> ListObjectsResponse {
+    let next_token = if truncated {
+        entries.last().map(|(k, _)| k.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let objects: Vec<ObjectInfo> = entries
+        .into_iter()
+        .map(|(key, meta)| ObjectInfo {
+            key,
+            size: meta.data_length(),
+            etag: meta.etag,
+            last_modified: meta.last_modified,
+            version_id: meta.version_id,
+        })
+        .collect();
+
+    ListObjectsResponse {
+        objects,
+        common_prefixes,
+        is_truncated: truncated,
+        next_continuation_token: next_token,
+    }
+}
+
+/// Build a `ListObjectVersionsResponse` from storage results.
+pub(crate) fn build_list_versions_response(
+    result: ListVersionsResult,
+) -> ListObjectVersionsResponse {
+    let mut versions = Vec::new();
+    let mut delete_markers = Vec::new();
+
+    for entry in result.entries {
+        if entry.meta.is_delete_marker {
+            delete_markers.push(DeleteMarkerProto {
+                key: entry.key,
+                version_id: entry.version_id,
+                last_modified: entry.meta.last_modified,
+                is_latest: entry.is_latest,
+            });
+        } else {
+            let size = entry.meta.data_length();
+            let last_modified = entry.meta.last_modified;
+            versions.push(proto::VersionEntry {
+                key: entry.key,
+                version_id: entry.version_id,
+                etag: entry.meta.etag,
+                size,
+                last_modified,
+                is_latest: entry.is_latest,
+                content_type: entry.meta.content_type.unwrap_or_default(),
+            });
+        }
+    }
+
+    ListObjectVersionsResponse {
+        versions,
+        delete_markers,
+        common_prefixes: result.common_prefixes,
+        is_truncated: result.is_truncated,
+        next_key_marker: result.next_key_marker.unwrap_or_default(),
+        next_version_id_marker: result.next_version_id_marker.unwrap_or_default(),
+    }
+}
+
+/// Execute batch delete on a list of items, returning deleted and error lists.
+pub(crate) fn execute_batch_delete(
+    store: &Arc<BucketStore>,
+    items: Vec<DeleteObjectIdentifier>,
+) -> (Vec<DeletedObjectResult>, Vec<DeleteError>) {
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for item in items {
+        let result = if let Some(vid) = &item.version_id {
+            let s = Arc::clone(store);
+            let k = item.key.clone();
+            let v: String = vid.clone();
+            (|| -> io::Result<Option<ObjectMeta>> {
+                if let Some(m) = s.delete_current_version(&k, &v)? {
+                    return Ok(Some(m));
+                }
+                s.delete_version(&k, &v)
+            })()
+        } else {
+            store.delete_object(&item.key)
+        };
+
+        match result {
+            Ok(meta) => {
+                let (vid, dm) = meta.as_ref().map_or((None, None), |m| {
+                    (m.version_id.clone(), Some(m.is_delete_marker))
+                });
+                deleted.push(DeletedObjectResult {
+                    key: item.key,
+                    version_id: vid,
+                    delete_marker: dm,
+                });
+            }
+            Err(e) => errors.push(DeleteError {
+                key: item.key,
+                message: e.to_string(),
+                version_id: item.version_id,
+            }),
+        }
+    }
+    (deleted, errors)
+}
+
+/// Build a `VerifyResponse` from a storage `VerifyResult`.
+pub(crate) fn build_verify_response(result: VerifyResult) -> VerifyResponse {
+    let errors = result
+        .errors
+        .into_iter()
+        .map(|e| proto::VerifyError {
+            key: e.key,
+            kind: format!("{:?}", e.kind),
+            detail: e.detail,
+        })
+        .collect();
+
+    VerifyResponse {
+        total_objects: result.total_objects,
+        verified_ok: result.verified_ok,
+        checksum_errors: result.checksum_errors,
+        read_errors: result.read_errors,
+        errors,
+        crc_errors: result.crc_errors,
+    }
+}
+
+/// Parameters for `execute_copy_blocking`.
+pub(crate) struct CopyParams {
+    pub src_key: String,
+    pub src_version_id: Option<String>,
+    pub dest_key: String,
+    pub tmp_path: std::path::PathBuf,
+    pub replace_metadata: bool,
+    pub req_content_type: Option<String>,
+    pub req_metadata: std::collections::HashMap<String, String>,
+    pub max_obj_size: u64,
+    pub now: u64,
+}
+
+/// Execute the blocking copy-object logic: read source, write to tmp, put in dest.
+///
+/// Returns `(etag, dest_meta, source_version_id, data_length)`.
+pub(crate) fn execute_copy_blocking(
+    src_store: &Arc<BucketStore>,
+    dest_store: &Arc<BucketStore>,
+    p: CopyParams,
+) -> io::Result<(String, ObjectMeta, Option<String>, u64)> {
+    let src_meta = src_store
+        .get_object_or_version(&p.src_key, p.src_version_id.as_deref())?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source object not found"))?;
+    if src_meta.is_delete_marker {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "source is a delete marker",
+        ));
+    }
+    if p.max_obj_size > 0 && src_meta.data_length() > p.max_obj_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EntityTooLarge: source object exceeds max_object_size",
+        ));
+    }
+
+    let (content_type, user_metadata) = if p.replace_metadata {
+        (p.req_content_type, p.req_metadata)
+    } else {
+        (src_meta.content_type.clone(), src_meta.user_metadata.clone())
+    };
+
+    let (etag, crc) = src_store.copy_to_tmp_file(&src_meta, &p.tmp_path)?;
+    let data_len = src_meta.data_length();
+    match dest_store.put_object_streamed(
+        &p.dest_key, &p.tmp_path, content_type, etag.clone(), p.now, user_metadata, Some(crc),
+    ) {
+        Ok(m) => Ok((etag, m, src_meta.version_id, data_len)),
+        Err(e) => {
+            std::fs::remove_file(&p.tmp_path).ok();
+            Err(e)
+        }
+    }
+}
+
+/// Gather segment and version stats and build a `StatsResponse`.
+pub(crate) fn build_stats_response(
+    bucket: String,
+    store: &BucketStore,
+) -> io::Result<StatsResponse> {
+    let stats = store.segment_stats()?;
+    let (version_count, delete_marker_count, total_versioned_size) = store.version_stats()?;
+    let total_size: u64 = stats.iter().map(|s| s.size).sum();
+    let total_dead_bytes: u64 = stats.iter().map(|s| s.dead_bytes).sum();
+
+    Ok(StatsResponse {
+        bucket,
+        segments: segments_to_proto(stats),
+        total_size,
+        total_dead_bytes,
+        version_count,
+        delete_marker_count,
+        total_versioned_size,
+    })
 }

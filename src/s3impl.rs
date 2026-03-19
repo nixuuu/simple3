@@ -1,24 +1,19 @@
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures::TryStreamExt;
-use md5::{Digest, Md5};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, CreateBucketInput,
-    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketInput, DeleteBucketOutput, DeleteMarkerEntry, DeleteObjectInput,
-    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
-    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
-    ListBucketsInput, ListBucketsOutput,
-    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
-    MetadataDirective, Object, ObjectVersion, PutBucketVersioningInput,
+    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
+    CopyObjectOutput, CopyObjectResult, CopySource, CreateBucketInput, CreateBucketOutput,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput,
+    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
+    ETag, GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput,
+    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
+    ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, MetadataDirective, Object, PutBucketVersioningInput,
     PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
     UploadPartInput, UploadPartOutput,
 };
@@ -26,23 +21,12 @@ use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::limits::Limits;
 use crate::metrics_util::DurationRecorder;
+use crate::s3impl_helpers::{
+    TMP_COUNTER, blocking, build_version_lists, delete_one_unversioned, delete_one_versioned,
+    execute_copy_blocking, resolve_object_version, stream_body_to_tmp, version_id_string,
+};
 use crate::storage::versioning::VersioningState;
 use crate::storage::{BucketStore, Storage};
-use crate::types::ObjectMeta;
-
-/// Monotonic counter for unique temp file names across concurrent requests.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Run a blocking closure on the tokio blocking thread pool.
-async fn blocking<F, T>(f: F) -> Result<T, io::Error>
-where
-    F: FnOnce() -> io::Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| io::Error::other(format!("task panicked: {e}")))?
-}
 
 pub struct SimpleStorage {
     inner: Arc<Storage>,
@@ -60,60 +44,6 @@ impl SimpleStorage {
             .map_err(|e| { tracing::error!("get_bucket({name}): {e}"); s3_error!(e, InternalError) })?
             .ok_or_else(|| s3_error!(NoSuchBucket))
     }
-}
-
-/// Stream request body to a temp file, returning `(md5_hex, crc32c)`.
-/// When `max_size > 0`, aborts with `EntityTooLarge` if the body exceeds the limit.
-async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path, max_size: u64) -> S3Result<(String, u32)> {
-    let file = tokio::fs::File::create(tmp_path).await
-        .map_err(|e| { tracing::error!("create tmp file: {e}"); s3_error!(e, InternalError) })?;
-    let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
-    let mut hasher = Md5::new();
-    let mut crc: u32 = 0;
-    let mut total_bytes = 0u64;
-    let mut stream = body;
-
-    while let Some(chunk) = stream.try_next().await.map_err(|e| { tracing::error!("read request body: {e}"); s3_error!(InternalError) })? {
-        total_bytes += chunk.len() as u64;
-        if max_size > 0 && total_bytes > max_size {
-            drop(writer);
-            tokio::fs::remove_file(tmp_path).await.ok();
-            return Err(s3_error!(EntityTooLarge));
-        }
-        tokio::io::AsyncWriteExt::write_all(&mut writer, &chunk).await
-            .map_err(|e| { tracing::error!("write tmp file: {e}"); s3_error!(e, InternalError) })?;
-        hasher.update(&chunk);
-        crc = crc32c::crc32c_append(crc, &chunk);
-    }
-    tokio::io::AsyncWriteExt::flush(&mut writer).await
-        .map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
-
-    metrics::counter!("simple3_bytes_received_total").increment(total_bytes);
-    Ok((format!("{:x}", hasher.finalize()), crc))
-}
-
-fn version_id_string(vid: Option<&str>) -> Option<String> {
-    vid.map(str::to_owned)
-}
-
-/// Resolve an object by key, optionally looking up a specific version.
-/// Uses a single read transaction to avoid TOCTOU between tables.
-/// Returns the meta or an `io::Error` with appropriate `ErrorKind`.
-fn resolve_object_version(
-    store: &BucketStore,
-    key: &str,
-    version_id: Option<&str>,
-) -> io::Result<ObjectMeta> {
-    let not_found_msg = if version_id.is_some() { "NoSuchVersion" } else { "NoSuchKey" };
-    let meta = store
-        .get_object_or_version(key, version_id)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, not_found_msg))?;
-
-    if meta.is_delete_marker {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "DeleteMarker"));
-    }
-
-    Ok(meta)
 }
 
 #[async_trait::async_trait]
@@ -197,8 +127,6 @@ impl S3 for SimpleStorage {
         Ok(S3Response::new(output))
     }
 
-    // === Bucket versioning ===
-
     async fn put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
@@ -263,8 +191,6 @@ impl S3 for SimpleStorage {
         };
         Ok(S3Response::new(output))
     }
-
-    // === Object operations ===
 
     async fn put_object(
         &self,
@@ -479,32 +405,11 @@ impl S3 for SimpleStorage {
         let dest_key = input.key;
         let max_obj_size = self.limits.max_object_size;
         let result = blocking(move || {
-            let src_meta = resolve_object_version(&ss, &src_key, src_vid.as_deref())?;
-
-            if max_obj_size > 0 && src_meta.data_length() > max_obj_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "EntityTooLarge: source object exceeds max_object_size",
-                ));
-            }
-
-            let (content_type, user_metadata) = if replace_metadata {
-                (req_content_type, req_metadata)
-            } else {
-                (src_meta.content_type.clone(), src_meta.user_metadata.clone())
-            };
-
-            let (etag_hex, crc) = ss.copy_to_tmp_file(&src_meta, &tmp_path)?;
-            let data_len = src_meta.data_length();
-            match dest_store.put_object_streamed(
-                &dest_key, &tmp_path, content_type, etag_hex.clone(), now, user_metadata, Some(crc),
-            ) {
-                Ok(m) => Ok((etag_hex, m, src_meta.version_id, data_len)),
-                Err(e) => {
-                    std::fs::remove_file(&tmp_path).ok();
-                    Err(e)
-                }
-            }
+            execute_copy_blocking(
+                &ss, &dest_store, &src_key, src_vid.as_deref(), &dest_key,
+                &tmp_path, replace_metadata, req_content_type, req_metadata,
+                now, max_obj_size,
+            )
         })
         .await
         .map_err(|e| {
@@ -574,7 +479,6 @@ impl S3 for SimpleStorage {
         Ok(S3Response::new(output))
     }
 
-    #[allow(clippy::too_many_lines)] // per-item version/non-version branching in batch delete
     async fn delete_objects(
         &self,
         req: S3Request<DeleteObjectsInput>,
@@ -591,76 +495,14 @@ impl S3 for SimpleStorage {
 
             for obj_id in objects {
                 let key = obj_id.key;
-                let version_id = obj_id.version_id;
-
-                if let Some(vid) = version_id {
-                    // Version-specific delete
-                    match store.delete_current_version(&key, &vid) {
-                        Ok(Some(meta)) => {
-                            deleted_list.push(DeletedObject {
-                                key: Some(key),
-                                version_id: Some(vid),
-                                delete_marker: Some(meta.is_delete_marker),
-                                ..Default::default()
-                            });
-                        }
-                        Ok(None) => {
-                            // Try versions table
-                            match store.delete_version(&key, &vid) {
-                                Ok(Some(meta)) => {
-                                    deleted_list.push(DeletedObject {
-                                        key: Some(key),
-                                        version_id: Some(vid),
-                                        delete_marker: if meta.is_delete_marker { Some(true) } else { None },
-                                        ..Default::default()
-                                    });
-                                }
-                                Ok(None) => {
-                                    deleted_list.push(DeletedObject {
-                                        key: Some(key),
-                                        version_id: Some(vid),
-                                        ..Default::default()
-                                    });
-                                }
-                                Err(e) => errors.push(s3s::dto::Error {
-                                    code: Some("InternalError".to_owned()),
-                                    key: Some(key),
-                                    message: Some(e.to_string()),
-                                    version_id: Some(vid),
-                                }),
-                            }
-                        }
-                        Err(e) => errors.push(s3s::dto::Error {
-                            code: Some("InternalError".to_owned()),
-                            key: Some(key),
-                            message: Some(e.to_string()),
-                            version_id: Some(vid),
-                        }),
-                    }
+                let result = if let Some(vid) = obj_id.version_id {
+                    delete_one_versioned(&store, key, vid)
                 } else {
-                    // No version_id: hard delete or create delete marker
-                    match store.delete_object(&key) {
-                        Ok(Some(meta)) => {
-                            deleted_list.push(DeletedObject {
-                                key: Some(key),
-                                version_id: version_id_string(meta.version_id.as_deref()),
-                                delete_marker: if meta.is_delete_marker { Some(true) } else { None },
-                                ..Default::default()
-                            });
-                        }
-                        Ok(None) => {
-                            deleted_list.push(DeletedObject {
-                                key: Some(key),
-                                ..Default::default()
-                            });
-                        }
-                        Err(e) => errors.push(s3s::dto::Error {
-                            code: Some("InternalError".to_owned()),
-                            key: Some(key),
-                            message: Some(e.to_string()),
-                            version_id: None,
-                        }),
-                    }
+                    delete_one_unversioned(&store, key)
+                };
+                match result {
+                    Ok(deleted) => deleted_list.push(deleted),
+                    Err(err) => errors.push(err),
                 }
             }
             Ok((deleted_list, errors))
@@ -761,9 +603,6 @@ impl S3 for SimpleStorage {
         Ok(S3Response::new(output))
     }
 
-    // === ListObjectVersions ===
-
-    #[allow(clippy::too_many_lines)] // maps storage entries to S3 DTOs with version/delete-marker split
     async fn list_object_versions(
         &self,
         req: S3Request<ListObjectVersionsInput>,
@@ -791,34 +630,7 @@ impl S3 for SimpleStorage {
         .await
         .map_err(|e| { tracing::error!("list_object_versions: {e}"); s3_error!(e, InternalError) })?;
 
-        let mut versions = Vec::new();
-        let mut delete_markers = Vec::new();
-
-        for entry in result.entries {
-            let last_modified =
-                Timestamp::from(UNIX_EPOCH + Duration::from_secs(entry.meta.last_modified));
-
-            if entry.meta.is_delete_marker {
-                delete_markers.push(DeleteMarkerEntry {
-                    is_latest: Some(entry.is_latest),
-                    key: Some(entry.key),
-                    last_modified: Some(last_modified),
-                    version_id: Some(entry.version_id),
-                    ..Default::default()
-                });
-            } else {
-                let size = entry.meta.data_length().cast_signed();
-                versions.push(ObjectVersion {
-                    e_tag: Some(ETag::Strong(entry.meta.etag)),
-                    is_latest: Some(entry.is_latest),
-                    key: Some(entry.key),
-                    last_modified: Some(last_modified),
-                    size: Some(size),
-                    version_id: Some(entry.version_id),
-                    ..Default::default()
-                });
-            }
-        }
+        let (versions, delete_markers) = build_version_lists(result.entries);
 
         let cp: Option<Vec<CommonPrefix>> = if result.common_prefixes.is_empty() {
             None
@@ -849,8 +661,6 @@ impl S3 for SimpleStorage {
         };
         Ok(S3Response::new(output))
     }
-
-    // === Multipart upload ===
 
     async fn create_multipart_upload(
         &self,
