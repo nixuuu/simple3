@@ -687,8 +687,9 @@ pub async fn run(
             Some((u, p))
         }
         (Some(_), None) | (None, Some(_)) => {
-            tracing::warn!("metrics auth partially configured (need both username and password); metrics endpoint is open");
-            None
+            anyhow::bail!(
+                "metrics auth partially configured: both --metrics-user and --metrics-password must be set"
+            );
         }
         _ => None,
     };
@@ -763,24 +764,11 @@ mod tests {
     #[tokio::test]
     async fn test_request_id_header() {
         let dir = tempfile::tempdir().unwrap();
-        let service = build_admin_service(dir.path());
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
-        });
-
+        let port = spawn_test_server(build_admin_service(dir.path())).await;
         let resp = reqwest::get(format!("http://127.0.0.1:{port}/health"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-
         let header = resp
             .headers()
             .get("x-request-id")
@@ -792,27 +780,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_id_unique_per_request() {
         let dir = tempfile::tempdir().unwrap();
-        let service = build_admin_service(dir.path());
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(_) => break,
-                };
-                let svc = service.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .await;
-                });
-            }
-        });
-
+        let port = spawn_test_server(build_admin_service(dir.path())).await;
         let client = reqwest::Client::new();
         let r1 = client
             .get(format!("http://127.0.0.1:{port}/health"))
@@ -824,7 +792,6 @@ mod tests {
             .send()
             .await
             .unwrap();
-
         let id1 = r1.headers().get("x-request-id").unwrap().to_str().unwrap();
         let id2 = r2.headers().get("x-request-id").unwrap().to_str().unwrap();
         assert_ne!(id1, id2, "each request must get a unique request ID");
@@ -866,93 +833,9 @@ mod tests {
         assert!(disk_free(dir.path()) > 0);
     }
 
-    fn build_admin_service_with_metrics_auth(
-        dir: &std::path::Path,
-        metrics_auth: Option<(String, String)>,
-    ) -> AdminService {
-        let mut svc = build_admin_service(dir);
-        svc.metrics_auth = metrics_auth;
-        svc
-    }
-
-    #[tokio::test]
-    async fn test_metrics_no_auth_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = build_admin_service(dir.path());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
-        });
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_auth_rejects_no_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = build_admin_service_with_metrics_auth(
-            dir.path(),
-            Some(("user".into(), "pass".into())),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
-        });
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-        assert_eq!(
-            resp.headers().get("www-authenticate").unwrap().to_str().unwrap(),
-            "Basic realm=\"metrics\""
-        );
-    }
-
-    #[tokio::test]
-    async fn test_metrics_auth_accepts_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = build_admin_service_with_metrics_auth(
-            dir.path(),
-            Some(("user".into(), "pass".into())),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
-        });
-        let client = reqwest::Client::new();
-        let resp = client
-            .get(format!("http://127.0.0.1:{port}/metrics"))
-            .basic_auth("user", Some("pass"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_auth_rejects_wrong_credentials() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = build_admin_service_with_metrics_auth(
-            dir.path(),
-            Some(("user".into(), "pass".into())),
-        );
+    /// Spawn an `AdminService` on a random port, accepting multiple connections.
+    /// Returns the port number.
+    async fn spawn_test_server(service: AdminService) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -970,6 +853,71 @@ mod tests {
                 });
             }
         });
+        port
+    }
+
+    fn build_admin_service_with_metrics_auth(
+        dir: &std::path::Path,
+        metrics_auth: Option<(String, String)>,
+    ) -> AdminService {
+        let mut svc = build_admin_service(dir);
+        svc.metrics_auth = metrics_auth;
+        svc
+    }
+
+    #[tokio::test]
+    async fn test_metrics_no_auth_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = spawn_test_server(build_admin_service(dir.path())).await;
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_auth_rejects_no_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service_with_metrics_auth(
+            dir.path(),
+            Some(("user".into(), "pass".into())),
+        );
+        let port = spawn_test_server(service).await;
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            resp.headers().get("www-authenticate").unwrap().to_str().unwrap(),
+            "Basic realm=\"metrics\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_auth_accepts_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service_with_metrics_auth(
+            dir.path(),
+            Some(("user".into(), "pass".into())),
+        );
+        let port = spawn_test_server(service).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/metrics"))
+            .basic_auth("user", Some("pass"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_auth_rejects_wrong_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_admin_service_with_metrics_auth(
+            dir.path(),
+            Some(("user".into(), "pass".into())),
+        );
+        let port = spawn_test_server(service).await;
         let client = reqwest::Client::new();
 
         // Wrong password
@@ -1007,17 +955,8 @@ mod tests {
             dir.path(),
             Some(("user".into(), "p:a:ss".into())),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
-        });
-        let client = reqwest::Client::new();
-        let resp = client
+        let port = spawn_test_server(service).await;
+        let resp = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/metrics"))
             .basic_auth("user", Some("p:a:ss"))
             .send()

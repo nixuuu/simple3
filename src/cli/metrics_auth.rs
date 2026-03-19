@@ -10,7 +10,16 @@ pub fn check(
     req.headers()
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|value| {
+            // RFC 7235/9110: auth scheme names are case-insensitive
+            let mut parts = value.splitn(2, ' ');
+            match (parts.next(), parts.next()) {
+                (Some(scheme), Some(encoded)) if scheme.eq_ignore_ascii_case("Basic") => {
+                    Some(encoded)
+                }
+                _ => None,
+            }
+        })
         .and_then(|encoded| {
             base64::engine::general_purpose::STANDARD
                 .decode(encoded.trim())
