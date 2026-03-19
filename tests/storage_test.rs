@@ -1,20 +1,12 @@
+mod common;
+use common::write_part;
+
 use md5::{Digest, Md5};
-use simple3::storage::{BucketStore, Storage};
+use simple3::storage::Storage;
 use simple3::types::ObjectMeta;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static TEST_TMP: AtomicU64 = AtomicU64::new(0);
-
-fn write_part(bucket: &BucketStore, upload_id: &str, part_number: i32, data: &[u8]) -> String {
-    let id = TEST_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = bucket.bucket_dir().join(format!(".tmp_test_{id}"));
-    std::fs::write(&tmp, data).unwrap();
-    let md5_hex = format!("{:x}", Md5::digest(data));
-    bucket.upload_part(upload_id, part_number, &tmp, &md5_hex).unwrap()
-}
 
 fn make_meta(segment_id: u32, offset: u64, length: u64, etag: &str, crc: u32) -> ObjectMeta {
     ObjectMeta {

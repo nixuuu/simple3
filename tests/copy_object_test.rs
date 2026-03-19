@@ -354,7 +354,7 @@ async fn test_copy_percent_encoded_chars_key() {
         .copy_object()
         .bucket("test")
         .key("backup/encoded-copy.txt")
-        .copy_source(format!("test/{key}"))
+        .copy_source(format!("test/{}", urlencoding::encode(key)))
         .send()
         .await
         .unwrap();

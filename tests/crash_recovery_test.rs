@@ -1,23 +1,15 @@
+mod common;
+use common::write_part;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use md5::{Digest, Md5};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use simple3::storage::{BucketStore, Storage};
+use simple3::storage::Storage;
 use simple3::types::ObjectMeta;
-
-static TEST_TMP: AtomicU64 = AtomicU64::new(0);
-
-fn write_part(bucket: &BucketStore, upload_id: &str, part_number: i32, data: &[u8]) -> String {
-    let id = TEST_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = bucket.bucket_dir().join(format!(".tmp_test_{id}"));
-    fs::write(&tmp, data).unwrap();
-    let md5_hex = format!("{:x}", Md5::digest(data));
-    bucket.upload_part(upload_id, part_number, &tmp, &md5_hex).unwrap()
-}
 
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
 const SEG_COMPACTING: TableDefinition<u32, u8> = TableDefinition::new("seg_compacting");

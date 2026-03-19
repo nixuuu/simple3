@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,9 +65,9 @@ impl SimpleStorage {
 /// Stream request body to a temp file, returning `(md5_hex, crc32c)`.
 /// When `max_size > 0`, aborts with `EntityTooLarge` if the body exceeds the limit.
 async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path, max_size: u64) -> S3Result<(String, u32)> {
-    let file = std::fs::File::create(tmp_path)
+    let file = tokio::fs::File::create(tmp_path).await
         .map_err(|e| { tracing::error!("create tmp file: {e}"); s3_error!(e, InternalError) })?;
-    let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
+    let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
     let mut hasher = Md5::new();
     let mut crc: u32 = 0;
     let mut total_bytes = 0u64;
@@ -77,16 +77,16 @@ async fn stream_body_to_tmp(body: StreamingBlob, tmp_path: &Path, max_size: u64)
         total_bytes += chunk.len() as u64;
         if max_size > 0 && total_bytes > max_size {
             drop(writer);
-            std::fs::remove_file(tmp_path).ok();
+            tokio::fs::remove_file(tmp_path).await.ok();
             return Err(s3_error!(EntityTooLarge));
         }
-        writer
-            .write_all(&chunk)
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &chunk).await
             .map_err(|e| { tracing::error!("write tmp file: {e}"); s3_error!(e, InternalError) })?;
         hasher.update(&chunk);
         crc = crc32c::crc32c_append(crc, &chunk);
     }
-    writer.flush().map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
+    tokio::io::AsyncWriteExt::flush(&mut writer).await
+        .map_err(|e| { tracing::error!("flush tmp file: {e}"); s3_error!(e, InternalError) })?;
 
     metrics::counter!("simple3_bytes_received_total").increment(total_bytes);
     Ok((format!("{:x}", hasher.finalize()), crc))
@@ -282,7 +282,7 @@ impl S3 for SimpleStorage {
         let (etag_hex, crc) = match stream_body_to_tmp(body, &tmp_path, self.limits.max_object_size).await {
             Ok(v) => v,
             Err(e) => {
-                std::fs::remove_file(&tmp_path).ok();
+                tokio::fs::remove_file(&tmp_path).await.ok();
                 return Err(e);
             }
         };
@@ -887,7 +887,7 @@ impl S3 for SimpleStorage {
         let (md5_hex, _crc) = match stream_body_to_tmp(body, &tmp_path, self.limits.max_object_size).await {
             Ok(v) => v,
             Err(e) => {
-                std::fs::remove_file(&tmp_path).ok();
+                tokio::fs::remove_file(&tmp_path).await.ok();
                 return Err(e);
             }
         };

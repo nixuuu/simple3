@@ -30,6 +30,9 @@ impl BucketStore {
     /// Store a part from a temp file that was streamed to disk.
     /// `md5_hex` is the pre-computed MD5 hex string (from streaming).
     /// The part file stores [data][16-byte raw MD5] for assembly.
+    /// Appends the digest to the temp file first, then atomically renames
+    /// to the final `.mpu_*` path so `complete_multipart_upload` only sees
+    /// fully-written parts.
     pub fn upload_part(
         &self,
         upload_id: &str,
@@ -37,11 +40,13 @@ impl BucketStore {
         tmp_path: &Path,
         md5_hex: &str,
     ) -> io::Result<String> {
+        let digest = md5_hex_to_bytes(md5_hex)?;
+        {
+            let mut f = OpenOptions::new().append(true).open(tmp_path)?;
+            f.write_all(&digest)?;
+        }
         let part_path = self.part_path(upload_id, part_number);
         fs::rename(tmp_path, &part_path)?;
-        let mut f = OpenOptions::new().append(true).open(&part_path)?;
-        let digest = md5_hex_to_bytes(md5_hex)?;
-        f.write_all(&digest)?;
         Ok(md5_hex.to_owned())
     }
 
