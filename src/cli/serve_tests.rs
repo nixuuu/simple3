@@ -51,7 +51,7 @@ fn build_admin_service_with_metrics_auth(
     metrics_auth: Option<(String, String)>,
 ) -> AdminService {
     let mut svc = build_admin_service(dir);
-    svc.metrics_auth = metrics_auth;
+    svc.metrics_auth = metrics_auth.map(Arc::new);
     svc
 }
 

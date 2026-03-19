@@ -129,7 +129,7 @@ struct AdminService {
     auth_store: Arc<AuthStore>,
     min_disk_free_mb: u64,
     prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
-    metrics_auth: Option<(String, String)>,
+    metrics_auth: Option<Arc<(String, String)>>,
 }
 
 type ServiceFuture =
@@ -171,8 +171,8 @@ impl AdminService {
         path: &str,
     ) -> ServiceFuture {
         if *method == hyper::Method::GET && path == "/metrics" {
-            if let Some((ref user, ref pass)) = self.metrics_auth
-                && !super::metrics_auth::check(&req, user, pass)
+            if let Some(ref creds) = self.metrics_auth
+                && !super::metrics_auth::check(&req, &creds.0, &creds.1)
             {
                 let resp = super::metrics_auth::unauthorized_response();
                 return Box::pin(async { Ok(resp) });
@@ -684,7 +684,7 @@ pub async fn run(data_dir: &Path, cfg: ServeConfig) -> anyhow::Result<()> {
     let metrics_auth = match (cfg.metrics_user, cfg.metrics_password) {
         (Some(u), Some(p)) => {
             tracing::info!("metrics endpoint auth enabled");
-            Some((u, p))
+            Some(Arc::new((u, p)))
         }
         (Some(_), None) | (None, Some(_)) => {
             anyhow::bail!(
