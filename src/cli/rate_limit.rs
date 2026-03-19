@@ -20,6 +20,26 @@ pub fn build_rate_limiter(rps: u32) -> Option<Arc<IpRateLimiter>> {
     Some(Arc::new(RateLimiter::dashmap(quota)))
 }
 
+/// Periodically prune stale entries from the per-IP rate limiter.
+/// Runs every 5 minutes until a shutdown signal is received.
+pub fn spawn_cleanup(
+    limiter: Arc<IpRateLimiter>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(300);
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                _ = rx.changed() => break,
+            }
+            limiter.retain_recent();
+            limiter.shrink_to_fit();
+        }
+    })
+}
+
 /// Extract peer IP from request extensions.
 /// Checks for direct `IpAddr` (set by HTTP `PeerIpService`) first,
 /// then falls back to tonic's `TcpConnectInfo` (set automatically for gRPC).

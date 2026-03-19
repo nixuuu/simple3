@@ -152,38 +152,39 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
         );
 
         // Rate limit check (exempt health/ready/metrics endpoints)
-        if path != "/health"
+        let rate_limited = path != "/health"
             && path != "/ready"
             && path != "/metrics"
-            && let Some(ref limiter) = self.rate_limiter
-        {
-            let peer_ip = req
-                .extensions()
-                .get::<std::net::IpAddr>()
-                .copied()
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-            if limiter.check_key(&peer_ip).is_err() {
-                metrics::counter!("simple3_rate_limited_total", "protocol" => "http")
-                    .increment(1);
-                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                    <Error><Code>SlowDown</Code>\
-                    <Message>Rate limit exceeded</Message></Error>"
-                    .to_owned();
-                return Box::pin(async {
-                    Ok(hyper::Response::builder()
-                        .status(503)
-                        .header("content-type", "application/xml")
-                        .header("retry-after", "1")
-                        .body(s3s::Body::from(body))
-                        .unwrap_or_else(|e| json_response(
-                            500,
-                            &serde_json::json!({"error": format!("rate limit response: {e}")}),
-                        )))
-                });
-            }
-        }
+            && self.rate_limiter.as_ref().is_some_and(|limiter| {
+                let peer_ip = req
+                    .extensions()
+                    .get::<std::net::IpAddr>()
+                    .copied()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                limiter.check_key(&peer_ip).is_err()
+            });
 
-        let fut = self.dispatch(req, &method, &path);
+        let fut: ServiceFuture = if rate_limited {
+            metrics::counter!("simple3_rate_limited_total", "protocol" => "http").increment(1);
+            let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                <Error><Code>SlowDown</Code>\
+                <Message>Rate limit exceeded</Message></Error>"
+                .to_owned();
+            Box::pin(async {
+                Ok(hyper::Response::builder()
+                    .status(503)
+                    .header("content-type", "application/xml")
+                    .header("retry-after", "1")
+                    .body(s3s::Body::from(body))
+                    .unwrap_or_else(|e| json_response(
+                        500,
+                        &serde_json::json!({"error": format!("rate limit response: {e}")}),
+                    )))
+            })
+        } else {
+            self.dispatch(req, &method, &path)
+        };
+
         Box::pin(
             async move {
                 let mut resp = fut.await?;
@@ -709,6 +710,13 @@ pub async fn run(
     spawn_signal_handler(sigterm, sigint, shutdown_tx);
 
     let mut bg_tasks: Vec<JoinHandle<()>> = Vec::new();
+
+    if let Some(ref limiter) = rate_limiter {
+        bg_tasks.push(super::rate_limit::spawn_cleanup(
+            Arc::clone(limiter),
+            &shutdown_rx,
+        ));
+    }
 
     if cfg.autovacuum_interval > 0 {
         bg_tasks.push(spawn_autovacuum(

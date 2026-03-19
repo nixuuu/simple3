@@ -41,7 +41,7 @@ impl BucketStore {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::too_many_arguments)] // max_object_size limit added for issue #14
+    #[allow(clippy::too_many_arguments)] // logically-distinct storage params; bundling into a struct adds indirection with no reuse benefit
     pub fn complete_multipart_upload(
         &self,
         upload_id: &str,
