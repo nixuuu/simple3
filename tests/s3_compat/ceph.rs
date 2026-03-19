@@ -48,8 +48,8 @@ secret_key = {alt_secret}
 display_name = Tenant
 user_id = tenant
 email = tenant@example.com
-access_key = {main_key}
-secret_key = {main_secret}
+access_key = {alt_key}
+secret_key = {alt_secret}
 "#
     )
 }

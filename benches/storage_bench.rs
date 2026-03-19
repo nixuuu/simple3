@@ -11,7 +11,7 @@ use std::sync::Arc;
 const KB: usize = 1024;
 const MB: usize = 1024 * KB;
 
-fn make_meta(segment_id: u32, offset: u64, length: u64) -> ObjectMeta {
+fn make_meta(segment_id: u32, offset: u64, length: u64, crc: u32) -> ObjectMeta {
     ObjectMeta {
         segment_id,
         offset,
@@ -21,7 +21,7 @@ fn make_meta(segment_id: u32, offset: u64, length: u64) -> ObjectMeta {
         last_modified: 0,
         user_metadata: HashMap::new(),
         content_md5: None,
-        content_crc32c: None,
+        content_crc32c: Some(crc),
         version_id: None,
         is_delete_marker: false,
     }
@@ -41,8 +41,9 @@ fn prefill(storage: &Storage, bucket: &str, count: usize, obj_size: usize) -> Ve
     let mut keys = Vec::with_capacity(count);
     for i in 0..count {
         let key = format!("key{i:06}");
-        let (seg, off, len) = b.append_data(&data).unwrap();
-        b.put_meta(&key, &make_meta(seg, off, len)).unwrap();
+        let (seg, off, len, crc) = b.append_data(&data).unwrap();
+        let mut meta = make_meta(seg, off, len, crc);
+        b.put_meta(&key, &mut meta).unwrap();
         keys.push(key);
     }
     keys
@@ -95,8 +96,9 @@ fn bench_put(c: &mut Criterion) {
             b.iter(|| {
                 let i = counter.fetch_add(1, Ordering::Relaxed);
                 let key = format!("k{i}");
-                let (seg, off, len) = bucket.append_data(&data).unwrap();
-                bucket.put_meta(&key, &make_meta(seg, off, len)).unwrap();
+                let (seg, off, len, crc) = bucket.append_data(&data).unwrap();
+                let mut meta = make_meta(seg, off, len, crc);
+                bucket.put_meta(&key, &mut meta).unwrap();
             });
         });
     }
@@ -218,8 +220,9 @@ fn bench_overwrite(c: &mut Criterion) {
             b.iter(|| {
                 let key = &keys[idx % keys.len()];
                 idx = idx.wrapping_add(7919);
-                let (seg, off, len) = bucket.append_data(&data).unwrap();
-                bucket.put_meta(key, &make_meta(seg, off, len)).unwrap();
+                let (seg, off, len, crc) = bucket.append_data(&data).unwrap();
+                let mut meta = make_meta(seg, off, len, crc);
+                bucket.put_meta(key, &mut meta).unwrap();
             });
         });
     }
@@ -356,10 +359,9 @@ fn bench_concurrent(c: &mut Criterion) {
                             s.spawn(move || {
                                 for i in 0..ops {
                                     let key = format!("t{t}k{i}");
-                                    let (seg, off, len) = bucket.append_data(data).unwrap();
-                                    bucket
-                                        .put_meta(&key, &make_meta(seg, off, len))
-                                        .unwrap();
+                                    let (seg, off, len, crc) = bucket.append_data(data).unwrap();
+                                    let mut meta = make_meta(seg, off, len, crc);
+                                    bucket.put_meta(&key, &mut meta).unwrap();
                                 }
                             });
                         }
@@ -388,10 +390,9 @@ fn bench_concurrent(c: &mut Criterion) {
                             s.spawn(move || {
                                 for i in 0..ops {
                                     let key = format!("t{t}k{i}");
-                                    let (seg, off, len) = bucket.append_data(data).unwrap();
-                                    bucket
-                                        .put_meta(&key, &make_meta(seg, off, len))
-                                        .unwrap();
+                                    let (seg, off, len, crc) = bucket.append_data(data).unwrap();
+                                    let mut meta = make_meta(seg, off, len, crc);
+                                    bucket.put_meta(&key, &mut meta).unwrap();
                                 }
                             });
                         }
@@ -439,10 +440,9 @@ fn bench_concurrent(c: &mut Criterion) {
                             s.spawn(move || {
                                 for i in 0..ops {
                                     let key = format!("new_t{t}k{i}");
-                                    let (seg, off, len) = bucket.append_data(data).unwrap();
-                                    bucket
-                                        .put_meta(&key, &make_meta(seg, off, len))
-                                        .unwrap();
+                                    let (seg, off, len, crc) = bucket.append_data(data).unwrap();
+                                    let mut meta = make_meta(seg, off, len, crc);
+                                    bucket.put_meta(&key, &mut meta).unwrap();
                                 }
                             });
                         }
@@ -490,10 +490,9 @@ fn bench_concurrent(c: &mut Criterion) {
                             s.spawn(move || {
                                 for i in 0..ops {
                                     let key = format!("new_t{t}k{i}");
-                                    let (seg, off, len) = bucket.append_data(data).unwrap();
-                                    bucket
-                                        .put_meta(&key, &make_meta(seg, off, len))
-                                        .unwrap();
+                                    let (seg, off, len, crc) = bucket.append_data(data).unwrap();
+                                    let mut meta = make_meta(seg, off, len, crc);
+                                    bucket.put_meta(&key, &mut meta).unwrap();
                                 }
                             });
                         }

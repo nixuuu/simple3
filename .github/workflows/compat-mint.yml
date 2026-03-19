@@ -28,7 +28,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Pull Mint image
-        run: docker pull minio/mint:edge
+        run: docker pull minio/mint:edge@sha256:08a05e68893c68be2a83b6f79556853ed6aa3c6c9e64c823a00853e4e55d2200
 
       - name: Run Mint compatibility tests
         run: cargo test --test s3_compat compat_mint -- --ignored --nocapture

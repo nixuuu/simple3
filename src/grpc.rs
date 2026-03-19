@@ -13,7 +13,9 @@ use crate::auth::AuthStore;
 use crate::limits::Limits;
 use crate::metrics_util::DurationRecorder;
 use crate::grpc_helpers::{
-    bulk_get_header, bulk_get_not_found, bulk_put_one_object, map_io_err, meta_to_proto,
+    build_list_objects_response, build_list_versions_response, build_verify_response,
+    bulk_get_header, bulk_get_not_found, bulk_put_one_object, clamp_max_keys,
+    execute_batch_delete, execute_copy_blocking, CopyParams, map_io_err, meta_to_proto, non_empty,
     segments_to_proto, spawn_download_stream, stream_to_tmp, TMP_COUNTER,
 };
 use crate::storage::versioning::VersioningState;
@@ -327,45 +329,7 @@ impl Simple3 for GrpcService {
 
         let items = input.items;
         let (deleted, errors) = tokio::task::spawn_blocking(move || {
-            let mut deleted = Vec::new();
-            let mut errors = Vec::new();
-            for item in items {
-                let result = if let Some(vid) = &item.version_id {
-                    let s = Arc::clone(&store);
-                    let k = item.key.clone();
-                    let v = vid.clone();
-                    // Try current version first, then versions table
-                    (|| -> io::Result<Option<crate::types::ObjectMeta>> {
-                        if let Some(m) = s.delete_current_version(&k, &v)? {
-                            return Ok(Some(m));
-                        }
-                        s.delete_version(&k, &v)
-                    })()
-                } else {
-                    store.delete_object(&item.key)
-                };
-
-                match result {
-                    Ok(meta) => {
-                        let (vid, dm) = meta
-                            .as_ref()
-                            .map_or((None, None), |m| {
-                                (m.version_id.clone(), Some(m.is_delete_marker))
-                            });
-                        deleted.push(DeletedObjectResult {
-                            key: item.key,
-                            version_id: vid,
-                            delete_marker: dm,
-                        });
-                    }
-                    Err(e) => errors.push(DeleteError {
-                        key: item.key,
-                        message: e.to_string(),
-                        version_id: item.version_id,
-                    }),
-                }
-            }
-            (deleted, errors)
+            execute_batch_delete(&store, items)
         })
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
@@ -388,54 +352,23 @@ impl Simple3 for GrpcService {
         let src_store = self.bucket(&input.source_bucket)?;
         let dest_store = self.bucket(&input.dest_bucket)?;
 
-        let replace_metadata = input.metadata_directive == "REPLACE";
-        let req_content_type = input.content_type.filter(|s| !s.is_empty());
-        let req_metadata = input.metadata;
-
         let tmp_id = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp_path = dest_store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}"));
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs();
-
-        let src_key = input.source_key;
-        let src_vid = input.source_version_id;
-        let ss = Arc::clone(&src_store);
-        let dest_key = input.dest_key;
-        let max_obj_size = self.limits.max_object_size;
+        let params = CopyParams {
+            src_key: input.source_key,
+            src_version_id: input.source_version_id,
+            dest_key: input.dest_key,
+            tmp_path: dest_store.bucket_dir().join(format!(".tmp_grpc_{tmp_id:020}")),
+            replace_metadata: input.metadata_directive == "REPLACE",
+            req_content_type: input.content_type.filter(|s| !s.is_empty()),
+            req_metadata: input.metadata,
+            max_obj_size: self.limits.max_object_size,
+            now: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_secs(),
+        };
         let (etag, meta, src_version_id_out, size) = tokio::task::spawn_blocking(move || {
-            let src_meta = ss
-                .get_object_or_version(&src_key, src_vid.as_deref())?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source object not found"))?;
-            if src_meta.is_delete_marker {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "source is a delete marker"));
-            }
-            if max_obj_size > 0 && src_meta.data_length() > max_obj_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "EntityTooLarge: source object exceeds max_object_size",
-                ));
-            }
-
-            let (content_type, user_metadata) = if replace_metadata {
-                (req_content_type, req_metadata)
-            } else {
-                (src_meta.content_type.clone(), src_meta.user_metadata.clone())
-            };
-
-            let (etag, crc) = ss.copy_to_tmp_file(&src_meta, &tmp_path)?;
-            let data_len = src_meta.data_length();
-            match dest_store.put_object_streamed(
-                &dest_key, &tmp_path, content_type, etag.clone(), now, user_metadata, Some(crc),
-            ) {
-                Ok(m) => Ok((etag, m, src_meta.version_id, data_len)),
-                Err(e) => {
-                    std::fs::remove_file(&tmp_path).ok();
-                    Err(e)
-                }
-            }
+            execute_copy_blocking(&src_store, &dest_store, params)
         })
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?
@@ -445,7 +378,7 @@ impl Simple3 for GrpcService {
             etag,
             content_md5: meta.content_md5.unwrap_or_default(),
             size,
-            last_modified: now,
+            last_modified: meta.last_modified,
             source_version_id: src_version_id_out,
             version_id: meta.version_id,
         }))
@@ -461,28 +394,10 @@ impl Simple3 for GrpcService {
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
-        let prefix = if input.prefix.is_empty() {
-            None
-        } else {
-            Some(input.prefix)
-        };
-        let delimiter = if input.delimiter.is_empty() {
-            None
-        } else {
-            Some(input.delimiter)
-        };
-        #[allow(clippy::cast_sign_loss)]
-        let max_keys = (if input.max_keys <= 0 {
-            1000
-        } else {
-            input.max_keys as usize
-        })
-        .min(self.limits.max_list_keys);
-        let continuation = if input.continuation_token.is_empty() {
-            None
-        } else {
-            Some(input.continuation_token)
-        };
+        let prefix = non_empty(input.prefix);
+        let delimiter = non_empty(input.delimiter);
+        let max_keys = clamp_max_keys(input.max_keys, self.limits.max_list_keys);
+        let continuation = non_empty(input.continuation_token);
 
         let (entries, common_prefixes, truncated) = tokio::task::spawn_blocking(move || {
             store.list_objects_with_delimiter(
@@ -496,29 +411,11 @@ impl Simple3 for GrpcService {
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?
         .map_err(map_io_err)?;
 
-        let next_token = if truncated {
-            entries.last().map(|(k, _)| k.clone()).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let objects: Vec<ObjectInfo> = entries
-            .into_iter()
-            .map(|(key, meta)| ObjectInfo {
-                key,
-                size: meta.data_length(),
-                etag: meta.etag,
-                last_modified: meta.last_modified,
-                version_id: meta.version_id,
-            })
-            .collect();
-
-        Ok(Response::new(ListObjectsResponse {
-            objects,
+        Ok(Response::new(build_list_objects_response(
+            entries,
             common_prefixes,
-            is_truncated: truncated,
-            next_continuation_token: next_token,
-        }))
+            truncated,
+        )))
     }
 
     // ================================================================
@@ -803,33 +700,11 @@ impl Simple3 for GrpcService {
         let input = request.into_inner();
         let store = self.bucket(&input.bucket)?;
 
-        let prefix = if input.prefix.is_empty() {
-            None
-        } else {
-            Some(input.prefix)
-        };
-        let delimiter = if input.delimiter.is_empty() {
-            None
-        } else {
-            Some(input.delimiter)
-        };
-        #[allow(clippy::cast_sign_loss)]
-        let max_keys = (if input.max_keys <= 0 {
-            1000
-        } else {
-            input.max_keys as usize
-        })
-        .min(self.limits.max_list_keys);
-        let key_marker = if input.key_marker.is_empty() {
-            None
-        } else {
-            Some(input.key_marker)
-        };
-        let vid_marker = if input.version_id_marker.is_empty() {
-            None
-        } else {
-            Some(input.version_id_marker)
-        };
+        let prefix = non_empty(input.prefix);
+        let delimiter = non_empty(input.delimiter);
+        let max_keys = clamp_max_keys(input.max_keys, self.limits.max_list_keys);
+        let key_marker = non_empty(input.key_marker);
+        let vid_marker = non_empty(input.version_id_marker);
 
         let result = tokio::task::spawn_blocking(move || {
             store.list_object_versions(
@@ -844,45 +719,8 @@ impl Simple3 for GrpcService {
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?
         .map_err(map_io_err)?;
 
-        let mut versions = Vec::new();
-        let mut delete_markers = Vec::new();
-
-        for entry in result.entries {
-            if entry.meta.is_delete_marker {
-                delete_markers.push(DeleteMarkerProto {
-                    key: entry.key,
-                    version_id: entry.version_id,
-                    last_modified: entry.meta.last_modified,
-                    is_latest: entry.is_latest,
-                });
-            } else {
-                let size = entry.meta.data_length();
-                let last_modified = entry.meta.last_modified;
-                versions.push(proto::VersionEntry {
-                    key: entry.key,
-                    version_id: entry.version_id,
-                    etag: entry.meta.etag,
-                    size,
-                    last_modified,
-                    is_latest: entry.is_latest,
-                    content_type: entry.meta.content_type.unwrap_or_default(),
-                });
-            }
-        }
-
-        Ok(Response::new(ListObjectVersionsResponse {
-            versions,
-            delete_markers,
-            common_prefixes: result.common_prefixes,
-            is_truncated: result.is_truncated,
-            next_key_marker: result.next_key_marker.unwrap_or_default(),
-            next_version_id_marker: result.next_version_id_marker.unwrap_or_default(),
-        }))
+        Ok(Response::new(build_list_versions_response(result)))
     }
-
-    // ================================================================
-    // Admin
-    // ================================================================
 
     async fn stats(
         &self,
@@ -895,28 +733,14 @@ impl Simple3 for GrpcService {
         let store = self.bucket(&bucket)?;
 
         let s = Arc::clone(&store);
-        let (stats, vstats) = tokio::task::spawn_blocking(move || {
-            let seg = s.segment_stats()?;
-            let ver = s.version_stats()?;
-            Ok::<_, io::Error>((seg, ver))
+        let resp = tokio::task::spawn_blocking(move || {
+            crate::grpc_helpers::build_stats_response(bucket, &s)
         })
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?
         .map_err(map_io_err)?;
 
-        let total_size: u64 = stats.iter().map(|s| s.size).sum();
-        let total_dead_bytes: u64 = stats.iter().map(|s| s.dead_bytes).sum();
-        let (version_count, delete_marker_count, total_versioned_size) = vstats;
-
-        Ok(Response::new(StatsResponse {
-            bucket,
-            segments: segments_to_proto(stats),
-            total_size,
-            total_dead_bytes,
-            version_count,
-            delete_marker_count,
-            total_versioned_size,
-        }))
+        Ok(Response::new(resp))
     }
 
     async fn compact(
@@ -969,23 +793,6 @@ impl Simple3 for GrpcService {
             .map_err(|e| Status::internal(format!("task panicked: {e}")))?
             .map_err(map_io_err)?;
 
-        let errors = result
-            .errors
-            .into_iter()
-            .map(|e| proto::VerifyError {
-                key: e.key,
-                kind: format!("{:?}", e.kind),
-                detail: e.detail,
-            })
-            .collect();
-
-        Ok(Response::new(VerifyResponse {
-            total_objects: result.total_objects,
-            verified_ok: result.verified_ok,
-            checksum_errors: result.checksum_errors,
-            read_errors: result.read_errors,
-            errors,
-            crc_errors: result.crc_errors,
-        }))
+        Ok(Response::new(build_verify_response(result)))
     }
 }

@@ -598,43 +598,6 @@ async fn spawn_grpc(
     Ok(handle)
 }
 
-async fn await_bg_tasks(tasks: &mut [JoinHandle<()>], timeout_secs: u64) {
-    let timeout = Duration::from_secs(timeout_secs);
-    if tokio::time::timeout(timeout, async {
-        for handle in tasks.iter_mut() {
-            let _ = handle.await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        tracing::warn!("background tasks did not finish within timeout, aborting");
-        for handle in tasks.iter() {
-            handle.abort();
-        }
-    }
-}
-
-async fn drain_connections(connections: &mut JoinSet<()>, timeout_secs: u64) {
-    tracing::info!(
-        "draining {} in-flight connection(s) (timeout {}s)",
-        connections.len(),
-        timeout_secs
-    );
-    let timeout = Duration::from_secs(timeout_secs);
-    if tokio::time::timeout(timeout, async {
-        while connections.join_next().await.is_some() {}
-    })
-    .await
-    .is_err()
-    {
-        tracing::warn!(
-            "shutdown timeout reached, dropping {} connection(s)",
-            connections.len()
-        );
-        connections.shutdown().await;
-    }
-}
 
 /// Wrapper that injects peer IP into request extensions before forwarding.
 #[derive(Clone)]
@@ -700,7 +663,35 @@ async fn accept_loop(
     Ok(connections)
 }
 
-#[allow(clippy::too_many_lines)] // startup orchestration: auth bootstrap, bg tasks, server bind, shutdown
+/// Spawn background tasks: rate-limit cleanup, autovacuum, scrub, metrics updater.
+fn spawn_background_tasks(
+    cfg: &super::serve_config::ServeConfig,
+    storage: &Arc<Storage>,
+    rate_limiter: Option<&Arc<super::rate_limit::IpRateLimiter>>,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>> {
+    let mut tasks = Vec::new();
+
+    if let Some(limiter) = rate_limiter {
+        tasks.push(super::rate_limit::spawn_cleanup(
+            Arc::clone(limiter),
+            shutdown_rx,
+        ));
+    }
+    if cfg.autovacuum_interval > 0 {
+        tasks.push(spawn_autovacuum(
+            storage, cfg.autovacuum_interval, cfg.autovacuum_threshold, shutdown_rx,
+        ));
+    }
+    if cfg.scrub_interval > 0 {
+        tasks.push(spawn_scrub(storage, cfg.scrub_interval, shutdown_rx));
+    }
+    tasks.push(spawn_metrics_updater(storage, shutdown_rx));
+    tasks
+}
+
+use super::serve_lifecycle::{validate_metrics_auth, graceful_shutdown};
+
 pub async fn run(
     data_dir: &Path,
     cfg: super::serve_config::ServeConfig,
@@ -735,30 +726,11 @@ pub async fn run(
     let sigint = tokio::signal::unix::signal(SignalKind::interrupt())?;
     spawn_signal_handler(sigterm, sigint, shutdown_tx);
 
-    let mut bg_tasks: Vec<JoinHandle<()>> = Vec::new();
-
-    if let Some(ref limiter) = rate_limiter {
-        bg_tasks.push(super::rate_limit::spawn_cleanup(
-            Arc::clone(limiter),
-            &shutdown_rx,
-        ));
-    }
-
-    if cfg.autovacuum_interval > 0 {
-        bg_tasks.push(spawn_autovacuum(
-            &storage, cfg.autovacuum_interval, cfg.autovacuum_threshold, &shutdown_rx,
-        ));
-    }
-
-    if cfg.scrub_interval > 0 {
-        bg_tasks.push(spawn_scrub(&storage, cfg.scrub_interval, &shutdown_rx));
-    }
+    let mut bg_tasks = spawn_background_tasks(&cfg, &storage, rate_limiter.as_ref(), &shutdown_rx);
 
     let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("prometheus recorder: {e}"))?;
-
-    bg_tasks.push(spawn_metrics_updater(&storage, &shutdown_rx));
 
     let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
     let mut builder = S3ServiceBuilder::new(s3);
@@ -766,21 +738,7 @@ pub async fn run(
     builder.set_access(auth_provider);
     let s3_service = builder.build();
 
-    let metrics_auth = match (cfg.metrics_user, cfg.metrics_password) {
-        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
-            tracing::info!("metrics endpoint auth enabled");
-            Some(Arc::new((u, p)))
-        }
-        (Some(_), Some(_)) => {
-            anyhow::bail!("metrics auth requires non-empty --metrics-user and --metrics-password");
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!(
-                "metrics auth partially configured: both --metrics-user and --metrics-password must be set"
-            );
-        }
-        _ => None,
-    };
+    let metrics_auth = validate_metrics_auth(cfg.metrics_user, cfg.metrics_password)?;
 
     let service = AdminService {
         s3: s3_service,
@@ -812,25 +770,7 @@ pub async fn run(
 
     let mut connections = accept_loop(listener, service, &shutdown_rx).await?;
 
-    tokio::join!(
-        drain_connections(&mut connections, cfg.shutdown_timeout),
-        await_bg_tasks(&mut bg_tasks, cfg.shutdown_timeout),
-    );
-
-    match tokio::task::spawn_blocking(move || storage.sync_all()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::error!("failed to sync storage on shutdown: {e}");
-            return Err(e.into());
-        }
-        Err(e) => {
-            tracing::error!("sync_all task panicked: {e}");
-            return Err(e.into());
-        }
-    }
-
-    tracing::info!("shutdown complete");
-    Ok(())
+    graceful_shutdown(&mut connections, &mut bg_tasks, storage, cfg.shutdown_timeout).await
 }
 
 #[cfg(test)]

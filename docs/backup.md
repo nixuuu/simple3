@@ -85,8 +85,9 @@ simple3 --data-dir /path/to/data_dir verify
 For every stored object:
 - Reads the full data from the segment file
 - Computes MD5 and compares against stored `content_md5` / ETag
-- If CRC32C metadata is present:
-  - Computes CRC32C and compares against stored `content_crc32c`
-  - Reads the on-disk CRC trailer and compares against the expected value
 
-Objects written before CRC32C support was added are verified using MD5 only. A clean verify means every object passed all applicable checks.
+**CRC32C checks are per-object optional.** They are only performed when the object has `content_crc32c` metadata — i.e., objects uploaded after CRC32C support was added. If `content_crc32c` is present, verify also:
+- Computes CRC32C over the data and compares against stored `content_crc32c`
+- Reads the on-disk CRC trailer and compares against the expected value
+
+Objects written before CRC32C support was added have no `content_crc32c` metadata and are verified using MD5 only. A clean verify means every object passed all applicable checks.
