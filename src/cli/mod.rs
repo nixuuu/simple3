@@ -232,7 +232,7 @@ fn resolve_limits(
     cfg: &config::StorageConfig,
 ) -> simple3::limits::Limits {
     let mb = max_obj_mb.or(cfg.max_object_size_mb).unwrap_or(5120);
-    // checked_mul guards against overflow on very large MB values
+    // saturating_mul guards against overflow on very large MB values
     let max_object_size = mb.saturating_mul(1024 * 1024);
     #[allow(clippy::cast_possible_truncation)] // u32 -> usize: max_list_keys fits in usize on all platforms
     let max_list_keys = max_list.or(cfg.max_list_keys).unwrap_or(1000) as usize;
