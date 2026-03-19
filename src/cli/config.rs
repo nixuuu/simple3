@@ -12,6 +12,8 @@ pub struct Config {
     #[serde(default)]
     #[allow(dead_code)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Deserialize, Default)]
@@ -43,6 +45,12 @@ pub struct StorageConfig {
 #[allow(dead_code)]
 pub struct AuthConfig {
     pub enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct MetricsConfig {
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 pub fn load_config(config_path: Option<&Path>, data_dir: &Path) -> anyhow::Result<Config> {

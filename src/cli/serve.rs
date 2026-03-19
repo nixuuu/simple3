@@ -129,6 +129,7 @@ struct AdminService {
     auth_store: Arc<AuthStore>,
     min_disk_free_mb: u64,
     prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
+    metrics_auth: Option<Arc<(String, String)>>,
     rate_limiter: Option<Arc<super::rate_limit::IpRateLimiter>>,
 }
 
@@ -218,6 +219,12 @@ impl AdminService {
         path: &str,
     ) -> ServiceFuture {
         if *method == hyper::Method::GET && path == "/metrics" {
+            if let Some(ref creds) = self.metrics_auth
+                && !super::metrics_auth::check(&req, &creds.0, &creds.1)
+            {
+                let resp = super::metrics_auth::unauthorized_response();
+                return Box::pin(async { Ok(resp) });
+            }
             let body = self.prometheus_handle.render();
             Box::pin(async move {
                 Ok(hyper::Response::builder()
@@ -692,11 +699,15 @@ async fn accept_loop(
     Ok(connections)
 }
 
+#[allow(clippy::too_many_lines)] // startup orchestration: auth bootstrap, bg tasks, server bind, shutdown
 pub async fn run(
     data_dir: &Path,
     cfg: super::serve_config::ServeConfig,
 ) -> anyhow::Result<()> {
-    let max_seg_bytes = cfg.max_segment_size_mb.saturating_mul(1024 * 1024);
+    let max_seg_bytes = cfg
+        .max_segment_size_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("max_segment_size_mb is too large"))?;
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
     let s3 = SimpleStorage::new(Arc::clone(&storage), cfg.limits.clone());
 
@@ -754,12 +765,29 @@ pub async fn run(
     builder.set_access(auth_provider);
     let s3_service = builder.build();
 
+    let metrics_auth = match (cfg.metrics_user, cfg.metrics_password) {
+        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
+            tracing::info!("metrics endpoint auth enabled");
+            Some(Arc::new((u, p)))
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("metrics auth requires non-empty --metrics-user and --metrics-password");
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "metrics auth partially configured: both --metrics-user and --metrics-password must be set"
+            );
+        }
+        _ => None,
+    };
+
     let service = AdminService {
         s3: s3_service,
         storage: Arc::clone(&storage),
         auth_store: Arc::clone(&auth_store),
         min_disk_free_mb: cfg.min_disk_free_mb,
         prometheus_handle,
+        metrics_auth,
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -805,152 +833,5 @@ pub async fn run(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn build_admin_service(dir: &std::path::Path) -> AdminService {
-        let storage = Arc::new(Storage::open(dir).unwrap());
-        let s3 = SimpleStorage::new(Arc::clone(&storage), simple3::limits::Limits::default());
-        let (auth_store, _) = simple3::auth::AuthStore::open(dir).unwrap();
-        let auth_store = Arc::new(auth_store);
-        let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
-        let mut builder = S3ServiceBuilder::new(s3);
-        builder.set_auth(auth_provider.clone());
-        builder.set_access(auth_provider);
-        let s3_service = builder.build();
-        let recorder =
-            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let prometheus_handle = recorder.handle();
-
-        AdminService {
-            s3: s3_service,
-            storage,
-            auth_store,
-            min_disk_free_mb: 0,
-            prometheus_handle,
-            rate_limiter: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_request_id_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = build_admin_service(dir.path());
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
-        });
-
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/health"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        let header = resp
-            .headers()
-            .get("x-request-id")
-            .expect("response must include x-request-id header");
-        let id_str = header.to_str().unwrap();
-        uuid::Uuid::parse_str(id_str).expect("x-request-id must be a valid UUID");
-    }
-
-    #[tokio::test]
-    async fn test_request_id_unique_per_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = build_admin_service(dir.path());
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(_) => break,
-                };
-                let svc = service.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .await;
-                });
-            }
-        });
-
-        let client = reqwest::Client::new();
-        let r1 = client
-            .get(format!("http://127.0.0.1:{port}/health"))
-            .send()
-            .await
-            .unwrap();
-        let r2 = client
-            .get(format!("http://127.0.0.1:{port}/health"))
-            .send()
-            .await
-            .unwrap();
-
-        let id1 = r1.headers().get("x-request-id").unwrap().to_str().unwrap();
-        let id2 = r2.headers().get("x-request-id").unwrap().to_str().unwrap();
-        assert_ne!(id1, id2, "each request must get a unique request ID");
-    }
-
-    #[test]
-    fn test_ready_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
-        storage.create_bucket("test-bucket").unwrap();
-        let resp = handle_ready(&storage, 0);
-        assert_eq!(resp.status(), 200);
-    }
-
-    #[test]
-    fn test_ready_disk_low() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
-        let resp = handle_ready(&storage, u64::MAX / (1024 * 1024));
-        assert_eq!(resp.status(), 503);
-    }
-
-    #[test]
-    fn test_collect_ready_metrics() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
-        storage.create_bucket("b1").unwrap();
-        storage.create_bucket("b2").unwrap();
-        let m = collect_ready_metrics(&storage).unwrap();
-        assert_eq!(m.bucket_count, 2);
-        assert_eq!(m.total_size, 0);
-        assert_eq!(m.total_dead, 0);
-        assert!(!m.compaction_running);
-    }
-
-    #[test]
-    fn test_disk_free_nonzero() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(disk_free(dir.path()) > 0);
-    }
-
-    #[test]
-    fn test_compacting_counter() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
-        assert!(!storage.is_compacting());
-        storage.begin_compacting();
-        assert!(storage.is_compacting());
-        storage.begin_compacting();
-        assert!(storage.is_compacting());
-        storage.end_compacting();
-        assert!(storage.is_compacting());
-        storage.end_compacting();
-        assert!(!storage.is_compacting());
-    }
-
-}
+#[path = "serve_tests.rs"]
+mod tests;

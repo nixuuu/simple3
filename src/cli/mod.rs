@@ -6,6 +6,7 @@ mod admin_auth;
 mod compact;
 mod health;
 mod metrics;
+mod metrics_auth;
 pub mod rate_limit;
 mod request_id;
 pub mod client;
@@ -89,6 +90,12 @@ enum Command {
         /// Minimum free disk space in MB; /ready returns 503 below this (0 = disabled)
         #[arg(long)]
         min_disk_free_mb: Option<u64>,
+        /// Metrics endpoint HTTP Basic Auth username
+        #[arg(long, env = "SIMPLE3_METRICS_USER")]
+        metrics_user: Option<String>,
+        /// Metrics endpoint HTTP Basic Auth password
+        #[arg(long, env = "SIMPLE3_METRICS_PASSWORD")]
+        metrics_password: Option<String>,
         /// Maximum object size in megabytes (0 = unlimited, default 5120 = 5 GB)
         #[arg(long)]
         max_object_size_mb: Option<u64>,
@@ -350,6 +357,8 @@ pub async fn run() -> anyhow::Result<()> {
                     scrub_interval,
                     shutdown_timeout,
                     min_disk_free_mb,
+                    metrics_user,
+                    metrics_password,
                     max_object_size_mb,
                     max_list_keys,
                     rate_limit_rps,
@@ -367,6 +376,8 @@ pub async fn run() -> anyhow::Result<()> {
                     min_disk_free_mb: min_disk_free_mb
                         .or(cfg.storage.min_disk_free_mb)
                         .unwrap_or(0),
+                    metrics_user: metrics_user.or(cfg.metrics.username),
+                    metrics_password: metrics_password.or(cfg.metrics.password),
                     rate_limit_rps: rate_limit_rps
                         .or(cfg.server.rate_limit_rps)
                         .unwrap_or(0),
@@ -382,6 +393,8 @@ pub async fn run() -> anyhow::Result<()> {
                     scrub_interval: cfg.storage.scrub_interval.unwrap_or(3600),
                     shutdown_timeout: cfg.server.shutdown_timeout.unwrap_or(30),
                     min_disk_free_mb: cfg.storage.min_disk_free_mb.unwrap_or(0),
+                    metrics_user: cfg.metrics.username,
+                    metrics_password: cfg.metrics.password,
                     rate_limit_rps: cfg.server.rate_limit_rps.unwrap_or(0),
                     limits: resolve_limits(None, None, &cfg.storage),
                 },

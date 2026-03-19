@@ -13,4 +13,6 @@ pub struct ServeConfig {
     pub min_disk_free_mb: u64,
     pub rate_limit_rps: u32,
     pub limits: Limits,
+    pub metrics_user: Option<String>,
+    pub metrics_password: Option<String>,
 }
