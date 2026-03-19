@@ -489,7 +489,7 @@ fn test_multipart_upload_basic() {
     // Complete
     let parts = vec![(1, etag1), (2, etag2), (3, etag3)];
     let (meta, etag) = bucket
-        .complete_multipart_upload(&upload_id, "multipart_obj", &parts, None, 500, HashMap::new())
+        .complete_multipart_upload(&upload_id, "multipart_obj", &parts, None, 500, HashMap::new(), 0)
         .unwrap();
 
     // ETag has -N suffix
@@ -530,7 +530,7 @@ fn test_multipart_upload_out_of_order() {
 
     let parts = vec![(3, etag3), (1, etag1), (2, etag2)];
     let (meta, _) = bucket
-        .complete_multipart_upload(&upload_id, "ooo", &parts, None, 0, HashMap::new())
+        .complete_multipart_upload(&upload_id, "ooo", &parts, None, 0, HashMap::new(), 0)
         .unwrap();
 
     // Should be sorted by part number
@@ -660,7 +660,7 @@ fn test_multipart_overwrite_compacts() {
     let e1 = bucket.upload_part(&uid, 1, b"AAA").unwrap();
     let e2 = bucket.upload_part(&uid, 2, b"BBB").unwrap();
     let (meta, _) = bucket
-        .complete_multipart_upload(&uid, "key", &[(1, e1), (2, e2)], None, 0, HashMap::new())
+        .complete_multipart_upload(&uid, "key", &[(1, e1), (2, e2)], None, 0, HashMap::new(), 0)
         .unwrap();
 
     // Append-only: 14 + 6+4 = 24, dead_bytes = 14
@@ -963,7 +963,7 @@ fn test_verify_multipart_upload() {
     let etag2 = bucket.upload_part(&upload_id, 2, b"part two").unwrap();
     let parts = vec![(1, etag1), (2, etag2)];
     bucket
-        .complete_multipart_upload(&upload_id, "mpu_obj", &parts, None, 0, HashMap::new())
+        .complete_multipart_upload(&upload_id, "mpu_obj", &parts, None, 0, HashMap::new(), 0)
         .unwrap();
 
     // Verify should pass — content_md5 was set during assembly
@@ -1088,7 +1088,7 @@ fn test_backup_restore_cold_copy() {
     let etag_p2 = bucket.upload_part(&upload_id, 2, b"beta").unwrap();
     let parts = vec![(1, etag_p1), (2, etag_p2)];
     bucket
-        .complete_multipart_upload(&upload_id, "multi.bin", &parts, None, 300, HashMap::new())
+        .complete_multipart_upload(&upload_id, "multi.bin", &parts, None, 300, HashMap::new(), 0)
         .unwrap();
 
     // Drop storage to simulate server stop

@@ -7,12 +7,14 @@ mod compact;
 mod health;
 mod metrics;
 mod metrics_auth;
+pub mod rate_limit;
 mod request_id;
 pub mod client;
 pub mod config;
 pub mod keys;
 pub mod policy_cmd;
 pub mod serve;
+pub mod serve_config;
 pub mod util;
 mod verify;
 
@@ -94,6 +96,15 @@ enum Command {
         /// Metrics endpoint HTTP Basic Auth password
         #[arg(long, env = "SIMPLE3_METRICS_PASSWORD")]
         metrics_password: Option<String>,
+        /// Maximum object size in megabytes (0 = unlimited, default 5120 = 5 GB)
+        #[arg(long)]
+        max_object_size_mb: Option<u64>,
+        /// Maximum keys per `ListObjects` page (default 1000)
+        #[arg(long)]
+        max_list_keys: Option<u32>,
+        /// Per-IP rate limit in requests/second (0 = disabled)
+        #[arg(long)]
+        rate_limit_rps: Option<u32>,
     },
     /// Check if the running server is healthy
     Health,
@@ -221,6 +232,23 @@ enum Command {
     },
 }
 
+/// Resolve `Limits` from CLI args (if provided) falling back to TOML config, then defaults.
+fn resolve_limits(
+    max_obj_mb: Option<u64>,
+    max_list: Option<u32>,
+    cfg: &config::StorageConfig,
+) -> simple3::limits::Limits {
+    let mb = max_obj_mb.or(cfg.max_object_size_mb).unwrap_or(5120);
+    // saturating_mul guards against overflow on very large MB values
+    let max_object_size = mb.saturating_mul(1024 * 1024);
+    #[allow(clippy::cast_possible_truncation)] // u32 -> usize: max_list_keys fits in usize on all platforms
+    let max_list_keys = max_list.or(cfg.max_list_keys).unwrap_or(1000) as usize;
+    simple3::limits::Limits {
+        max_object_size,
+        max_list_keys,
+    }
+}
+
 #[allow(clippy::too_many_lines)] // single dispatch for all subcommands, splitting would hurt readability
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -331,7 +359,10 @@ pub async fn run() -> anyhow::Result<()> {
                     min_disk_free_mb,
                     metrics_user,
                     metrics_password,
-                }) => serve::ServeConfig {
+                    max_object_size_mb,
+                    max_list_keys,
+                    rate_limit_rps,
+                }) => serve_config::ServeConfig {
                     host,
                     port,
                     grpc_port,
@@ -347,8 +378,12 @@ pub async fn run() -> anyhow::Result<()> {
                         .unwrap_or(0),
                     metrics_user: metrics_user.or(cfg.metrics.username),
                     metrics_password: metrics_password.or(cfg.metrics.password),
+                    rate_limit_rps: rate_limit_rps
+                        .or(cfg.server.rate_limit_rps)
+                        .unwrap_or(0),
+                    limits: resolve_limits(max_object_size_mb, max_list_keys, &cfg.storage),
                 },
-                _ => serve::ServeConfig {
+                _ => serve_config::ServeConfig {
                     host: cfg.server.host.unwrap_or_else(|| "0.0.0.0".into()),
                     port: cfg.server.port.unwrap_or(8080),
                     grpc_port: cfg.server.grpc_port.unwrap_or(50051),
@@ -360,6 +395,8 @@ pub async fn run() -> anyhow::Result<()> {
                     min_disk_free_mb: cfg.storage.min_disk_free_mb.unwrap_or(0),
                     metrics_user: cfg.metrics.username,
                     metrics_password: cfg.metrics.password,
+                    rate_limit_rps: cfg.server.rate_limit_rps.unwrap_or(0),
+                    limits: resolve_limits(None, None, &cfg.storage),
                 },
             };
             serve::run(&cli.data_dir, serve_cfg).await

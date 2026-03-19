@@ -2,7 +2,7 @@ use super::*;
 
 fn build_admin_service(dir: &std::path::Path) -> AdminService {
     let storage = Arc::new(Storage::open(dir).unwrap());
-    let s3 = SimpleStorage::new(Arc::clone(&storage));
+    let s3 = SimpleStorage::new(Arc::clone(&storage), simple3::limits::Limits::default());
     let (auth_store, _) = simple3::auth::AuthStore::open(dir).unwrap();
     let auth_store = Arc::new(auth_store);
     let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
@@ -20,6 +20,7 @@ fn build_admin_service(dir: &std::path::Path) -> AdminService {
         min_disk_free_mb: 0,
         prometheus_handle,
         metrics_auth: None,
+        rate_limiter: None,
     }
 }
 
