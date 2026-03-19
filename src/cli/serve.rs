@@ -632,7 +632,10 @@ pub struct ServeConfig {
 }
 
 pub async fn run(data_dir: &Path, cfg: ServeConfig) -> anyhow::Result<()> {
-    let max_seg_bytes = cfg.max_segment_size_mb * 1024 * 1024;
+    let max_seg_bytes = cfg
+        .max_segment_size_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("max_segment_size_mb is too large"))?;
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
     let s3 = SimpleStorage::new(Arc::clone(&storage));
 
@@ -682,9 +685,12 @@ pub async fn run(data_dir: &Path, cfg: ServeConfig) -> anyhow::Result<()> {
     let s3_service = builder.build();
 
     let metrics_auth = match (cfg.metrics_user, cfg.metrics_password) {
-        (Some(u), Some(p)) => {
+        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
             tracing::info!("metrics endpoint auth enabled");
             Some(Arc::new((u, p)))
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("metrics auth requires non-empty --metrics-user and --metrics-password");
         }
         (Some(_), None) | (None, Some(_)) => {
             anyhow::bail!(
