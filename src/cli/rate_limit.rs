@@ -11,9 +11,8 @@ pub type IpRateLimiter = RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultC
 
 /// Build a per-IP token-bucket rate limiter. Returns `None` when `rps == 0` (disabled).
 ///
-/// Uses `DashMapStateStore` which grows one entry per unique IP and never evicts.
-/// TODO: add periodic cleanup or bounded LRU store for long-running servers
-/// exposed to many unique IPs.
+/// Uses `DashMapStateStore` with periodic `retain_recent()` cleanup (see `spawn_cleanup`).
+/// TODO: consider a bounded LRU store for servers exposed to very many unique IPs.
 pub fn build_rate_limiter(rps: u32) -> Option<Arc<IpRateLimiter>> {
     let rps = NonZeroU32::new(rps)?;
     let quota = Quota::per_second(rps);

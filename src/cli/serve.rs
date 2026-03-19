@@ -166,21 +166,35 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for AdminSer
 
         let fut: ServiceFuture = if rate_limited {
             metrics::counter!("simple3_rate_limited_total", "protocol" => "http").increment(1);
-            let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                <Error><Code>SlowDown</Code>\
-                <Message>Rate limit exceeded</Message></Error>"
-                .to_owned();
-            Box::pin(async {
-                Ok(hyper::Response::builder()
-                    .status(503)
-                    .header("content-type", "application/xml")
-                    .header("retry-after", "1")
-                    .body(s3s::Body::from(body))
-                    .unwrap_or_else(|e| json_response(
-                        500,
-                        &serde_json::json!({"error": format!("rate limit response: {e}")}),
-                    )))
-            })
+            if path.starts_with("/_/") {
+                // Admin endpoints use JSON
+                Box::pin(async {
+                    let mut resp = json_response(
+                        503,
+                        &serde_json::json!({"error": "SlowDown", "message": "Rate limit exceeded"}),
+                    );
+                    resp.headers_mut()
+                        .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
+                    Ok(resp)
+                })
+            } else {
+                // S3 endpoints use XML
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                    <Error><Code>SlowDown</Code>\
+                    <Message>Rate limit exceeded</Message></Error>"
+                    .to_owned();
+                Box::pin(async {
+                    Ok(hyper::Response::builder()
+                        .status(503)
+                        .header("content-type", "application/xml")
+                        .header("retry-after", "1")
+                        .body(s3s::Body::from(body))
+                        .unwrap_or_else(|e| json_response(
+                            500,
+                            &serde_json::json!({"error": format!("rate limit response: {e}")}),
+                        )))
+                })
+            }
         } else {
             self.dispatch(req, &method, &path)
         };
@@ -682,7 +696,7 @@ pub async fn run(
     data_dir: &Path,
     cfg: super::serve_config::ServeConfig,
 ) -> anyhow::Result<()> {
-    let max_seg_bytes = cfg.max_segment_size_mb * 1024 * 1024;
+    let max_seg_bytes = cfg.max_segment_size_mb.saturating_mul(1024 * 1024);
     let storage = Arc::new(Storage::open_with_segment_size(data_dir, max_seg_bytes)?);
     let s3 = SimpleStorage::new(Arc::clone(&storage), cfg.limits.clone());
 
