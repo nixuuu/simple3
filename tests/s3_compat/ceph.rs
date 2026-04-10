@@ -58,7 +58,7 @@ secret_key = {alt_secret}
 async fn run_pytest(container: &ContainerAsync<GenericImage>) -> String {
     let pytest_cmd = concat!(
         "cd /s3-tests && S3TEST_CONF=/s3-tests/s3tests.conf tox -e py -- ",
-        "s3tests_boto3/functional/test_s3.py ",
+        "s3tests/functional/test_s3.py ",
         "-m 'not encryption and not sse_s3 and not bucket_logging ",
         "and not fails_on_aws and not s3select and not storage_class ",
         "and not tagging and not object_lock' ",
@@ -170,10 +170,10 @@ async fn compat_ceph_s3_tests() {
         .find_map(|l| l.strip_prefix("EXIT:"))
         .and_then(|s| s.trim().parse::<i32>().ok())
         .expect("missing pytest EXIT marker in output");
-    assert!(
-        matches!(exit_code, 0 | 1),
-        "pytest execution failed (exit code {exit_code}); check container setup"
-    );
+    if !matches!(exit_code, 0 | 1) {
+        eprintln!("--- pytest output (exit code {exit_code}) ---\n{output}\n---");
+        panic!("pytest execution failed (exit code {exit_code}); check container setup");
+    }
 
     let report = build_ceph_report(&output);
     print!("{report}");
