@@ -85,6 +85,9 @@ enum Command {
         /// Background scrub interval in seconds (0 = disabled)
         #[arg(long, default_value_t = 3600)]
         scrub_interval: u64,
+        /// Lifecycle sweep interval in seconds (0 = disabled)
+        #[arg(long, default_value_t = 3600)]
+        lifecycle_interval: u64,
         /// Graceful shutdown timeout in seconds
         #[arg(long)]
         shutdown_timeout: Option<u64>,
@@ -356,6 +359,7 @@ pub async fn run() -> anyhow::Result<()> {
                     max_segment_size_mb,
                     grpc_port,
                     scrub_interval,
+                    lifecycle_interval,
                     shutdown_timeout,
                     min_disk_free_mb,
                     metrics_user,
@@ -371,6 +375,10 @@ pub async fn run() -> anyhow::Result<()> {
                     autovacuum_threshold,
                     max_segment_size_mb,
                     scrub_interval,
+                    lifecycle_interval: cfg
+                        .storage
+                        .lifecycle_interval
+                        .unwrap_or(lifecycle_interval),
                     shutdown_timeout: shutdown_timeout
                         .or(cfg.server.shutdown_timeout)
                         .unwrap_or(30),
@@ -392,6 +400,7 @@ pub async fn run() -> anyhow::Result<()> {
                     autovacuum_threshold: cfg.storage.autovacuum_threshold.unwrap_or(0.5),
                     max_segment_size_mb: cfg.storage.max_segment_size_mb.unwrap_or(4096),
                     scrub_interval: cfg.storage.scrub_interval.unwrap_or(3600),
+                    lifecycle_interval: cfg.storage.lifecycle_interval.unwrap_or(3600),
                     shutdown_timeout: cfg.server.shutdown_timeout.unwrap_or(30),
                     min_disk_free_mb: cfg.storage.min_disk_free_mb.unwrap_or(0),
                     metrics_user: cfg.metrics.username,

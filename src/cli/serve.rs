@@ -321,8 +321,79 @@ async fn handle_admin(
             .unwrap_or_else(|e| {
                 json_response(500, &serde_json::json!({"error": e.to_string()}))
             })
+    } else if let Some(rest) = path.strip_prefix("/_/lifecycle/") {
+        let bucket = rest.trim_end_matches('/').to_owned();
+        if bucket.is_empty() {
+            return json_response(404, &serde_json::json!({"error": "bucket required"}));
+        }
+        if method == hyper::Method::GET {
+            tokio::task::spawn_blocking(move || admin_lifecycle_get(&storage, &bucket))
+                .await
+                .unwrap_or_else(|e| {
+                    json_response(500, &serde_json::json!({"error": e.to_string()}))
+                })
+        } else if method == hyper::Method::PUT {
+            use http_body_util::BodyExt;
+            let body_bytes = req
+                .into_body()
+                .collect()
+                .await
+                .map(http_body_util::Collected::to_bytes)
+                .unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+            tokio::task::spawn_blocking(move || {
+                admin_lifecycle_put(&storage, &bucket, &body_str)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                json_response(500, &serde_json::json!({"error": e.to_string()}))
+            })
+        } else if method == hyper::Method::DELETE {
+            tokio::task::spawn_blocking(move || admin_lifecycle_delete(&storage, &bucket))
+                .await
+                .unwrap_or_else(|e| {
+                    json_response(500, &serde_json::json!({"error": e.to_string()}))
+                })
+        } else {
+            json_response(405, &serde_json::json!({"error": "method not allowed"}))
+        }
     } else {
         json_response(404, &serde_json::json!({"error": "not found"}))
+    }
+}
+
+fn admin_lifecycle_get(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
+    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
+        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    };
+    match store.get_lifecycle() {
+        Ok(Some(cfg)) => json_response(200, &cfg),
+        Ok(None) => json_response(404, &serde_json::json!({"error": "no lifecycle configured"})),
+        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+fn admin_lifecycle_put(storage: &Storage, bucket: &str, body: &str) -> s3s::HttpResponse {
+    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
+        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    };
+    let cfg: simple3::storage::LifecycleConfig = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return json_response(400, &serde_json::json!({"error": e.to_string()})),
+    };
+    match store.set_lifecycle(&cfg) {
+        Ok(()) => json_response(200, &cfg),
+        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+fn admin_lifecycle_delete(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
+    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
+        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    };
+    match store.delete_lifecycle() {
+        Ok(removed) => json_response(200, &serde_json::json!({"removed": removed})),
+        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
     }
 }
 
@@ -526,6 +597,50 @@ fn spawn_autovacuum(
     handle
 }
 
+fn run_lifecycle(storage: &Arc<Storage>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    match storage.apply_lifecycle_all(now) {
+        Ok(results) => {
+            for stat in results {
+                if stat.scanned == 0 {
+                    continue;
+                }
+                tracing::info!(
+                    "lifecycle: {} — scanned {}, deleted {}",
+                    stat.bucket, stat.scanned, stat.deleted
+                );
+            }
+        }
+        Err(e) => tracing::error!("lifecycle sweep failed: {e}"),
+    }
+}
+
+fn spawn_lifecycle(
+    storage: &Arc<Storage>,
+    interval_secs: u64,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let lc_storage = Arc::clone(storage);
+    let interval = Duration::from_secs(interval_secs);
+    let mut rx = shutdown_rx.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                _ = rx.changed() => break,
+            }
+            let storage = Arc::clone(&lc_storage);
+            if let Err(e) = tokio::task::spawn_blocking(move || run_lifecycle(&storage)).await {
+                tracing::error!("lifecycle task panicked: {e}");
+            }
+        }
+    });
+    tracing::info!("lifecycle enabled: interval={}s", interval_secs);
+    handle
+}
+
 fn spawn_scrub(
     storage: &Arc<Storage>,
     interval_secs: u64,
@@ -685,6 +800,9 @@ fn spawn_background_tasks(
     }
     if cfg.scrub_interval > 0 {
         tasks.push(spawn_scrub(storage, cfg.scrub_interval, shutdown_rx));
+    }
+    if cfg.lifecycle_interval > 0 {
+        tasks.push(spawn_lifecycle(storage, cfg.lifecycle_interval, shutdown_rx));
     }
     tasks.push(spawn_metrics_updater(storage, shutdown_rx));
     tasks

@@ -1,9 +1,11 @@
 mod compaction;
+pub mod lifecycle;
 mod multipart;
 mod segment;
 mod verify;
 pub mod versioning;
 
+pub use lifecycle::{LifecycleConfig, LifecycleStats};
 pub use verify::VerifyResult;
 
 use std::collections::HashMap;

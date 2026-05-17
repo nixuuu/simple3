@@ -722,6 +722,76 @@ impl Simple3 for GrpcService {
         Ok(Response::new(build_list_versions_response(result)))
     }
 
+    // ================================================================
+    // Lifecycle
+    // ================================================================
+
+    async fn get_bucket_lifecycle(
+        &self,
+        request: Request<GetBucketLifecycleRequest>,
+    ) -> Result<Response<GetBucketLifecycleResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "GetBucketLifecycle");
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:GetLifecycleConfiguration", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let cfg = tokio::task::spawn_blocking(move || store.get_lifecycle())
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+            .map_err(map_io_err)?;
+
+        Ok(Response::new(GetBucketLifecycleResponse {
+            has_config: cfg.is_some(),
+            config: cfg.map(|c| LifecycleConfig {
+                expiration_days: c.expiration_days,
+            }),
+        }))
+    }
+
+    async fn put_bucket_lifecycle(
+        &self,
+        request: Request<PutBucketLifecycleRequest>,
+    ) -> Result<Response<PutBucketLifecycleResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "PutBucketLifecycle");
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:PutLifecycleConfiguration", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let proto_cfg = input
+            .config
+            .ok_or_else(|| Status::invalid_argument("config required"))?;
+        let cfg = crate::storage::LifecycleConfig {
+            expiration_days: proto_cfg.expiration_days,
+        };
+
+        tokio::task::spawn_blocking(move || store.set_lifecycle(&cfg))
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+            .map_err(map_io_err)?;
+
+        Ok(Response::new(PutBucketLifecycleResponse {}))
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        request: Request<DeleteBucketLifecycleRequest>,
+    ) -> Result<Response<DeleteBucketLifecycleResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "DeleteBucketLifecycle");
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:PutLifecycleConfiguration", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let removed = tokio::task::spawn_blocking(move || store.delete_lifecycle())
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+            .map_err(map_io_err)?;
+
+        Ok(Response::new(DeleteBucketLifecycleResponse { removed }))
+    }
+
     async fn stats(
         &self,
         request: Request<StatsRequest>,
