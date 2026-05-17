@@ -45,14 +45,14 @@ fn chaos_eight_writers_plus_compaction_keep_data_consistent() {
     // 8 writer threads, each rewriting the same set of keys to maximize
     // dead-byte growth, plus a compaction thread sweeping continuously.
     let mut handles = Vec::new();
-    for tid in 0..8 {
+    for tid in 0u8..8 {
         let b = Arc::clone(&bucket);
         let s = Arc::clone(&stop);
         handles.push(std::thread::spawn(move || {
             let mut n = 0u64;
             while !s.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
                 let key = format!("k-{}", n % 20);
-                let payload = vec![tid as u8; 8 * 1024];
+                let payload = vec![tid; 8 * 1024];
                 put(&b, &key, &payload);
                 n += 1;
             }
@@ -102,8 +102,8 @@ fn chaos_partial_write_to_segment_tail_recovers_via_truncation() {
     let bucket = storage.get_bucket("chaos").unwrap().unwrap();
 
     // Establish a known-good baseline.
-    for i in 0..16 {
-        put(&bucket, &format!("k-{i:02}"), &vec![i as u8; 4096]);
+    for i in 0u8..16 {
+        put(&bucket, &format!("k-{i:02}"), &vec![i; 4096]);
     }
     let baseline = bucket.list_objects(None, 1000, None).unwrap().0;
     drop(bucket);
