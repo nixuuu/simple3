@@ -4,20 +4,18 @@ use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-#[path = "../common/mod.rs"]
-mod common;
-
+use crate::common;
 use crate::helpers::{apply_network_config, build_mint_report, parse_mint_log};
 use crate::known_failures::mint_known_failures;
 
 /// Marker echoed before catting the JSON log so we can split stdout cleanly.
 const LOG_MARKER: &str = "___MINT_LOG_START___";
 
-/// Run MinIO Mint core test suite against an in-process simple3 server.
+/// Run `MinIO` Mint core test suite against an in-process simple3 server.
 ///
 /// Requires Docker. Run with: `cargo test --test s3_compat compat_mint -- --ignored --nocapture`
 #[tokio::test]
-#[ignore]
+#[ignore = "requires Docker; opt in with --ignored"]
 async fn compat_mint_core() {
     let dir = tempfile::tempdir().unwrap();
     let srv = common::start_server_external(dir.path()).await;
@@ -64,16 +62,16 @@ async fn compat_mint_core() {
     let stderr = container.stderr_to_vec().await.unwrap();
     let full_output = String::from_utf8_lossy(&stdout);
 
-    let log_section = full_output
-        .split_once(LOG_MARKER)
-        .map(|(_, after)| after.trim())
-        .unwrap_or_else(|| {
+    let log_section = full_output.split_once(LOG_MARKER).map_or_else(
+        || {
             let stderr_str = String::from_utf8_lossy(&stderr);
             panic!(
                 "Mint log marker not found in stdout — container may have crashed.\n\
                  --- stdout ---\n{full_output}\n--- stderr ---\n{stderr_str}\n--- end ---"
             );
-        });
+        },
+        |(_, after)| after.trim(),
+    );
 
     let results = parse_mint_log(log_section);
     assert!(

@@ -47,7 +47,7 @@ fn lifecycle_zero_day_expires_all_live_objects() {
                 Some("text/plain".into()),
                 "etag".into(),
                 now() - 10,
-                Default::default(),
+                std::collections::HashMap::new(),
                 None,
             )
             .unwrap();
@@ -83,7 +83,7 @@ fn lifecycle_threshold_preserves_recent_objects() {
                 None,
                 "etag".into(),
                 last_modified,
-                Default::default(),
+                std::collections::HashMap::new(),
                 None,
             )
             .unwrap();
@@ -121,7 +121,7 @@ fn lifecycle_unconfigured_bucket_is_noop() {
             None,
             "etag".into(),
             now() - 10_000_000,
-            Default::default(),
+            std::collections::HashMap::new(),
             None,
         )
         .unwrap();
@@ -152,7 +152,7 @@ fn lifecycle_apply_all_skips_unconfigured() {
             None,
             "etag".into(),
             now() - 60,
-            Default::default(),
+            std::collections::HashMap::new(),
             None,
         )
         .unwrap();
@@ -181,7 +181,7 @@ async fn lifecycle_compaction_reclaims_space_for_expired_objects() {
                 None,
                 "etag".into(),
                 now() - 86_400,
-                Default::default(),
+                std::collections::HashMap::new(),
                 None,
             )
             .unwrap();
@@ -227,7 +227,7 @@ async fn lifecycle_versioned_bucket_creates_delete_markers() {
             None,
             "etag".into(),
             now() - 86_400,
-            Default::default(),
+            std::collections::HashMap::new(),
             None,
         )
         .unwrap();

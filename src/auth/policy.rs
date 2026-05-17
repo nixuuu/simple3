@@ -236,12 +236,13 @@ mod tests {
     #[test]
     fn test_resource_prefix_match() {
         let p = make_policy(Effect::Allow, &["s3:GetObject"], &["arn:s3:::bucket/photos/*"]);
+        let one = std::slice::from_ref(&p);
         assert_eq!(
-            evaluate(&[p.clone()], "s3:GetObject", "arn:s3:::bucket/photos/cat.jpg"),
+            evaluate(one, "s3:GetObject", "arn:s3:::bucket/photos/cat.jpg"),
             Decision::Allow
         );
         assert_eq!(
-            evaluate(&[p], "s3:GetObject", "arn:s3:::bucket/docs/readme.txt"),
+            evaluate(one, "s3:GetObject", "arn:s3:::bucket/docs/readme.txt"),
             Decision::Deny
         );
     }

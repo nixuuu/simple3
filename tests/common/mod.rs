@@ -35,7 +35,7 @@ pub struct ExternalTestServer {
 }
 
 /// Bootstrap storage + auth and build an S3 service.
-/// Returns (service, auth_store, root_access_key, root_secret_key).
+/// Returns `(service, auth_store, root_access_key, root_secret_key)`.
 fn build_s3_service(
     dir: &std::path::Path,
 ) -> (s3s::service::S3Service, Arc<AuthStore>, String, String) {
@@ -188,7 +188,7 @@ pub fn container_host() -> &'static str {
 static TEST_TMP: AtomicU64 = AtomicU64::new(0);
 
 /// Write data to a temp file and upload as a multipart part.
-/// Shared helper used by storage_test and crash_recovery_test.
+/// Shared helper used by `storage_test` and `crash_recovery_test`.
 pub fn write_part(
     bucket: &simple3::storage::BucketStore,
     upload_id: &str,

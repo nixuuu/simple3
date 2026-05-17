@@ -508,7 +508,7 @@ fn test_multipart_upload_basic() {
     let bucket_dir = dir.path().join("b");
     let mpu_files: Vec<_> = std::fs::read_dir(&bucket_dir)
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter(|e| {
             e.file_name()
                 .to_str()
@@ -1042,8 +1042,8 @@ fn test_backup_restore_cold_copy() {
     let orig_dir = tempfile::tempdir().unwrap();
 
     // Create auth store so _auth.redb exists
-    let (_auth, _bootstrap) = simple3::auth::AuthStore::open(orig_dir.path()).unwrap();
-    drop(_auth);
+    let (auth, _bootstrap) = simple3::auth::AuthStore::open(orig_dir.path()).unwrap();
+    drop(auth);
 
     let storage = Storage::open(orig_dir.path()).unwrap();
     storage.create_bucket("docs").unwrap();
