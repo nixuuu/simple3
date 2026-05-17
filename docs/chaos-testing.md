@@ -129,7 +129,7 @@ kill loop complete: 100/100 iterations passed verify
 real 0m59.898s
 ```
 
-macOS 25.1, ext4-equivalent volume, release-prod binary. No new bugs surfaced. Re-run on Linux when CI is wired up.
+macOS 25.1, APFS, `release-prod` binary. No new bugs surfaced. Re-run on Linux + ext4/xfs when CI is wired up.
 
 `tests/chaos_test.rs` (concurrent stress + orphan-tail recovery) was run in the same session and finished in 2.3 s with zero verify errors.
 
