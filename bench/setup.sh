@@ -19,6 +19,14 @@ SIMPLE3_DATA="$ROOT/simple3-data"
 MINIO_DATA="$ROOT/minio-data"
 mkdir -p "$SIMPLE3_DATA" "$MINIO_DATA"
 
+SIMPLE3_PID=""
+MINIO_PID=""
+cleanup_on_error() {
+  [[ -n "$SIMPLE3_PID" ]] && kill "$SIMPLE3_PID" 2>/dev/null || true
+  [[ -n "$MINIO_PID"   ]] && kill "$MINIO_PID"   2>/dev/null || true
+}
+trap cleanup_on_error ERR
+
 wait_url() {
   local url=$1 pid=$2 name=$3
   for _ in $(seq 1 50); do
@@ -80,6 +88,10 @@ export SIMPLE3_SK=$SIMPLE3_SK
 export MINIO_AK=minioadmin
 export MINIO_SK=minioadmin
 EOF
+
+# Bootstrap done; clear the cleanup trap so the daemons keep running
+# for the actual benchmark runs.
+trap - ERR
 
 echo
 echo "PIDs: simple3=$SIMPLE3_PID  minio=$MINIO_PID"

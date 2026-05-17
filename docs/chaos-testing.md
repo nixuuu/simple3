@@ -26,13 +26,20 @@ cargo build --release
 sudo ./chaos/disk-full.sh
 ```
 
-A Makefile target wraps the lot:
+A Makefile target wraps the in-tree subset. Disk-full stays opt-in (needs
+root + Linux), so it lives in its own target:
 
 ```make
-chaos:
+chaos: chaos-stress chaos-loop
+
+chaos-stress:
 	cargo test --test chaos_test -- --nocapture
+
+chaos-loop: build
 	./chaos/kill-loop.sh
-	./chaos/disk-full.sh
+
+chaos-disk-full: build
+	sudo ./chaos/disk-full.sh
 ```
 
 ## Scenarios

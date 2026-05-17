@@ -100,7 +100,7 @@ These numbers are loopback-only and not representative of a real network deploym
 
 ## Known caveats
 
-- All measurements are over the loopback interface in a single Docker host. There is no network jitter, no NIC saturation, no TLS termination.
+- All measurements are over the loopback interface on a single host (no Docker, no containers — the scripts run native binaries). There is no network jitter, no NIC saturation, no TLS termination.
 - `warp mixed` doesn't exercise multipart. Add `warp put --obj.size=1G --concurrent=4 --duration=60s` to compare the multipart paths if multi-GB objects matter for your workload.
 - MinIO's erasure-coded mode is not tested here. Single-disk MinIO is the closest apples-to-apples comparison.
 - 15 s is short — quote the duration alongside any numbers you publish; longer runs give stable p99s.
