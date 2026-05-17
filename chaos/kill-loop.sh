@@ -22,7 +22,15 @@ if [[ ! -x "$SIMPLE3" ]]; then
 fi
 
 # Always start from a clean state so the bootstrap root key is regenerated.
-test -d "$DATA" && rm -r "$DATA"
+case "$DATA" in
+  "" | "/" | "$HOME" | "$HOME/")
+    echo "refusing to remove unsafe DATA path: '$DATA'" >&2
+    exit 1
+    ;;
+esac
+if [[ -d "$DATA" ]]; then
+  rm -r "$DATA"
+fi
 mkdir -p "$DATA"
 : > "$LOG"
 
@@ -70,6 +78,11 @@ PID=$(start_server)
 wait_ready "$PID" || { kill "$PID" 2>/dev/null || true; cat "$LOG"; exit 1; }
 AK=$(awk '/Access Key ID/ {print $4}' "$LOG" | head -1)
 SK=$(awk '/Secret Key/ {print $3}'    "$LOG" | head -1)
+if [[ -z "$AK" || -z "$SK" ]]; then
+  echo "failed to parse bootstrap credentials from $LOG" >&2
+  kill "$PID" 2>/dev/null || true
+  exit 1
+fi
 "$SIMPLE3" --data-dir "$DATA" mb "s3://$BUCKET" \
   --endpoint-url "http://127.0.0.1:$PORT" \
   --access-key "$AK" --secret-key "$SK" > /dev/null
@@ -112,4 +125,8 @@ done
 
 echo
 echo "kill loop complete: $((N - failures))/$N iterations passed verify"
-exit $failures
+# Exit codes wrap at 256; collapse the failure count to a 0/1 signal for CI.
+if (( failures > 0 )); then
+  exit 1
+fi
+exit 0

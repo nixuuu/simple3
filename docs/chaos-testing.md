@@ -39,13 +39,13 @@ chaos:
 
 ### Random kill loop
 
-`chaos/kill-loop.sh` runs `simple3 serve`, blasts ~200 PUTs at random keys, then sends `SIGKILL` at a random offset within the first 500 ms. After each kill it runs `simple3 verify <bucket>` and counts failures. The loop preserves the `data_dir` across iterations, so the state grows over time — a single corruption persists and eventually surfaces.
+`chaos/kill-loop.sh` runs `simple3 serve`, blasts ~200 PUTs at random keys, then sends `SIGKILL` at a random offset 50–550 ms after startup. After each kill it runs `simple3 verify <bucket>` and counts failures. The loop preserves the `data_dir` across iterations, so the state grows over time — a single corruption persists and eventually surfaces.
 
 Default thresholds:
 
 - 100 iterations
 - 200 PUTs per iteration
-- Kill at `Uniform(0, 500 ms)`
+- Kill at `Uniform(50 ms, 550 ms)`
 - One bucket, 200-key keyspace
 
 Adjust with `N=`, `DATA=`, `BUCKET=` env vars.
@@ -105,7 +105,7 @@ All three live in `main` and are covered by deterministic tests in
 
 ### Run log
 
-```
+```text
 $ time N=100 ./chaos/kill-loop.sh
   ... 10/100 iterations complete (0 failures)
   ... 20/100 iterations complete (0 failures)

@@ -32,7 +32,7 @@ esac
 run_one() {
   local size="$1"
   local threads="$2"
-  local duration="${3:-30s}"
+  local duration="${3:-15s}"
   local out="$RESULTS/${TARGET}-mixed-${size}-t${threads}.csv"
 
   echo ">>> $TARGET / mixed / size=$size / threads=$threads / duration=$duration"

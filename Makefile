@@ -1,4 +1,4 @@
-.PHONY: build test lint chaos chaos-loop chaos-disk-full
+.PHONY: build test lint chaos chaos-stress chaos-loop chaos-disk-full
 
 build:
 	cargo build --release

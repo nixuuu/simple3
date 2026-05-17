@@ -148,7 +148,7 @@ scrape_configs:
 | `simple3_buckets_total` | gauge | Bucket count |
 | `simple3_total_size_bytes` / `simple3_total_dead_bytes` | gauge | Capacity and reclaimable space |
 | `simple3_compaction_running` | gauge | Long autovacuum stalls indicate either thrashing or a misconfigured threshold |
-| `simple3_open_connections` | gauge | TCP fan-in |
+| `simple3_connections_active` | gauge | TCP fan-in |
 
 ### Alert rules (sample)
 
@@ -162,7 +162,7 @@ groups:
         annotations:
           summary: "simple3 process not reachable"
 
-      - alert: Simple3DiskLow
+      - alert: Simple3DeadSpaceHigh
         expr: simple3_total_dead_bytes / simple3_total_size_bytes > 0.4
         for: 30m
         annotations:

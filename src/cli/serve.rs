@@ -409,9 +409,13 @@ fn spawn_autovacuum(
 }
 
 fn run_lifecycle(storage: &Arc<Storage>) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            tracing::warn!("clock before UNIX_EPOCH ({e}); skipping lifecycle sweep");
+            return;
+        }
+    };
     match storage.apply_lifecycle_all(now) {
         Ok(results) => {
             for stat in results {

@@ -79,10 +79,13 @@ impl BucketStore {
 
         let threshold = now.saturating_sub(u64::from(cfg.expiration_days).saturating_mul(ONE_DAY));
 
-        let candidates = {
+        // Scan together with last_modified, then delete only if the per-key
+        // snapshot still matches the (key, last_modified) we observed. A
+        // concurrent overwrite bumps last_modified and we leave it alone.
+        let candidates: Vec<(String, u64)> = {
             let txn = self.db.begin_read().map_err(io::Error::other)?;
             let table = txn.open_table(OBJECTS).map_err(io::Error::other)?;
-            let mut keys: Vec<String> = Vec::new();
+            let mut acc = Vec::new();
             for entry in table.iter().map_err(io::Error::other)? {
                 let (k, v) = entry.map_err(io::Error::other)?;
                 let meta = ObjectMeta::from_bytes(v.value()).map_err(io::Error::other)?;
@@ -90,17 +93,28 @@ impl BucketStore {
                     continue;
                 }
                 if meta.last_modified <= threshold {
-                    keys.push(k.value().to_owned());
+                    acc.push((k.value().to_owned(), meta.last_modified));
                 }
             }
-            keys
+            acc
         };
 
         let mut stats = LifecycleStats {
             scanned: candidates.len() as u64,
             ..Default::default()
         };
-        for key in candidates {
+        for (key, expected_last_modified) in candidates {
+            // Re-check inside a fresh read before deleting so a concurrent
+            // overwrite that bumped last_modified is preserved.
+            let current = self.get_meta(&key)?;
+            let should_delete = current.as_ref().is_some_and(|m| {
+                !m.is_delete_marker
+                    && m.last_modified == expected_last_modified
+                    && m.last_modified <= threshold
+            });
+            if !should_delete {
+                continue;
+            }
             // delete_object honors versioning — produces a delete marker when enabled
             // and increments dead bytes for the unversioned case.
             self.delete_object(&key)?;

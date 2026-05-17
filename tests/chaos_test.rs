@@ -94,8 +94,12 @@ fn chaos_eight_writers_plus_compaction_keep_data_consistent() {
     );
 }
 
+/// Append junk to the active segment after a clean shutdown and confirm the
+/// reopen path truncates the orphan tail. This is the deterministic equivalent
+/// of a torn write — not a substitute for the SIGKILL-driven crash coverage in
+/// `chaos/kill-loop.sh`, which exercises the in-flight path.
 #[test]
-fn chaos_partial_write_to_segment_tail_recovers_via_truncation() {
+fn recovery_truncates_orphan_segment_tail() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.create_bucket("chaos").unwrap();
@@ -109,9 +113,19 @@ fn chaos_partial_write_to_segment_tail_recovers_via_truncation() {
     drop(bucket);
     drop(storage);
 
-    // Append junk to the latest segment to simulate a torn write that landed
-    // on disk but had no metadata commit.
-    let seg_path = dir.path().join("chaos").join("seg_000000.bin");
+    // Append junk to the *highest-numbered* segment so the test survives any
+    // future change to bootstrap or rotation that would shift the active file.
+    let seg_path = fs::read_dir(dir.path().join("chaos"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.starts_with("seg_")
+                && p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+        })
+        .max()
+        .expect("at least one segment file must exist");
     {
         let mut f = OpenOptions::new().append(true).open(&seg_path).unwrap();
         f.write_all(&vec![0xAA; 12345]).unwrap();

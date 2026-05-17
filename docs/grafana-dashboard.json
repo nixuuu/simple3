@@ -6,7 +6,7 @@
     {
       "title": "Request rate by op",
       "type": "timeseries",
-      "datasource": "Prometheus",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "targets": [
         {
@@ -19,7 +19,7 @@
     {
       "title": "p50 / p99 latency by op (1 MB GET/PUT etc.)",
       "type": "timeseries",
-      "datasource": "Prometheus",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "targets": [
         {
@@ -36,7 +36,7 @@
     {
       "title": "Ingress / Egress",
       "type": "timeseries",
-      "datasource": "Prometheus",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [
         {
@@ -53,7 +53,7 @@
     {
       "title": "Active connections",
       "type": "timeseries",
-      "datasource": "Prometheus",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "targets": [
         {
@@ -66,7 +66,7 @@
     {
       "title": "Dead-space ratio per bucket",
       "type": "timeseries",
-      "datasource": "Prometheus",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "targets": [
         {
@@ -79,7 +79,7 @@
     {
       "title": "Compaction runs / duration",
       "type": "timeseries",
-      "datasource": "Prometheus",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "targets": [
         {
@@ -95,7 +95,7 @@
     {
       "title": "Rate-limit drops",
       "type": "timeseries",
-      "datasource": "Prometheus",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 6, "w": 12, "x": 0, "y": 24 },
       "targets": [
         {
@@ -108,7 +108,7 @@
     {
       "title": "Segments per bucket",
       "type": "stat",
-      "datasource": "Prometheus",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 6, "w": 12, "x": 12, "y": 24 },
       "targets": [
         {

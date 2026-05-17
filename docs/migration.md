@@ -149,7 +149,7 @@ Local end-to-end run against `minio/minio:latest` (Docker) and `rclone/rclone:la
 
 Sync command (`rclone/rclone:latest`, `list_version = 2` set on the destination remote):
 
-```
+```text
 $ rclone sync src:mig-source dst:mig-dest --transfers 8 --s3-chunk-size 8M
 Transferred:   	   50.002 MiB / 50.002 MiB, 100%
 Checks:                 0 / 0, -, Listed 102

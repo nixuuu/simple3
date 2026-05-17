@@ -86,9 +86,9 @@ enum Command {
         /// Background scrub interval in seconds (0 = disabled)
         #[arg(long, default_value_t = 3600)]
         scrub_interval: u64,
-        /// Lifecycle sweep interval in seconds (0 = disabled)
-        #[arg(long, default_value_t = 3600)]
-        lifecycle_interval: u64,
+        /// Lifecycle sweep interval in seconds (0 = disabled, default 3600)
+        #[arg(long)]
+        lifecycle_interval: Option<u64>,
         /// Graceful shutdown timeout in seconds
         #[arg(long)]
         shutdown_timeout: Option<u64>,
@@ -376,10 +376,9 @@ pub async fn run() -> anyhow::Result<()> {
                     autovacuum_threshold,
                     max_segment_size_mb,
                     scrub_interval,
-                    lifecycle_interval: cfg
-                        .storage
-                        .lifecycle_interval
-                        .unwrap_or(lifecycle_interval),
+                    lifecycle_interval: lifecycle_interval
+                        .or(cfg.storage.lifecycle_interval)
+                        .unwrap_or(3600),
                     shutdown_timeout: shutdown_timeout
                         .or(cfg.server.shutdown_timeout)
                         .unwrap_or(30),

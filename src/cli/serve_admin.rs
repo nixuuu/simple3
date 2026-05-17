@@ -12,6 +12,7 @@ use serde::Serialize;
 use simple3::auth::AuthStore;
 use simple3::storage::{SegmentStat, Storage};
 
+use super::admin_auth::check_admin_auth;
 use super::serve::{json_response, CompactingGuard};
 
 #[derive(Serialize)]
@@ -52,8 +53,12 @@ pub(super) fn stats_to_json(stats: &[SegmentStat]) -> Vec<SegmentStatJson> {
 pub(super) async fn handle_admin(
     req: hyper::Request<hyper::body::Incoming>,
     storage: Arc<Storage>,
-    _auth_store: Arc<AuthStore>,
+    auth_store: Arc<AuthStore>,
 ) -> s3s::HttpResponse {
+    if let Err(resp) = check_admin_auth(&req, &auth_store) {
+        return resp;
+    }
+
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
 
@@ -86,18 +91,40 @@ async fn handle_lifecycle(
     if method == hyper::Method::GET {
         spawn_blocking_admin(move || admin_lifecycle_get(&storage, &bucket)).await
     } else if method == hyper::Method::PUT {
-        let body_bytes = req
-            .into_body()
-            .collect()
-            .await
-            .map(http_body_util::Collected::to_bytes)
-            .unwrap_or_default();
+        let body_bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => {
+                return json_response(
+                    400,
+                    &serde_json::json!({"error": format!("failed to read request body: {e}")}),
+                );
+            }
+        };
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
         spawn_blocking_admin(move || admin_lifecycle_put(&storage, &bucket, &body_str)).await
     } else if method == hyper::Method::DELETE {
         spawn_blocking_admin(move || admin_lifecycle_delete(&storage, &bucket)).await
     } else {
         json_response(405, &serde_json::json!({"error": "method not allowed"}))
+    }
+}
+
+/// Resolve a bucket, mapping storage errors to 500 instead of folding them into 404.
+#[allow(clippy::result_large_err)] // Err variant carries the JSON response we return directly to the caller
+fn resolve_bucket(
+    storage: &Storage,
+    bucket: &str,
+) -> Result<Arc<simple3::storage::BucketStore>, s3s::HttpResponse> {
+    match storage.get_bucket(bucket) {
+        Ok(Some(store)) => Ok(store),
+        Ok(None) => Err(json_response(
+            404,
+            &serde_json::json!({"error": "bucket not found"}),
+        )),
+        Err(e) => Err(json_response(
+            500,
+            &serde_json::json!({"error": e.to_string()}),
+        )),
     }
 }
 
@@ -110,8 +137,9 @@ async fn spawn_blocking_admin(
 }
 
 fn admin_lifecycle_get(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    let store = match resolve_bucket(storage, bucket) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
     match store.get_lifecycle() {
         Ok(Some(cfg)) => json_response(200, &cfg),
@@ -121,8 +149,9 @@ fn admin_lifecycle_get(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
 }
 
 fn admin_lifecycle_put(storage: &Storage, bucket: &str, body: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    let store = match resolve_bucket(storage, bucket) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
     let cfg: simple3::storage::LifecycleConfig = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -135,8 +164,9 @@ fn admin_lifecycle_put(storage: &Storage, bucket: &str, body: &str) -> s3s::Http
 }
 
 fn admin_lifecycle_delete(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    let store = match resolve_bucket(storage, bucket) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
     match store.delete_lifecycle() {
         Ok(removed) => json_response(200, &serde_json::json!({"removed": removed})),
@@ -145,8 +175,9 @@ fn admin_lifecycle_delete(storage: &Storage, bucket: &str) -> s3s::HttpResponse 
 }
 
 fn admin_stats(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    let store = match resolve_bucket(storage, bucket) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
     let Ok(stats) = store.segment_stats() else {
         return json_response(500, &serde_json::json!({"error": "failed to read stats"}));
@@ -165,8 +196,9 @@ fn admin_stats(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
 }
 
 fn admin_compact(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    let store = match resolve_bucket(storage, bucket) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
     let before = store.segment_stats().unwrap_or_default();
     let before_json = stats_to_json(&before);
@@ -188,8 +220,9 @@ fn admin_compact(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
 }
 
 fn admin_verify(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
+    let store = match resolve_bucket(storage, bucket) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
     match store.verify_integrity() {
         Ok(result) => json_response(200, &result),

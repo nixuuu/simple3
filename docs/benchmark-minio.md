@@ -40,7 +40,7 @@ Tear down with `kill $SIMPLE3_PID $MINIO_PID` (both are exported by `setup.sh`).
 
 - Apple M-series laptop (macOS Darwin 25), single client process pinned to the host loopback.
 - Storage: APFS on the host SSD for both data directories.
-- simple3 built with the `release-prod` profile; MinIO is `minio/minio:latest` (RELEASE.2024-…) in a Docker container with host networking.
+- simple3 built with the `release-prod` profile, ran natively. MinIO is `minio/minio:latest` (RELEASE.2024-…), also run natively by `bench/setup.sh` — `docker run` MinIO is fine too, but the bundled script avoids the container layer.
 - warp 1.x via the `minio/warp:latest` image.
 
 These numbers are loopback-only and not representative of a real network deployment. Re-run on the production hardware before quoting.
