@@ -6,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use simple3::grpc::proto::simple3_client::Simple3Client;
-#[allow(clippy::wildcard_imports)]
+#[allow(clippy::wildcard_imports)] // tonic-generated request/response types — explicit list would be 20+ names
 use simple3::grpc::proto::*;
 
 use super::{

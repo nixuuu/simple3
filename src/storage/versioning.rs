@@ -71,7 +71,6 @@ fn split_version_key(composite: &str) -> Option<(&str, &str)> {
     composite.split_once('\0')
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl BucketStore {
     // === Versioning configuration ===
 

@@ -74,7 +74,7 @@ fn run_autovacuum(storage: &Arc<Storage>, threshold: f64) {
             if stat.dead_bytes == 0 || stat.size == 0 {
                 continue;
             }
-            #[allow(clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)] // ratio for autovacuum threshold; sub-ULP loss irrelevant
             let ratio = stat.dead_bytes as f64 / stat.size as f64;
             if ratio >= threshold {
                 tracing::info!(
@@ -98,29 +98,7 @@ fn run_autovacuum(storage: &Arc<Storage>, threshold: f64) {
 }
 
 // === Admin endpoints ===
-
-#[derive(Serialize)]
-struct StatsResponse {
-    bucket: String,
-    segments: Vec<SegmentStatJson>,
-    total_size: u64,
-    total_dead_bytes: u64,
-}
-
-#[derive(Serialize)]
-struct CompactResponse {
-    bucket: String,
-    compacted: bool,
-    segments_before: Vec<SegmentStatJson>,
-    segments_after: Vec<SegmentStatJson>,
-}
-
-#[derive(Serialize)]
-struct SegmentStatJson {
-    id: u32,
-    size: u64,
-    dead_bytes: u64,
-}
+// Handlers under `/_/` live in `serve_admin.rs`; routing happens in `dispatch` below.
 
 #[derive(Clone)]
 struct AdminService {
@@ -260,7 +238,9 @@ impl AdminService {
         } else if path.starts_with("/_/") {
             let storage = Arc::clone(&self.storage);
             let auth_store = Arc::clone(&self.auth_store);
-            Box::pin(async move { Ok(handle_admin(req, storage, auth_store).await) })
+            Box::pin(async move {
+                Ok(super::serve_admin::handle_admin(req, storage, auth_store).await)
+            })
         } else {
             hyper::service::Service::call(&self.s3, req)
         }
@@ -279,175 +259,6 @@ pub fn json_response(status: u16, body: &impl Serialize) -> s3s::HttpResponse {
                 .body(s3s::Body::from(format!(r#"{{"error":"{e}"}}"#)))
                 .expect("fallback response with no custom headers cannot fail")
         })
-}
-
-fn stats_to_json(stats: &[simple3::storage::SegmentStat]) -> Vec<SegmentStatJson> {
-    stats
-        .iter()
-        .map(|s| SegmentStatJson {
-            id: s.id,
-            size: s.size,
-            dead_bytes: s.dead_bytes,
-        })
-        .collect()
-}
-
-async fn handle_admin(
-    req: hyper::Request<hyper::body::Incoming>,
-    storage: Arc<Storage>,
-    _auth_store: Arc<AuthStore>,
-) -> s3s::HttpResponse {
-    let path = req.uri().path().to_owned();
-    let method = req.method().clone();
-
-    if method == hyper::Method::GET && path.starts_with("/_/stats/") {
-        let bucket = path["/_/stats/".len()..].trim_end_matches('/').to_owned();
-        tokio::task::spawn_blocking(move || admin_stats(&storage, &bucket))
-            .await
-            .unwrap_or_else(|e| {
-                json_response(500, &serde_json::json!({"error": e.to_string()}))
-            })
-    } else if method == hyper::Method::POST && path.starts_with("/_/compact/") {
-        let bucket = path["/_/compact/".len()..].trim_end_matches('/').to_owned();
-        tokio::task::spawn_blocking(move || admin_compact(&storage, &bucket))
-            .await
-            .unwrap_or_else(|e| {
-                json_response(500, &serde_json::json!({"error": e.to_string()}))
-            })
-    } else if method == hyper::Method::GET && path.starts_with("/_/verify/") {
-        let bucket = path["/_/verify/".len()..].trim_end_matches('/').to_owned();
-        tokio::task::spawn_blocking(move || admin_verify(&storage, &bucket))
-            .await
-            .unwrap_or_else(|e| {
-                json_response(500, &serde_json::json!({"error": e.to_string()}))
-            })
-    } else if let Some(rest) = path.strip_prefix("/_/lifecycle/") {
-        let bucket = rest.trim_end_matches('/').to_owned();
-        if bucket.is_empty() {
-            return json_response(404, &serde_json::json!({"error": "bucket required"}));
-        }
-        if method == hyper::Method::GET {
-            tokio::task::spawn_blocking(move || admin_lifecycle_get(&storage, &bucket))
-                .await
-                .unwrap_or_else(|e| {
-                    json_response(500, &serde_json::json!({"error": e.to_string()}))
-                })
-        } else if method == hyper::Method::PUT {
-            use http_body_util::BodyExt;
-            let body_bytes = req
-                .into_body()
-                .collect()
-                .await
-                .map(http_body_util::Collected::to_bytes)
-                .unwrap_or_default();
-            let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
-            tokio::task::spawn_blocking(move || {
-                admin_lifecycle_put(&storage, &bucket, &body_str)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                json_response(500, &serde_json::json!({"error": e.to_string()}))
-            })
-        } else if method == hyper::Method::DELETE {
-            tokio::task::spawn_blocking(move || admin_lifecycle_delete(&storage, &bucket))
-                .await
-                .unwrap_or_else(|e| {
-                    json_response(500, &serde_json::json!({"error": e.to_string()}))
-                })
-        } else {
-            json_response(405, &serde_json::json!({"error": "method not allowed"}))
-        }
-    } else {
-        json_response(404, &serde_json::json!({"error": "not found"}))
-    }
-}
-
-fn admin_lifecycle_get(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    match store.get_lifecycle() {
-        Ok(Some(cfg)) => json_response(200, &cfg),
-        Ok(None) => json_response(404, &serde_json::json!({"error": "no lifecycle configured"})),
-        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
-    }
-}
-
-fn admin_lifecycle_put(storage: &Storage, bucket: &str, body: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    let cfg: simple3::storage::LifecycleConfig = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(e) => return json_response(400, &serde_json::json!({"error": e.to_string()})),
-    };
-    match store.set_lifecycle(&cfg) {
-        Ok(()) => json_response(200, &cfg),
-        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
-    }
-}
-
-fn admin_lifecycle_delete(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    match store.delete_lifecycle() {
-        Ok(removed) => json_response(200, &serde_json::json!({"removed": removed})),
-        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
-    }
-}
-
-fn admin_stats(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    let Ok(stats) = store.segment_stats() else {
-        return json_response(500, &serde_json::json!({"error": "failed to read stats"}));
-    };
-    let total_size: u64 = stats.iter().map(|s| s.size).sum();
-    let total_dead_bytes: u64 = stats.iter().map(|s| s.dead_bytes).sum();
-    json_response(
-        200,
-        &StatsResponse {
-            bucket: bucket.to_owned(),
-            segments: stats_to_json(&stats),
-            total_size,
-            total_dead_bytes,
-        },
-    )
-}
-
-fn admin_compact(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    let before = store.segment_stats().unwrap_or_default();
-    let before_json = stats_to_json(&before);
-    storage.begin_compacting();
-    let _guard = CompactingGuard(storage);
-    if let Err(e) = store.compact() {
-        return json_response(500, &serde_json::json!({"error": e.to_string()}));
-    }
-    let after = store.segment_stats().unwrap_or_default();
-    json_response(
-        200,
-        &CompactResponse {
-            bucket: bucket.to_owned(),
-            compacted: true,
-            segments_before: before_json,
-            segments_after: stats_to_json(&after),
-        },
-    )
-}
-
-fn admin_verify(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    match store.verify_integrity() {
-        Ok(result) => json_response(200, &result),
-        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
-    }
 }
 
 struct ReadyMetrics {
@@ -532,7 +343,7 @@ fn disk_free(path: &Path) -> u64 {
     }
 }
 
-struct CompactingGuard<'a>(&'a Storage);
+pub(super) struct CompactingGuard<'a>(pub(super) &'a Storage);
 
 impl Drop for CompactingGuard<'_> {
     fn drop(&mut self) {

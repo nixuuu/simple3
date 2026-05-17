@@ -158,6 +158,10 @@ pub struct BucketEntry {
     pub name: String,
 }
 
+// DTOs returned by Transport implementations. Some fields are populated by
+// every backend (HTTP/gRPC) but only consumed by a subset of commands —
+// `cargo`'s dead_code lint can't see across the dyn-trait boundary and flags
+// the unused fields. Keeping the full DTO matches the AWS SDK shape.
 #[allow(dead_code)]
 pub struct ObjectEntry {
     pub key: String,
@@ -217,6 +221,8 @@ pub trait Transport: Send + Sync {
         content_type: Option<&str>,
     ) -> anyhow::Result<()>;
     async fn get_object(&self, bucket: &str, key: &str, dest: &Path) -> anyhow::Result<u64>;
+    // Implemented by every Transport backend but not yet called from the CLI;
+    // kept so the trait covers the operation matrix expected of an S3 client.
     #[allow(dead_code)]
     async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<Option<ObjectHead>>;
     #[allow(dead_code)]
@@ -242,6 +248,9 @@ pub trait Transport: Send + Sync {
         key: &str,
         version_id: &str,
     ) -> anyhow::Result<()>;
+    // Backend-implemented but currently only invoked via `simple3 ls --versions`
+    // (the implementation lives in `ls`, not here). Part of the trait so that
+    // future commands can rely on it.
     #[allow(dead_code)]
     async fn list_object_versions(
         &self,

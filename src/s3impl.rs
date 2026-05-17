@@ -85,7 +85,8 @@ impl S3 for SimpleStorage {
 
         blocking(move || {
             if !store.is_empty()? {
-                return Err(io::Error::other("BucketNotEmpty"));
+                // DirectoryNotEmpty maps cleanly back to S3's BucketNotEmpty on the caller side
+                return Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty));
             }
             drop(store);
             storage.delete_bucket(&bucket)?;
@@ -93,7 +94,7 @@ impl S3 for SimpleStorage {
         })
         .await
         .map_err(|e| {
-            if e.to_string() == "BucketNotEmpty" {
+            if e.kind() == io::ErrorKind::DirectoryNotEmpty {
                 return s3_error!(BucketNotEmpty);
             }
             tracing::error!("delete_bucket: {e}");
@@ -144,10 +145,11 @@ impl S3 for SimpleStorage {
                 } else if s.as_str() == BucketVersioningStatus::SUSPENDED {
                     VersioningState::Suspended
                 } else {
-                    return Err(io::Error::other(format!(
-                        "MalformedXML: invalid versioning status '{}'",
-                        s.as_str()
-                    )));
+                    // InvalidData maps to S3's MalformedXML on the caller side
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid versioning status '{}'", s.as_str()),
+                    ));
                 };
                 store.set_versioning_state(state)?;
             }
@@ -155,7 +157,7 @@ impl S3 for SimpleStorage {
         })
         .await
         .map_err(|e| {
-            if e.to_string().starts_with("MalformedXML") {
+            if e.kind() == io::ErrorKind::InvalidData {
                 return s3_error!(MalformedXML);
             }
             tracing::error!("put_bucket_versioning: {e}");
@@ -288,7 +290,7 @@ impl S3 for SimpleStorage {
             s3_error!(e, InternalError)
         })?;
 
-        #[allow(clippy::cast_possible_wrap)]
+        #[allow(clippy::cast_possible_wrap)] // S3 dto uses i64; an object > i64::MAX bytes is unrepresentable
         let content_length = data.len() as i64;
         metrics::counter!("simple3_bytes_sent_total").increment(data.len() as u64);
         let stream =
@@ -583,6 +585,7 @@ impl S3 for SimpleStorage {
             )
         };
 
+        // S3 dto uses i32 for key counts; max_list_keys is clamped well under i32::MAX
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let key_count = objects.len() as i32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -611,7 +614,7 @@ impl S3 for SimpleStorage {
         let input = req.input;
         let store = self.bucket(&input.bucket)?;
 
-        #[allow(clippy::cast_sign_loss)]
+        #[allow(clippy::cast_sign_loss)] // max(0) guarantees non-negative
         let max_keys = (input.max_keys.unwrap_or(1000).max(0) as usize).min(self.limits.max_list_keys);
         let prefix = input.prefix.clone();
         let delimiter = input.delimiter.clone();
@@ -651,7 +654,7 @@ impl S3 for SimpleStorage {
             is_truncated: Some(result.is_truncated),
             key_marker: input.key_marker,
             version_id_marker: input.version_id_marker,
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // max_keys is clamped to max_list_keys, well under i32::MAX
             max_keys: Some(max_keys as i32),
             name: Some(input.bucket),
             prefix: input.prefix,

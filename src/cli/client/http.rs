@@ -21,7 +21,7 @@ impl HttpTransport {
     }
 }
 
-#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_sign_loss)] // S3 timestamps are always >= UNIX_EPOCH; pre-1970 dates would already be invalid
 fn millis_to_epoch_secs(t: &aws_sdk_s3::primitives::DateTime) -> u64 {
     t.to_millis().map_or(0, |ms| (ms / 1000) as u64)
 }
@@ -75,7 +75,7 @@ impl Transport for HttpTransport {
             .iter()
             .map(|obj| ObjectEntry {
                 key: obj.key().unwrap_or_default().to_owned(),
-                #[allow(clippy::cast_sign_loss)]
+                #[allow(clippy::cast_sign_loss)] // AWS SDK reports size as i64 but a negative size is impossible
                 size: obj.size().unwrap_or_default() as u64,
                 last_modified: obj
                     .last_modified()
@@ -124,7 +124,7 @@ impl Transport for HttpTransport {
     async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<Option<ObjectHead>> {
         match self.client.head_object().bucket(bucket).key(key).send().await {
             Ok(resp) => Ok(Some(ObjectHead {
-                #[allow(clippy::cast_sign_loss)]
+                #[allow(clippy::cast_sign_loss)] // AWS SDK reports content_length as i64 but a negative size is impossible
                 size: resp.content_length().unwrap_or_default() as u64,
                 last_modified: resp
                     .last_modified()
@@ -253,7 +253,7 @@ impl Transport for HttpTransport {
             entries.push(VersionEntryInfo {
                 key: ver.key().unwrap_or_default().to_owned(),
                 version_id: ver.version_id().unwrap_or("null").to_owned(),
-                #[allow(clippy::cast_sign_loss)]
+                #[allow(clippy::cast_sign_loss)] // AWS SDK reports size as i64 but a negative size is impossible
                 size: ver.size().unwrap_or_default() as u64,
                 last_modified: ver
                     .last_modified()

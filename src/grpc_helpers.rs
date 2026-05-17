@@ -23,7 +23,7 @@ pub static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Chunk size for streaming downloads (256 KB).
 pub const STREAM_CHUNK_SIZE: u64 = 256 * 1024;
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)] // callers `.map_err(map_io_err)` — taking owned error matches the closure
 pub fn map_io_err(e: io::Error) -> Status {
     match e.kind() {
         io::ErrorKind::NotFound => Status::not_found(e.to_string()),
@@ -78,7 +78,7 @@ pub async fn stream_to_tmp(
                 "expected data chunk after init message",
             ));
         };
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_truncation)] // usize → u64 widens on 32-bit, no-op on 64-bit
         {
             size += chunk.len() as u64;
         }
@@ -103,7 +103,7 @@ pub async fn stream_to_tmp(
 }
 
 /// Stream object data in chunks via an mpsc channel.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)] // ObjectMeta is moved into the spawned blocking task
 pub fn spawn_download_stream(
     store: Arc<BucketStore>,
     meta: ObjectMeta,
@@ -212,7 +212,7 @@ pub async fn bulk_put_one_object(
 
         match msg.request {
             Some(proto::bulk_put_request::Request::Data(chunk)) => {
-                #[allow(clippy::cast_possible_truncation)]
+                #[allow(clippy::cast_possible_truncation)] // usize → u64 widens on 32-bit, no-op on 64-bit
                 {
                     size += chunk.len() as u64;
                 }

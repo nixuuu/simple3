@@ -46,7 +46,6 @@ pub struct BucketStore {
     pub(super) max_segment_size: u64,
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl BucketStore {
     fn open(bucket_dir: &Path, max_segment_size: u64) -> io::Result<Self> {
         fs::create_dir_all(bucket_dir)?;
@@ -320,7 +319,6 @@ pub struct Storage {
     compacting: AtomicUsize,
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl Storage {
     pub fn open(data_dir: &Path) -> io::Result<Self> {
         Self::open_with_segment_size(data_dir, DEFAULT_MAX_SEGMENT_SIZE)

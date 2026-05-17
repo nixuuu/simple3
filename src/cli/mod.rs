@@ -14,6 +14,7 @@ pub mod config;
 pub mod keys;
 pub mod policy_cmd;
 pub mod serve;
+mod serve_admin;
 pub mod serve_config;
 mod serve_lifecycle;
 pub mod util;

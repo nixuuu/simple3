@@ -27,7 +27,6 @@ pub struct LifecycleStats {
     pub deleted: u64,
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl BucketStore {
     pub fn get_lifecycle(&self) -> io::Result<Option<LifecycleConfig>> {
         let txn = self.db.begin_read().map_err(io::Error::other)?;
@@ -111,7 +110,6 @@ impl BucketStore {
     }
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl Storage {
     /// Run lifecycle sweep over every bucket and return per-bucket stats.
     /// Buckets without a configured rule are skipped silently.

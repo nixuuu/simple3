@@ -21,6 +21,8 @@ use crate::grpc_helpers::{
 use crate::storage::versioning::VersioningState;
 use crate::storage::{BucketStore, Storage};
 
+// tonic generates a self-contained module with documentation we don't control;
+// the linted patterns are inherent to prost/tonic codegen and not actionable here.
 #[allow(
     clippy::doc_markdown,
     clippy::derive_partial_eq_without_eq,
@@ -36,7 +38,7 @@ pub mod proto {
 }
 
 use proto::simple3_server::Simple3;
-#[allow(clippy::wildcard_imports)]
+#[allow(clippy::wildcard_imports)] // tonic-generated request/response types — explicit list would be 30+ names
 use proto::*;
 
 pub struct GrpcService {
@@ -600,7 +602,7 @@ impl Simple3 for GrpcService {
 
         tokio::task::spawn_blocking(move || {
             if !store.is_empty()? {
-                return Err(io::Error::other("bucket not empty"));
+                return Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty));
             }
             drop(store);
             storage.delete_bucket(&name)?;
@@ -609,7 +611,7 @@ impl Simple3 for GrpcService {
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?
         .map_err(|e: io::Error| {
-            if e.to_string() == "bucket not empty" {
+            if e.kind() == io::ErrorKind::DirectoryNotEmpty {
                 Status::failed_precondition("bucket not empty")
             } else {
                 map_io_err(e)

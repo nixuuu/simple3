@@ -100,7 +100,7 @@ async fn upload(
     }
     pb.finish_and_clear();
     let err_count = errors.load(Ordering::Relaxed);
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)] // u64 error counter capped by entries.len() (usize)
     let succeeded = entries.len() - err_count as usize;
     println!("upload: {succeeded} files, {err_count} errors");
     if err_count > 0 {
@@ -186,7 +186,7 @@ async fn download(
     }
     pb.finish_and_clear();
     let err_count = errors.load(Ordering::Relaxed);
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)] // u64 error counter capped by objects.len() (usize)
     let succeeded = objects.len() - err_count as usize;
     println!("download: {succeeded} files, {err_count} errors");
     if err_count > 0 {
@@ -264,7 +264,7 @@ async fn copy_s3_to_s3(
     }
     pb.finish_and_clear();
     let err_count = errors.load(Ordering::Relaxed);
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)] // u64 error counter capped by objects.len() (usize)
     let succeeded = objects.len() - err_count as usize;
     println!("copy: {succeeded} files, {err_count} errors");
     if err_count > 0 {

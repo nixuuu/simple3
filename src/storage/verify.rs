@@ -35,7 +35,6 @@ pub enum VerifyErrorKind {
     ReadError,
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl BucketStore {
     pub fn verify_integrity(&self) -> io::Result<VerifyResult> {
         let txn = self.db.begin_read().map_err(io::Error::other)?;
@@ -109,7 +108,7 @@ impl BucketStore {
         Ok(result)
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)] // chunk lengths (remaining as usize) bounded by buf size
     fn verify_object(&self, key: &str, meta: &ObjectMeta) -> Result<(), VerifyError> {
         let seg_arc = self.get_segment_handle(meta.segment_id).map_err(|e| {
             VerifyError {

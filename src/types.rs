@@ -88,7 +88,6 @@ struct ObjectMetaV1 {
     user_metadata: HashMap<String, String>,
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl ObjectMeta {
     pub fn from_bytes(data: &[u8]) -> Result<Self, Box<bincode::ErrorKind>> {
         bincode::deserialize::<Self>(data).or_else(|_| {
