@@ -139,15 +139,18 @@ scrape_configs:
 
 ### Key metrics
 
+These names match what the server actually emits (see `src/cli/metrics.rs`,
+`src/metrics_util.rs`, `src/storage/compaction.rs`, `src/cli/rate_limit.rs`).
+
 | Metric | Type | Why it matters |
 |---|---|---|
-| `simple3_requests_total{op,status}` | counter | Request rate and error budget |
-| `simple3_request_duration_seconds_bucket` | histogram | p50/p99 per S3/gRPC op |
-| `simple3_bytes_received_total` / `simple3_bytes_sent_total` | counter | Ingress/egress throughput |
-| `simple3_rate_limited_total{protocol}` | counter | 429 frequency; raise `rate_limit_rps` if non-zero under normal load |
-| `simple3_buckets_total` | gauge | Bucket count |
-| `simple3_total_size_bytes` / `simple3_total_dead_bytes` | gauge | Capacity and reclaimable space |
-| `simple3_compaction_running` | gauge | Long autovacuum stalls indicate either thrashing or a misconfigured threshold |
+| `simple3_request_duration_seconds{method,operation}` | histogram | Request rate (`_count`), error budget, p50/p99 latency per S3 op |
+| `simple3_bytes_received_total` / `simple3_bytes_sent_total` | counter | Ingress / egress throughput |
+| `simple3_rate_limited_total{protocol}` | counter | 429s by protocol (`http`/`grpc`); raise `rate_limit_rps` if non-zero under normal load |
+| `simple3_segments_total{bucket}` | gauge | Number of segment files per bucket |
+| `simple3_dead_bytes{bucket}` | gauge | Reclaimable bytes per bucket (delete / overwrite churn) |
+| `simple3_dead_space_ratio{bucket}` | gauge | Per-bucket dead-space ratio in [0, 1] |
+| `simple3_compaction_runs_total` / `simple3_compaction_duration_seconds` | counter / histogram | Autovacuum throughput and tail latency |
 | `simple3_connections_active` | gauge | TCP fan-in |
 
 ### Alert rules (sample)
@@ -163,19 +166,20 @@ groups:
           summary: "simple3 process not reachable"
 
       - alert: Simple3DeadSpaceHigh
-        expr: simple3_total_dead_bytes / simple3_total_size_bytes > 0.4
+        # per-bucket gauge; max picks the worst offender
+        expr: max(simple3_dead_space_ratio) > 0.4
         for: 30m
         annotations:
-          summary: "Dead-space ratio > 40 % — autovacuum may be lagging"
+          summary: "Dead-space ratio > 40 % on at least one bucket — autovacuum may be lagging"
 
       - alert: Simple3RateLimitSpike
-        expr: rate(simple3_rate_limited_total[5m]) > 1
+        expr: sum(rate(simple3_rate_limited_total[5m])) > 1
         for: 10m
         annotations:
           summary: "Sustained 429s; check rate_limit_rps or upstream load"
 
       - alert: Simple3HighLatency
-        expr: histogram_quantile(0.99, rate(simple3_request_duration_seconds_bucket{op=~"PutObject|GetObject"}[5m])) > 2
+        expr: histogram_quantile(0.99, sum by (le, operation) (rate(simple3_request_duration_seconds_bucket{operation=~"PutObject|GetObject"}[5m]))) > 2
         for: 15m
         annotations:
           summary: "p99 latency for PUT/GET > 2 s"
