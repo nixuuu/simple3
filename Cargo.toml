@@ -52,7 +52,7 @@ tikv-jemallocator = "0.6"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 testcontainers = "0.27"
 urlencoding = "2"
 
