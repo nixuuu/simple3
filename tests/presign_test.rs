@@ -26,7 +26,7 @@ async fn test_presign_get() {
         .unwrap();
 
     // Generate presigned GET URL
-    let presign_config = PresigningConfig::expires_in(Duration::from_secs(3600)).unwrap();
+    let presign_config = PresigningConfig::expires_in(Duration::from_hours(1)).unwrap();
     let presigned = client
         .get_object()
         .bucket("test")
@@ -52,7 +52,7 @@ async fn test_presign_put() {
     client.create_bucket().bucket("test").send().await.unwrap();
 
     // Generate presigned PUT URL
-    let presign_config = PresigningConfig::expires_in(Duration::from_secs(3600)).unwrap();
+    let presign_config = PresigningConfig::expires_in(Duration::from_hours(1)).unwrap();
     let presigned = client
         .put_object()
         .bucket("test")
@@ -100,7 +100,7 @@ async fn test_presign_expired() {
         .unwrap();
 
     // Generate presigned URL that is already expired (start_time far in the past + 1s TTL)
-    let past = SystemTime::now() - Duration::from_secs(3600);
+    let past = SystemTime::now() - Duration::from_hours(1);
     let presign_config = PresigningConfig::builder()
         .start_time(past)
         .expires_in(Duration::from_secs(1))
@@ -174,7 +174,7 @@ async fn test_presign_policy_denied() {
     let restricted_client = make_client(srv.port, &restricted_key.access_key_id, &restricted_key.secret_key);
 
     // Presigned GET for allowed bucket should work
-    let presign_config = PresigningConfig::expires_in(Duration::from_secs(3600)).unwrap();
+    let presign_config = PresigningConfig::expires_in(Duration::from_hours(1)).unwrap();
     let presigned_allowed = restricted_client
         .get_object()
         .bucket("allowed")
@@ -188,7 +188,7 @@ async fn test_presign_policy_denied() {
     assert_eq!(resp.status(), 200, "allowed bucket should return 200");
 
     // Presigned GET for denied bucket should fail
-    let presign_config = PresigningConfig::expires_in(Duration::from_secs(3600)).unwrap();
+    let presign_config = PresigningConfig::expires_in(Duration::from_hours(1)).unwrap();
     let presigned_denied = restricted_client
         .get_object()
         .bucket("denied")

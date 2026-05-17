@@ -65,11 +65,7 @@ fn prefill_and_delete(
         clippy::cast_sign_loss
     )] // bench helper: count is bounded by test sizes (<= 50k), well within f64 mantissa
     let delete_count = (count as f64 * delete_fraction) as usize;
-    let step = if delete_count > 0 {
-        count / delete_count
-    } else {
-        count + 1
-    };
+    let step = count.checked_div(delete_count).unwrap_or(count + 1);
     for (i, key) in keys.iter().enumerate() {
         if i % step == 0 {
             b.delete_object(key).unwrap();
@@ -240,7 +236,7 @@ fn bench_overwrite(c: &mut Criterion) {
 fn bench_compact(c: &mut Criterion) {
     let mut group = c.benchmark_group("compact");
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(60));
+    group.measurement_time(Duration::from_mins(1));
 
     let cases: &[(&str, usize, usize)] = &[
         ("1k_x_1kb", 1_000, KB),

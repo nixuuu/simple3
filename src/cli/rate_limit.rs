@@ -29,7 +29,7 @@ pub fn spawn_cleanup(
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = shutdown_rx.clone();
     tokio::spawn(async move {
-        let interval = std::time::Duration::from_secs(300);
+        let interval = std::time::Duration::from_mins(5);
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}

@@ -47,7 +47,7 @@ impl BucketStore {
         let live = self.collect_live_objects_for_segment(segment_id)?;
         let compacted_size: u64 = live.iter().map(|e| e.meta.length).sum();
         let seg_path = self.bucket_dir.join(segment_filename(segment_id));
-        let current_size = fs::metadata(&seg_path).map(|m| m.len()).unwrap_or(0);
+        let current_size = fs::metadata(&seg_path).map_or(0, |m| m.len());
         let original_end = live
             .iter()
             .map(|e| e.meta.offset + e.meta.length)

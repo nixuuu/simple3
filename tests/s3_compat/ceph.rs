@@ -145,7 +145,7 @@ async fn compat_ceph_s3_tests() {
         },
     );
 
-    let container = apply_network_config(image.with_startup_timeout(Duration::from_secs(120)))
+    let container = apply_network_config(image.with_startup_timeout(Duration::from_mins(2)))
         .start()
         .await
         .unwrap();

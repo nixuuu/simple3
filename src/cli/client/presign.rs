@@ -100,17 +100,17 @@ mod tests {
 
     #[test]
     fn test_parse_ttl_seconds() {
-        assert_eq!(parse_ttl("3600").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_ttl("3600").unwrap(), Duration::from_hours(1));
         assert_eq!(parse_ttl("1").unwrap(), Duration::from_secs(1));
-        assert_eq!(parse_ttl("604800").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(parse_ttl("604800").unwrap(), Duration::from_hours(24 * 7));
     }
 
     #[test]
     fn test_parse_ttl_suffixes() {
-        assert_eq!(parse_ttl("60s").unwrap(), Duration::from_secs(60));
-        assert_eq!(parse_ttl("30m").unwrap(), Duration::from_secs(1800));
-        assert_eq!(parse_ttl("1h").unwrap(), Duration::from_secs(3600));
-        assert_eq!(parse_ttl("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(parse_ttl("60s").unwrap(), Duration::from_mins(1));
+        assert_eq!(parse_ttl("30m").unwrap(), Duration::from_mins(30));
+        assert_eq!(parse_ttl("1h").unwrap(), Duration::from_hours(1));
+        assert_eq!(parse_ttl("7d").unwrap(), Duration::from_hours(24 * 7));
     }
 
     #[test]

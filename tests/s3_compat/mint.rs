@@ -41,12 +41,12 @@ async fn compat_mint_core() {
         .with_env_var("ENABLE_HTTPS", "0")
         .with_env_var("MINT_MODE", "core")
         .with_cmd(["-c", &cmd])
-        .with_startup_timeout(Duration::from_secs(60));
+        .with_startup_timeout(Duration::from_mins(1));
 
     let container = apply_network_config(container).start().await.unwrap();
 
     // Wait for Mint to finish (poll exit code with timeout).
-    tokio::time::timeout(Duration::from_secs(2400), async {
+    tokio::time::timeout(Duration::from_mins(40), async {
         loop {
             if container.exit_code().await.unwrap().is_some() {
                 break;
