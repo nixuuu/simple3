@@ -59,12 +59,13 @@ fn prefill_and_delete(
 ) {
     let keys = prefill(storage, bucket, count, obj_size);
     let b = storage.get_bucket(bucket).unwrap().unwrap();
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )] // bench helper: count is bounded by test sizes (<= 50k), well within f64 mantissa
     let delete_count = (count as f64 * delete_fraction) as usize;
-    let step = if delete_count > 0 {
-        count / delete_count
-    } else {
-        count + 1
-    };
+    let step = count.checked_div(delete_count).unwrap_or(count + 1);
     for (i, key) in keys.iter().enumerate() {
         if i % step == 0 {
             b.delete_object(key).unwrap();
@@ -235,7 +236,7 @@ fn bench_overwrite(c: &mut Criterion) {
 fn bench_compact(c: &mut Criterion) {
     let mut group = c.benchmark_group("compact");
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(60));
+    group.measurement_time(Duration::from_mins(1));
 
     let cases: &[(&str, usize, usize)] = &[
         ("1k_x_1kb", 1_000, KB),
@@ -245,6 +246,11 @@ fn bench_compact(c: &mut Criterion) {
     ];
 
     for &(label, count, obj_size) in cases {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )] // bench helper: count is bounded; throughput hint only
         let live_bytes = (count as f64 * 0.9) as u64 * obj_size as u64;
         group.throughput(Throughput::Bytes(live_bytes));
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
@@ -268,6 +274,7 @@ fn bench_compact(c: &mut Criterion) {
 
 // === Concurrent benchmarks ===
 
+#[allow(clippy::too_many_lines)] // benchmark scenarios are flat by design; splitting hurts readability
 fn bench_concurrent(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent");
     group.sample_size(10);

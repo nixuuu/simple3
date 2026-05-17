@@ -21,6 +21,8 @@ use crate::grpc_helpers::{
 use crate::storage::versioning::VersioningState;
 use crate::storage::{BucketStore, Storage};
 
+// tonic generates a self-contained module with documentation we don't control;
+// the linted patterns are inherent to prost/tonic codegen and not actionable here.
 #[allow(
     clippy::doc_markdown,
     clippy::derive_partial_eq_without_eq,
@@ -36,7 +38,7 @@ pub mod proto {
 }
 
 use proto::simple3_server::Simple3;
-#[allow(clippy::wildcard_imports)]
+#[allow(clippy::wildcard_imports)] // tonic-generated request/response types — explicit list would be 30+ names
 use proto::*;
 
 pub struct GrpcService {
@@ -600,7 +602,7 @@ impl Simple3 for GrpcService {
 
         tokio::task::spawn_blocking(move || {
             if !store.is_empty()? {
-                return Err(io::Error::other("bucket not empty"));
+                return Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty));
             }
             drop(store);
             storage.delete_bucket(&name)?;
@@ -609,7 +611,7 @@ impl Simple3 for GrpcService {
         .await
         .map_err(|e| Status::internal(format!("task panicked: {e}")))?
         .map_err(|e: io::Error| {
-            if e.to_string() == "bucket not empty" {
+            if e.kind() == io::ErrorKind::DirectoryNotEmpty {
                 Status::failed_precondition("bucket not empty")
             } else {
                 map_io_err(e)
@@ -720,6 +722,76 @@ impl Simple3 for GrpcService {
         .map_err(map_io_err)?;
 
         Ok(Response::new(build_list_versions_response(result)))
+    }
+
+    // ================================================================
+    // Lifecycle
+    // ================================================================
+
+    async fn get_bucket_lifecycle(
+        &self,
+        request: Request<GetBucketLifecycleRequest>,
+    ) -> Result<Response<GetBucketLifecycleResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "GetBucketLifecycle");
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:GetLifecycleConfiguration", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let cfg = tokio::task::spawn_blocking(move || store.get_lifecycle())
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+            .map_err(map_io_err)?;
+
+        Ok(Response::new(GetBucketLifecycleResponse {
+            has_config: cfg.is_some(),
+            config: cfg.map(|c| LifecycleConfig {
+                expiration_days: c.expiration_days,
+            }),
+        }))
+    }
+
+    async fn put_bucket_lifecycle(
+        &self,
+        request: Request<PutBucketLifecycleRequest>,
+    ) -> Result<Response<PutBucketLifecycleResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "PutBucketLifecycle");
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:PutLifecycleConfiguration", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let proto_cfg = input
+            .config
+            .ok_or_else(|| Status::invalid_argument("config required"))?;
+        let cfg = crate::storage::LifecycleConfig {
+            expiration_days: proto_cfg.expiration_days,
+        };
+
+        tokio::task::spawn_blocking(move || store.set_lifecycle(&cfg))
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+            .map_err(map_io_err)?;
+
+        Ok(Response::new(PutBucketLifecycleResponse {}))
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        request: Request<DeleteBucketLifecycleRequest>,
+    ) -> Result<Response<DeleteBucketLifecycleResponse>, Status> {
+        let _timer = DurationRecorder::new("gRPC", "DeleteBucketLifecycle");
+        let resource = format!("arn:s3:::{}", request.get_ref().bucket);
+        self.check_auth(&request, "s3:PutLifecycleConfiguration", &resource)?;
+        let input = request.into_inner();
+        let store = self.bucket(&input.bucket)?;
+
+        let removed = tokio::task::spawn_blocking(move || store.delete_lifecycle())
+            .await
+            .map_err(|e| Status::internal(format!("task panicked: {e}")))?
+            .map_err(map_io_err)?;
+
+        Ok(Response::new(DeleteBucketLifecycleResponse { removed }))
     }
 
     async fn stats(

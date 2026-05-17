@@ -33,6 +33,8 @@ pub struct StorageConfig {
     pub autovacuum_interval: Option<u64>,
     pub autovacuum_threshold: Option<f64>,
     pub scrub_interval: Option<u64>,
+    /// Lifecycle sweep interval in seconds (0 = disabled)
+    pub lifecycle_interval: Option<u64>,
     pub min_disk_free_mb: Option<u64>,
     /// Maximum object size in megabytes (0 = unlimited)
     pub max_object_size_mb: Option<u64>,

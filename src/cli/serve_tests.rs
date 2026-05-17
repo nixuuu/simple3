@@ -31,9 +31,8 @@ async fn spawn_test_server(service: AdminService) -> u16 {
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(_) => break,
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
             };
             let svc = service.clone();
             tokio::spawn(async move {

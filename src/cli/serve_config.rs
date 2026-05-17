@@ -9,6 +9,7 @@ pub struct ServeConfig {
     pub autovacuum_threshold: f64,
     pub max_segment_size_mb: u64,
     pub scrub_interval: u64,
+    pub lifecycle_interval: u64,
     pub shutdown_timeout: u64,
     pub min_disk_free_mb: u64,
     pub rate_limit_rps: u32,

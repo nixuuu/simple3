@@ -328,7 +328,7 @@ async fn test_copy_special_chars_key() {
 }
 
 /// Regression test: keys containing characters that require percent-encoding
-/// (?, #, %) must round-trip through CopyObject correctly. The s3s library
+/// (?, #, %) must round-trip through `CopyObject` correctly. The s3s library
 /// decodes these at parse time; this test guards against regressions.
 #[tokio::test]
 async fn test_copy_percent_encoded_chars_key() {

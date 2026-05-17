@@ -259,6 +259,40 @@ simple3 verify               # all buckets
 simple3 verify my-bucket     # single bucket
 ```
 
+## Operations
+
+| Topic | Doc |
+|---|---|
+| Production deployment (systemd, config, monitoring, sizing) | [`docs/production.md`](docs/production.md) |
+| TLS via reverse proxy (nginx, Traefik, Caddy) | [`docs/tls-proxy.md`](docs/tls-proxy.md) |
+| Migration from MinIO / AWS S3 | [`docs/migration.md`](docs/migration.md) |
+| Backup and restore | [`docs/backup.md`](docs/backup.md) |
+| Benchmark vs MinIO (single node) | [`docs/benchmark-minio.md`](docs/benchmark-minio.md) |
+| Chaos / fault-injection testing | [`docs/chaos-testing.md`](docs/chaos-testing.md) |
+
+## Lifecycle (auto-expiration)
+
+Per-bucket rule expressed as JSON, persisted in the bucket's redb index. The
+server sweeps every `storage.lifecycle_interval` seconds (default 3600;
+set 0 to disable) and deletes objects older than `expiration_days`. Deletes
+produce dead bytes the autovacuum reclaims.
+
+```bash
+# Set a 30-day expiration on `bucket-a`
+curl -X PUT \
+  -H "Authorization: Bearer $AK:$SK" \
+  -H "Content-Type: application/json" \
+  -d '{"expiration_days":30}' \
+  http://127.0.0.1:8080/_/lifecycle/bucket-a
+
+# Inspect / remove
+curl    -H "Authorization: Bearer $AK:$SK" http://127.0.0.1:8080/_/lifecycle/bucket-a
+curl -X DELETE -H "Authorization: Bearer $AK:$SK" http://127.0.0.1:8080/_/lifecycle/bucket-a
+```
+
+The same operations are available over gRPC (`GetBucketLifecycle`,
+`PutBucketLifecycle`, `DeleteBucketLifecycle`).
+
 ## Development
 
 ```bash

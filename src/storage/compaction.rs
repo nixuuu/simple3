@@ -25,7 +25,6 @@ pub(super) struct LiveEntry {
     meta: ObjectMeta,
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl BucketStore {
     pub(super) fn collect_live_objects_for_segment(
         &self,
@@ -48,7 +47,7 @@ impl BucketStore {
         let live = self.collect_live_objects_for_segment(segment_id)?;
         let compacted_size: u64 = live.iter().map(|e| e.meta.length).sum();
         let seg_path = self.bucket_dir.join(segment_filename(segment_id));
-        let current_size = fs::metadata(&seg_path).map(|m| m.len()).unwrap_or(0);
+        let current_size = fs::metadata(&seg_path).map_or(0, |m| m.len());
         let original_end = live
             .iter()
             .map(|e| e.meta.offset + e.meta.length)
@@ -234,7 +233,7 @@ fn copy_live_objects(
         new_offset += entry.meta.length;
 
         while remaining > 0 {
-            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_possible_truncation)] // chunk is .min(buf.len()) — clamped to a usize-sized buffer
             let chunk = (remaining as usize).min(buf.len());
             file.read_exact_at(&mut buf[..chunk], read_off)?;
             tmp.write_all(&buf[..chunk])?;

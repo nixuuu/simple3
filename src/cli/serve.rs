@@ -74,7 +74,7 @@ fn run_autovacuum(storage: &Arc<Storage>, threshold: f64) {
             if stat.dead_bytes == 0 || stat.size == 0 {
                 continue;
             }
-            #[allow(clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)] // ratio for autovacuum threshold; sub-ULP loss irrelevant
             let ratio = stat.dead_bytes as f64 / stat.size as f64;
             if ratio >= threshold {
                 tracing::info!(
@@ -98,29 +98,7 @@ fn run_autovacuum(storage: &Arc<Storage>, threshold: f64) {
 }
 
 // === Admin endpoints ===
-
-#[derive(Serialize)]
-struct StatsResponse {
-    bucket: String,
-    segments: Vec<SegmentStatJson>,
-    total_size: u64,
-    total_dead_bytes: u64,
-}
-
-#[derive(Serialize)]
-struct CompactResponse {
-    bucket: String,
-    compacted: bool,
-    segments_before: Vec<SegmentStatJson>,
-    segments_after: Vec<SegmentStatJson>,
-}
-
-#[derive(Serialize)]
-struct SegmentStatJson {
-    id: u32,
-    size: u64,
-    dead_bytes: u64,
-}
+// Handlers under `/_/` live in `serve_admin.rs`; routing happens in `dispatch` below.
 
 #[derive(Clone)]
 struct AdminService {
@@ -260,7 +238,9 @@ impl AdminService {
         } else if path.starts_with("/_/") {
             let storage = Arc::clone(&self.storage);
             let auth_store = Arc::clone(&self.auth_store);
-            Box::pin(async move { Ok(handle_admin(req, storage, auth_store).await) })
+            Box::pin(async move {
+                Ok(super::serve_admin::handle_admin(req, storage, auth_store).await)
+            })
         } else {
             hyper::service::Service::call(&self.s3, req)
         }
@@ -279,104 +259,6 @@ pub fn json_response(status: u16, body: &impl Serialize) -> s3s::HttpResponse {
                 .body(s3s::Body::from(format!(r#"{{"error":"{e}"}}"#)))
                 .expect("fallback response with no custom headers cannot fail")
         })
-}
-
-fn stats_to_json(stats: &[simple3::storage::SegmentStat]) -> Vec<SegmentStatJson> {
-    stats
-        .iter()
-        .map(|s| SegmentStatJson {
-            id: s.id,
-            size: s.size,
-            dead_bytes: s.dead_bytes,
-        })
-        .collect()
-}
-
-async fn handle_admin(
-    req: hyper::Request<hyper::body::Incoming>,
-    storage: Arc<Storage>,
-    _auth_store: Arc<AuthStore>,
-) -> s3s::HttpResponse {
-    let path = req.uri().path().to_owned();
-    let method = req.method().clone();
-
-    if method == hyper::Method::GET && path.starts_with("/_/stats/") {
-        let bucket = path["/_/stats/".len()..].trim_end_matches('/').to_owned();
-        tokio::task::spawn_blocking(move || admin_stats(&storage, &bucket))
-            .await
-            .unwrap_or_else(|e| {
-                json_response(500, &serde_json::json!({"error": e.to_string()}))
-            })
-    } else if method == hyper::Method::POST && path.starts_with("/_/compact/") {
-        let bucket = path["/_/compact/".len()..].trim_end_matches('/').to_owned();
-        tokio::task::spawn_blocking(move || admin_compact(&storage, &bucket))
-            .await
-            .unwrap_or_else(|e| {
-                json_response(500, &serde_json::json!({"error": e.to_string()}))
-            })
-    } else if method == hyper::Method::GET && path.starts_with("/_/verify/") {
-        let bucket = path["/_/verify/".len()..].trim_end_matches('/').to_owned();
-        tokio::task::spawn_blocking(move || admin_verify(&storage, &bucket))
-            .await
-            .unwrap_or_else(|e| {
-                json_response(500, &serde_json::json!({"error": e.to_string()}))
-            })
-    } else {
-        json_response(404, &serde_json::json!({"error": "not found"}))
-    }
-}
-
-fn admin_stats(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    let Ok(stats) = store.segment_stats() else {
-        return json_response(500, &serde_json::json!({"error": "failed to read stats"}));
-    };
-    let total_size: u64 = stats.iter().map(|s| s.size).sum();
-    let total_dead_bytes: u64 = stats.iter().map(|s| s.dead_bytes).sum();
-    json_response(
-        200,
-        &StatsResponse {
-            bucket: bucket.to_owned(),
-            segments: stats_to_json(&stats),
-            total_size,
-            total_dead_bytes,
-        },
-    )
-}
-
-fn admin_compact(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    let before = store.segment_stats().unwrap_or_default();
-    let before_json = stats_to_json(&before);
-    storage.begin_compacting();
-    let _guard = CompactingGuard(storage);
-    if let Err(e) = store.compact() {
-        return json_response(500, &serde_json::json!({"error": e.to_string()}));
-    }
-    let after = store.segment_stats().unwrap_or_default();
-    json_response(
-        200,
-        &CompactResponse {
-            bucket: bucket.to_owned(),
-            compacted: true,
-            segments_before: before_json,
-            segments_after: stats_to_json(&after),
-        },
-    )
-}
-
-fn admin_verify(storage: &Storage, bucket: &str) -> s3s::HttpResponse {
-    let Some(store) = storage.get_bucket(bucket).ok().flatten() else {
-        return json_response(404, &serde_json::json!({"error": "bucket not found"}));
-    };
-    match store.verify_integrity() {
-        Ok(result) => json_response(200, &result),
-        Err(e) => json_response(500, &serde_json::json!({"error": e.to_string()})),
-    }
 }
 
 struct ReadyMetrics {
@@ -461,7 +343,7 @@ fn disk_free(path: &Path) -> u64 {
     }
 }
 
-struct CompactingGuard<'a>(&'a Storage);
+pub(super) struct CompactingGuard<'a>(pub(super) &'a Storage);
 
 impl Drop for CompactingGuard<'_> {
     fn drop(&mut self) {
@@ -523,6 +405,54 @@ fn spawn_autovacuum(
         interval_secs,
         threshold * 100.0
     );
+    handle
+}
+
+fn run_lifecycle(storage: &Arc<Storage>) {
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            tracing::warn!("clock before UNIX_EPOCH ({e}); skipping lifecycle sweep");
+            return;
+        }
+    };
+    match storage.apply_lifecycle_all(now) {
+        Ok(results) => {
+            for stat in results {
+                if stat.scanned == 0 {
+                    continue;
+                }
+                tracing::info!(
+                    "lifecycle: {} — scanned {}, deleted {}",
+                    stat.bucket, stat.scanned, stat.deleted
+                );
+            }
+        }
+        Err(e) => tracing::error!("lifecycle sweep failed: {e}"),
+    }
+}
+
+fn spawn_lifecycle(
+    storage: &Arc<Storage>,
+    interval_secs: u64,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let lc_storage = Arc::clone(storage);
+    let interval = Duration::from_secs(interval_secs);
+    let mut rx = shutdown_rx.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                _ = rx.changed() => break,
+            }
+            let storage = Arc::clone(&lc_storage);
+            if let Err(e) = tokio::task::spawn_blocking(move || run_lifecycle(&storage)).await {
+                tracing::error!("lifecycle task panicked: {e}");
+            }
+        }
+    });
+    tracing::info!("lifecycle enabled: interval={}s", interval_secs);
     handle
 }
 
@@ -685,6 +615,9 @@ fn spawn_background_tasks(
     }
     if cfg.scrub_interval > 0 {
         tasks.push(spawn_scrub(storage, cfg.scrub_interval, shutdown_rx));
+    }
+    if cfg.lifecycle_interval > 0 {
+        tasks.push(spawn_lifecycle(storage, cfg.lifecycle_interval, shutdown_rx));
     }
     tasks.push(spawn_metrics_updater(storage, shutdown_rx));
     tasks

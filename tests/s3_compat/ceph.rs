@@ -4,9 +4,7 @@ use testcontainers::core::{ExecCommand, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-#[path = "../common/mod.rs"]
-mod common;
-
+use crate::common;
 use crate::helpers::{apply_network_config, parse_pytest_summary, CompatReport, FailureDetail};
 use crate::known_failures::ceph_known_failures;
 
@@ -20,7 +18,7 @@ fn generate_ceph_config(
     alt_secret: &str,
 ) -> String {
     format!(
-        r#"[DEFAULT]
+        r"[DEFAULT]
 host = {host}
 port = {port}
 is_secure = no
@@ -50,7 +48,7 @@ user_id = tenant
 email = tenant@example.com
 access_key = {alt_key}
 secret_key = {alt_secret}
-"#
+"
     )
 }
 
@@ -126,7 +124,7 @@ fn build_ceph_report(output: &str) -> CompatReport {
 ///
 /// Run with: `cargo test --test s3_compat compat_ceph -- --ignored --nocapture`
 #[tokio::test]
-#[ignore]
+#[ignore = "requires Docker image; opt in with --ignored"]
 async fn compat_ceph_s3_tests() {
     let dir = tempfile::tempdir().unwrap();
     let srv = common::start_server_external(dir.path()).await;
@@ -147,7 +145,7 @@ async fn compat_ceph_s3_tests() {
         },
     );
 
-    let container = apply_network_config(image.with_startup_timeout(Duration::from_secs(120)))
+    let container = apply_network_config(image.with_startup_timeout(Duration::from_mins(2)))
         .start()
         .await
         .unwrap();

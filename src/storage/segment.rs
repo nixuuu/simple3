@@ -23,7 +23,7 @@ pub(super) fn copy_large(reader: &mut impl Read, writer: &mut impl Write) -> io:
             return Ok(total);
         }
         writer.write_all(&buf[..n])?;
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_truncation)] // usize → u64 widens on 32-bit, no-op on 64-bit
         {
             total += n as u64;
         }

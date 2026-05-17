@@ -26,6 +26,11 @@ service Simple3 {
   rpc PutBucketVersioning(PutBucketVersioningRequest) returns (PutBucketVersioningResponse);
   rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
 
+  // --- Lifecycle ---
+  rpc GetBucketLifecycle(GetBucketLifecycleRequest) returns (GetBucketLifecycleResponse);
+  rpc PutBucketLifecycle(PutBucketLifecycleRequest) returns (PutBucketLifecycleResponse);
+  rpc DeleteBucketLifecycle(DeleteBucketLifecycleRequest) returns (DeleteBucketLifecycleResponse);
+
   // --- Admin ---
   rpc Stats(StatsRequest) returns (StatsResponse);
   rpc Compact(CompactRequest) returns (CompactResponse);
@@ -302,6 +307,33 @@ message DeleteMarkerProto {
   string version_id = 2;
   uint64 last_modified = 3;
   bool is_latest = 4;
+}
+
+// ============================================================
+// Lifecycle
+// ============================================================
+
+message LifecycleConfig {
+  uint32 expiration_days = 1;
+}
+
+message GetBucketLifecycleRequest {
+  string bucket = 1;
+}
+message GetBucketLifecycleResponse {
+  bool has_config = 1;
+  LifecycleConfig config = 2;
+}
+message PutBucketLifecycleRequest {
+  string bucket = 1;
+  LifecycleConfig config = 2;
+}
+message PutBucketLifecycleResponse {}
+message DeleteBucketLifecycleRequest {
+  string bucket = 1;
+}
+message DeleteBucketLifecycleResponse {
+  bool removed = 1;
 }
 
 // ============================================================

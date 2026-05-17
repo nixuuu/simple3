@@ -35,7 +35,7 @@ pub struct ExternalTestServer {
 }
 
 /// Bootstrap storage + auth and build an S3 service.
-/// Returns (service, auth_store, root_access_key, root_secret_key).
+/// Returns `(service, auth_store, root_access_key, root_secret_key)`.
 fn build_s3_service(
     dir: &std::path::Path,
 ) -> (s3s::service::S3Service, Arc<AuthStore>, String, String) {
@@ -100,6 +100,45 @@ pub async fn start_server(dir: &std::path::Path) -> TestServer {
     }
 }
 
+/// Same as `start_server` but with a custom `Limits` configuration so
+/// per-test enforcement of size/list caps can be verified.
+pub async fn start_server_with_limits(
+    dir: &std::path::Path,
+    limits: simple3::limits::Limits,
+) -> TestServer {
+    let storage = Arc::new(Storage::open(dir).unwrap());
+    let (auth_store, bootstrap) = AuthStore::open(dir).unwrap();
+    let auth_store = Arc::new(auth_store);
+
+    let (access_key, secret_key) = match bootstrap {
+        simple3::auth::types::BootstrapResult::NewRootKey {
+            access_key_id,
+            secret_key,
+        } => (access_key_id, secret_key),
+        simple3::auth::types::BootstrapResult::Existing => {
+            panic!("expected new root key for fresh data dir");
+        }
+    };
+
+    let s3 = SimpleStorage::new(Arc::clone(&storage), limits);
+    let auth_provider = AuthProvider::new(Arc::clone(&auth_store));
+    let mut builder = S3ServiceBuilder::new(s3);
+    builder.set_auth(auth_provider.clone());
+    builder.set_access(auth_provider);
+    let svc = builder.build();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    spawn_accept_loop(listener, svc);
+
+    TestServer {
+        port,
+        access_key,
+        secret_key,
+        auth_store,
+    }
+}
+
 /// Start a server bound to 0.0.0.0 (accessible from Docker containers) with
 /// a second non-admin user for cross-user compatibility tests.
 pub async fn start_server_external(dir: &std::path::Path) -> ExternalTestServer {
@@ -149,7 +188,7 @@ pub fn container_host() -> &'static str {
 static TEST_TMP: AtomicU64 = AtomicU64::new(0);
 
 /// Write data to a temp file and upload as a multipart part.
-/// Shared helper used by storage_test and crash_recovery_test.
+/// Shared helper used by `storage_test` and `crash_recovery_test`.
 pub fn write_part(
     bucket: &simple3::storage::BucketStore,
     upload_id: &str,

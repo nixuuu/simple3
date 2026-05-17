@@ -54,7 +54,7 @@ pub async fn run(args: ClientArgs, cmd: KeysCommand) -> anyhow::Result<()> {
         KeysCommand::List => {
             let resp: serde_json::Value = client.get("/_/keys").await?;
             let keys = resp["keys"].as_array();
-            if keys.is_none() || keys.is_some_and(Vec::is_empty) {
+            if keys.is_none_or(Vec::is_empty) {
                 println!("no access keys");
                 return Ok(());
             }
@@ -88,7 +88,7 @@ pub async fn run(args: ClientArgs, cmd: KeysCommand) -> anyhow::Result<()> {
             );
             println!("Description:   {}", resp["description"].as_str().unwrap_or(""));
             let policies = resp["policies"].as_array();
-            if policies.is_none() || policies.is_some_and(Vec::is_empty) {
+            if policies.is_none_or(Vec::is_empty) {
                 println!("Policies:      (none)");
             } else {
                 println!("Policies:");

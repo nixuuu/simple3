@@ -10,7 +10,6 @@ use crate::types::ObjectMeta;
 
 use super::{BucketStore, COPY_BUF_SIZE};
 
-#[allow(clippy::missing_errors_doc)]
 impl BucketStore {
     pub fn create_multipart_upload(&self) -> String {
         static MPU_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -50,7 +49,7 @@ impl BucketStore {
         Ok(md5_hex.to_owned())
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)] // i32 part numbers cast to u32 only for sorting; bounded by S3 max parts (10_000)
     #[allow(clippy::too_many_arguments)] // logically-distinct storage params; bundling into a struct adds indirection with no reuse benefit
     pub fn complete_multipart_upload(
         &self,
@@ -143,7 +142,7 @@ impl BucketStore {
 
     /// Read part files, write them sequentially, and compute the combined multipart `ETag`,
     /// whole-object `content_md5`, and CRC32C for integrity verification.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)] // copy loop bounds (remaining as usize) are clamped by buf.len()
     fn assemble_parts(
         &self,
         writer: &mut File,
