@@ -1,6 +1,6 @@
 # TLS via reverse proxy
 
-simple3 speaks plaintext HTTP and gRPC by design. For production, terminate TLS in a reverse proxy that also handles certificate renewal. The configs below have been verified end-to-end with `aws s3 ls` (HTTPS) and the `simple3 --grpc ls` client (HTTPS gRPC).
+simple3 speaks plaintext HTTP and gRPC by design. For production, terminate TLS in a reverse proxy that also handles certificate renewal. The configs below are derived from a local end-to-end run against the nginx variant — see [End-to-end verification](#end-to-end-verification) for the trace. Traefik and Caddy are the same routing pattern with different syntax; the gotcha (SigV4 Host header preservation) applies to all three.
 
 Assumptions throughout:
 
@@ -30,7 +30,10 @@ server {
 
     location / {
         proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host              $host;
+        # SigV4 signs the Host header verbatim INCLUDING the port. nginx's
+        # $host variable strips the port — use $http_host to forward the
+        # exact header the client signed, or signature verification fails.
+        proxy_set_header Host              $http_host;
         proxy_set_header X-Forwarded-For   $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
@@ -143,20 +146,48 @@ grpc.example.com {
 
 Reload: `caddy reload --config /etc/caddy/Caddyfile`.
 
-## Verifying the path end-to-end
+## End-to-end verification
+
+The S3-over-HTTPS path was verified locally with the nginx config above against
+a real simple3 binary. Steps:
 
 ```bash
-# S3 API
-AWS_ACCESS_KEY_ID=AK AWS_SECRET_ACCESS_KEY=SK \
-  aws --endpoint-url https://s3.example.com s3 ls
+# 1. Self-signed cert for localhost
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1 -nodes \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
-# gRPC
-simple3 ls --grpc \
-  --endpoint-url https://grpc.example.com \
-  --access-key AK --secret-key SK
+# 2. simple3 on host:18080, plaintext
+simple3 --data-dir /tmp/tls-data serve --host 127.0.0.1 --port 18080 --grpc-port 0
+
+# 3. nginx in a container, listening on host:18443, proxying to host:18080.
+#    Mount cert.pem / key.pem and the nginx.conf above (with proxy_pass
+#    rewritten to http://host.docker.internal:18080).
+docker run -d --rm -p 18443:443 \
+  -v /tmp/tls/cert.pem:/etc/nginx/certs/cert.pem:ro \
+  -v /tmp/tls/key.pem:/etc/nginx/certs/key.pem:ro \
+  -v /tmp/tls/nginx.conf:/etc/nginx/nginx.conf:ro \
+  nginx:1.27-alpine
+
+# 4. AWS CLI over HTTPS
+export AWS_ACCESS_KEY_ID=$AK AWS_SECRET_ACCESS_KEY=$SK
+export AWS_CA_BUNDLE=/tmp/tls/cert.pem
+aws --endpoint-url https://localhost:18443 s3 ls
+# → 1970-01-01 01:00:00 tls-bucket
+
+aws --endpoint-url https://localhost:18443 s3 cp ./payload.txt s3://tls-bucket/payload.txt
+aws --endpoint-url https://localhost:18443 s3 cp s3://tls-bucket/payload.txt ./payload.dl
+diff ./payload.txt ./payload.dl
+# (no output → byte-identical)
 ```
 
-A 200 / non-error response confirms TLS termination, header rewriting, and upstream forwarding.
+The gRPC variant follows the same pattern (HTTP/2 backend, `h2c` upstream). It
+was not run end-to-end locally; only validate the Host-header rule (SigV4 doesn't
+apply to gRPC) and the HTTP/2-cleartext backend setting.
+
+If the AWS CLI returns `SignatureDoesNotMatch`, the proxy is rewriting the Host
+header. Check that the config uses `$http_host` (nginx), `passHostHeader: true`
+(Traefik), or default behavior (Caddy preserves the Host).
 
 ## Why no native TLS
 

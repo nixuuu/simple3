@@ -1,31 +1,23 @@
 # Benchmark vs MinIO (single node)
 
-Same machine, same disk, same client, same parameters — simple3 against a single MinIO instance. The intent is reproducibility, not winning a benchmark. The scripts under [`bench/`](../bench/) bring up both servers locally, run [MinIO's `warp`](https://github.com/minio/warp) against each, and emit raw CSVs you can analyze yourself.
+Same machine, same disk, same client, same parameters — simple3 against a single MinIO instance. The intent is reproducibility, not winning a benchmark. The scripts under [`bench/`](../bench/) bring up both servers locally, run [MinIO's `warp`](https://github.com/minio/warp) against each, and emit raw CSVs you can re-analyze.
 
 ## Methodology
 
 - Both servers run on the same host, sequentially. No co-tenancy effects, no cross-host networking.
 - Each test starts from an empty `data_dir`.
 - `warp mixed` is the canonical workload: a 20% PUT / 80% GET mix over a single bucket, mirroring real S3 traffic.
-- Three repetitions per cell; report median.
-- Disk caches are dropped between runs (`sysctl vm.drop_caches=3`) on Linux; on macOS the disk cache is not flushable so results are read-cache-warm.
+- 15 s warm-up + run per cell (warp prep + record).
+- One run per cell; we record what was measured, not best-of-N.
 
 ### Parameters
 
 | Axis | Values |
 |---|---|
 | Object size | 1 KB, 64 KB, 1 MB, 10 MB |
-| Concurrency | 1, 8 |
-| Duration per cell | 30 s |
-| Workload | `warp mixed` (20% PUT, 80% GET) |
-
-### Metrics
-
-`warp analyze` produces:
-
-- p50 / p99 latency per operation (PUT, GET, STAT)
-- Throughput in ops/s and MiB/s
-- Peak RSS read from `/proc/<pid>/status` (Linux only)
+| Concurrency | 1, 8 (8 only at 1 MB) |
+| Duration per cell | 15 s |
+| Workload | `warp mixed` (default share) |
 
 ### Reproducing
 
@@ -44,39 +36,71 @@ warp analyze bench/results/minio-mixed-1MB-t8.csv
 
 Tear down with `kill $SIMPLE3_PID $MINIO_PID` (both are exported by `setup.sh`).
 
-## Hardware tested
+## Hardware used for the numbers below
 
-This guide ships with the scripts. The reference run that populated `README.md`'s storage-engine numbers used:
+- Apple M-series laptop (macOS Darwin 25), single client process pinned to the host loopback.
+- Storage: APFS on the host SSD for both data directories.
+- simple3 built with the `release-prod` profile; MinIO is `minio/minio:latest` (RELEASE.2024-…) in a Docker container with host networking.
+- warp 1.x via the `minio/warp:latest` image.
 
-- Hetzner EX130-R (Intel Xeon Gold 5412U, 24 cores @ 2.1 GHz, 256 GB DDR5 ECC, 1.92 TB NVMe SSD, Ubuntu 22.04, ext4)
+These numbers are loopback-only and not representative of a real network deployment. Re-run on the production hardware before quoting.
 
-Replace the table below with your own numbers once you've run the scripts. Leave the raw CSVs alongside this doc so others can audit.
+## Results — `warp mixed`, 15 s
 
-## Results template
+### Concurrency 1 (single-threaded)
 
-Drop your `warp analyze` output into the table below and check it in next to this file.
+| Object size | Op | simple3 throughput | MinIO throughput |
+|---|---|---:|---:|
+| 1 KB  | PUT  | 59 obj/s     | 176 obj/s |
+| 1 KB  | GET  | 177 obj/s    | 531 obj/s |
+| 1 KB  | STAT | 118 obj/s    | 356 obj/s |
+| 64 KB | PUT  | 3.10 MiB/s   | 10.25 MiB/s |
+| 64 KB | GET  | 9.36 MiB/s   | 30.80 MiB/s |
+| 64 KB | STAT | 100 obj/s    | 336 obj/s |
+| 1 MB  | PUT  | 36.39 MiB/s  | 57.70 MiB/s |
+| 1 MB  | GET  | 111.44 MiB/s | 172.26 MiB/s |
+| 1 MB  | STAT | 77 obj/s     | 121 obj/s |
+| 10 MB | PUT  | 147.62 MiB/s | 138.21 MiB/s |
+| 10 MB | GET  | 424.75 MiB/s | 398.17 MiB/s |
+| 10 MB | STAT | 29 obj/s     | 28 obj/s |
 
-| Workload | Size | Threads | Server | p50 latency | p99 latency | Throughput | RSS |
-|---|---|---|---|---|---|---|---|
-| mixed | 1 KB | 1 | simple3 | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 1 KB | 1 | minio   | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 64 KB | 1 | simple3 | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 64 KB | 1 | minio   | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 1 MB | 1 | simple3 | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 1 MB | 1 | minio   | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 10 MB | 1 | simple3 | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 10 MB | 1 | minio   | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 1 MB | 8 | simple3 | _fill_ | _fill_ | _fill_ | _fill_ |
-| mixed | 1 MB | 8 | minio   | _fill_ | _fill_ | _fill_ | _fill_ |
+### Concurrency 8
+
+| Object size | Op | simple3 throughput | MinIO throughput |
+|---|---|---:|---:|
+| 1 MB | PUT  | 66.52 MiB/s  | 162.55 MiB/s |
+| 1 MB | GET  | 200.78 MiB/s | 487.35 MiB/s |
+| 1 MB | STAT | 139 obj/s    | 341 obj/s |
+
+### Latency percentiles (1 MB, concurrency 1)
+
+| Op  | Server  | p50  | p90  | p99  | Fastest |
+|---|---|---:|---:|---:|---:|
+| PUT  | simple3 | 13.6 ms | 15.6 ms | 21.0 ms | 10.0 ms |
+| PUT  | MinIO   | 7.9 ms  | 9.5 ms  | 12.1 ms | 5.9 ms |
+| GET  | simple3 | 1.6 ms  | 2.9 ms  | 4.3 ms  | 0.8 ms |
+| GET  | MinIO   | 1.9 ms  | 3.4 ms  | 5.4 ms  | 0.8 ms |
+| STAT | simple3 | 0.4 ms  | 0.8 ms  | 1.9 ms  | 0.2 ms |
+| STAT | MinIO   | 0.5 ms  | 0.8 ms  | 1.9 ms  | 0.2 ms |
+
+### Peak resident memory (after the 15 s mixed run)
+
+| Server  | RSS |
+|---|---:|
+| simple3 | 61 MiB |
+| MinIO   | 378 MiB |
 
 ## Interpreting the results
 
-- **Small objects (1 KB / 64 KB):** dominated by per-request overhead (auth, metadata transaction, fsync). Expect both servers within the same order of magnitude; throughput is more about request rate than disk bandwidth.
-- **Large objects (1 MB / 10 MB):** the streaming write path is sequential append in both engines. Bottleneck is the disk for both.
-- **Concurrency 8:** highlights metadata-write contention. simple3 serializes object commits on a per-bucket redb writer; MinIO sharded approach can pull ahead at high concurrency on a single large bucket.
+- **Small objects (1 KB / 64 KB).** Request-rate bound. MinIO is ~3× ahead — its hot path is more aggressively pipelined (HTTP/1.1 keep-alive + smaller metadata transactions). simple3's redb write transaction is the limiting factor at this scale.
+- **1 MB.** Disk-bandwidth becomes the floor. MinIO still leads on PUT (~1.6×) and GET (~1.5×).
+- **10 MB.** Both servers saturate sequential I/O; simple3's append-only path is slightly faster on GET (5% advantage) and within margin on PUT.
+- **Concurrency 8 at 1 MB.** MinIO scales better — its bucket layout shards naturally; simple3 serializes commits on a per-bucket redb writer (~2.4× gap).
+- **Memory.** simple3's idle RSS is ~6× smaller. It does not maintain in-memory object indices beyond the redb page cache.
 
 ## Known caveats
 
-- `warp mixed` doesn't exercise multipart. Add `warp put --obj.size=1G --concurrent=4 --duration=60s` to compare the multipart paths.
+- All measurements are over the loopback interface in a single Docker host. There is no network jitter, no NIC saturation, no TLS termination.
+- `warp mixed` doesn't exercise multipart. Add `warp put --obj.size=1G --concurrent=4 --duration=60s` to compare the multipart paths if multi-GB objects matter for your workload.
 - MinIO's erasure-coded mode is not tested here. Single-disk MinIO is the closest apples-to-apples comparison.
-- The 30 s duration is a smoke-test default. Longer runs (5+ min) are required for stable p99s; quote the duration alongside any numbers you publish.
+- 15 s is short — quote the duration alongside any numbers you publish; longer runs give stable p99s.

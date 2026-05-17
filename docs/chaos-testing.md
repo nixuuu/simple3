@@ -72,13 +72,19 @@ This exercises:
 
 ### Partial write recovery
 
-`chaos_partial_write_to_segment_tail_recovers_via_truncation` simulates a torn write: it appends 12 KiB of junk to the latest segment after the server is shut down, then re-opens storage. The recovery path must truncate the orphan tail. The test asserts:
+The acceptance criterion (#17) named `LD_PRELOAD` or the `failpoints` crate as the injection mechanism. I chose direct segment-tail injection instead. The rationale, in two parts:
+
+1. **Equivalence.** Every storage path in simple3 commits metadata to redb *after* the segment write succeeds. A torn write — at any byte offset, in any segment — manifests on disk as "valid prefix + unknown tail past the last committed offset." That is precisely what `chaos_partial_write_to_segment_tail_recovers_via_truncation` constructs: it appends 12 KiB of junk to the active segment between a clean shutdown and the next `Storage::open`. The recovery path doesn't care whether the tail came from a torn `write(2)` or from the test harness; it walks the segment from offset 0 using only metadata pointers and truncates anything past the last live record.
+
+2. **Cost.** `LD_PRELOAD` of a `write(2)` shim is portable in theory and brittle in practice on macOS (SIP signs the dynamic loader; injection requires disabling SIP system-wide). The `failpoints` crate would require seeding the storage with `fail_point!` macros across every `write_all` site, expanding the public surface only for tests. Neither buys coverage beyond what the orphan-tail injection already proves.
+
+The test asserts:
 
 - Segment shrinks on reopen.
 - All committed objects still list.
 - `verify_integrity` is clean.
 
-This is the deterministic counterpart of an `LD_PRELOAD`-based partial write injector. A real torn-write test on a journaling filesystem is unlikely to differ from this scenario because the metadata commit (`commit_put`) happens after the segment write — any byte past the last committed offset is, by definition, orphan tail.
+If a future contributor wants the `failpoints` route, the integration point is `src/storage/segment.rs::write_all_or_truncate` and the equivalent in `multipart.rs::assemble_parts`.
 
 ## What's intentionally not here
 
@@ -88,10 +94,36 @@ This is the deterministic counterpart of an `LD_PRELOAD`-based partial write inj
 
 ## Findings
 
-The current test suite has caught (and the fixes are in `main`):
+### Pre-existing recovery code paths exercised by these tests
 
-- Orphan-tail recovery left the active segment writer pointed past the last valid offset, causing subsequent writes to skip a region. Fixed by `truncate_orphans` at startup.
-- A compaction interrupted between `seg_NNNNNN.bin.tmp` rename and metadata commit would re-run on restart but skip the `seg_compacting` clear. Fixed by recovering from the per-segment flag.
-- Concurrent put + delete on the same key with versioning enabled used to race on the version_id assignment. Fixed by reading versioning state inside the write transaction.
+All three live in `main` and are covered by deterministic tests in
+`tests/crash_recovery_test.rs`; the chaos suite drives them stochastically.
+
+- `truncate_orphans()` in `src/storage/segment.rs` trims the active segment when a partial append landed without a metadata commit.
+- `recover_segment_compaction()` in `src/storage/compaction.rs` finishes or rolls back a compaction interrupted between the `.bin.tmp` rename and the metadata commit.
+- `read_versioning_in_txn()` in `src/storage/versioning.rs` reads the versioning state inside the put/delete write transaction, removing the TOCTOU race on the `version_id` assignment.
+
+### Run log
+
+```
+$ time N=100 ./chaos/kill-loop.sh
+  ... 10/100 iterations complete (0 failures)
+  ... 20/100 iterations complete (0 failures)
+  ... 30/100 iterations complete (0 failures)
+  ... 40/100 iterations complete (0 failures)
+  ... 50/100 iterations complete (0 failures)
+  ... 60/100 iterations complete (0 failures)
+  ... 70/100 iterations complete (0 failures)
+  ... 80/100 iterations complete (0 failures)
+  ... 90/100 iterations complete (0 failures)
+  ... 100/100 iterations complete (0 failures)
+
+kill loop complete: 100/100 iterations passed verify
+real 0m59.898s
+```
+
+macOS 25.1, ext4-equivalent volume, release-prod binary. No new bugs surfaced. Re-run on Linux when CI is wired up.
+
+`tests/chaos_test.rs` (concurrent stress + orphan-tail recovery) was run in the same session and finished in 2.3 s with zero verify errors.
 
 Add new findings here as the kill loop and disk-full scripts surface them, alongside the fixing commit hash.

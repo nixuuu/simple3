@@ -39,6 +39,7 @@ access_key_id = AK
 secret_access_key = SK
 endpoint = http://simple3:8080
 force_path_style = true
+list_version = 2          # simple3 implements ListObjectsV2 only — see Gotchas
 ```
 
 ### Copy a single bucket
@@ -139,18 +140,47 @@ curl -H "Authorization: Bearer $AK:$SK" \
 
 ## Tested scenarios
 
-The migration flow has been exercised against the following sources:
+Local end-to-end run against `minio/minio:latest` (Docker) and `rclone/rclone:latest`
+(Docker). Source bucket contained:
 
-- MinIO single-node (RELEASE.2024-01-01) — bucket of 1000 small objects (1 KB each).
-- MinIO single-node — single 5.5 GiB object, multipart with 16 MiB parts.
-- MinIO single-node — objects carrying `x-amz-meta-author` and `Content-Type: application/pdf`.
-- AWS S3 (`eu-west-1`) — empty bucket (only metadata, no objects).
-- AWS S3 — bucket of 200 objects ranging 1 KB – 100 MiB.
+- 100 small objects (`k-001.txt` … `k-100.txt`, single PUT each)
+- 1 × 50 MiB random object (`big.bin`, transferred as a 7-part multipart upload)
+- 1 object with custom `Content-Type: application/pdf` and a user-metadata header
 
-The mint and ceph s3-tests suites (`tests/s3_compat/`) further cover the destination-side semantics that rclone and aws-cli rely on.
+Sync command (`rclone/rclone:latest`, `list_version = 2` set on the destination remote):
+
+```
+$ rclone sync src:mig-source dst:mig-dest --transfers 8 --s3-chunk-size 8M
+Transferred:   	   50.002 MiB / 50.002 MiB, 100%
+Checks:                 0 / 0, -, Listed 102
+Transferred:          102 / 102, 100%
+Elapsed time:         0.9s
+```
+
+Verification:
+
+- `aws s3 ls --recursive` count: src = dst = 102.
+- SHA-256 over every transferred file: 102/102 byte-identical (`diff` clean).
+- `HeadObject` on `big.bin`: `ETag: "c5bc0ff942ae79e5b186ddf8e79dcb38-7"` —
+  multipart format preserved (`<md5>-<parts>`), 50 MiB / 7 parts ⇒ 8 MiB chunk
+  matches the rclone setting.
+- `HeadObject` on `doc.pdf`: `ContentType: "application/pdf"` plus the
+  `x-amz-meta-mtime` user metadata rclone adds — both round-tripped.
+
+AWS S3 source not tested directly. The protocol surface is the same; only
+credential handling and endpoint syntax differ from MinIO.
+
+The mint and ceph s3-tests suites (`tests/s3_compat/`) further cover the
+destination-side semantics that rclone and aws-cli rely on.
 
 ## Gotchas
 
+- **`ListObjects` v1 not implemented.** simple3 only exposes `ListObjectsV2`.
+  rclone defaults to the v1 API when it inspects the destination bucket for
+  pre-existing objects (used by `sync` to compute which files to delete).
+  Without `list_version = 2`, `rclone sync` will copy the data correctly and
+  then fail at the end with `501 NotImplemented: ListObjects`. Always set
+  `list_version = 2` on the simple3 remote.
 - **Bucket name restrictions.** Both simple3 and AWS use the standard S3 naming rules (3–63 chars, lowercase, alphanumerics + hyphens). Buckets that exist in MinIO with wider names need renaming first.
 - **Path-style addressing.** simple3 does not implement virtual-host routing. Always set `force_path_style = true` (rclone) or `--endpoint-url` with path-style (aws-cli, `--addressing-style path`).
 - **Empty `Content-Type`.** S3 defaults to `binary/octet-stream`; some tools omit the header and simple3 will record `None`. If the downstream consumer relies on the header, set it explicitly.

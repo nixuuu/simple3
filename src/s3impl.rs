@@ -10,12 +10,12 @@ use s3s::dto::{
     CopyObjectOutput, CopyObjectResult, CopySource, CreateBucketInput, CreateBucketOutput,
     CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput,
     DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
-    ETag, GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
-    ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, MetadataDirective, Object, PutBucketVersioningInput,
-    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
-    UploadPartInput, UploadPartOutput,
+    ETag, GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
+    GetBucketVersioningOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
+    HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
+    MetadataDirective, Object, PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput,
+    PutObjectOutput, StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
@@ -56,6 +56,21 @@ impl S3 for SimpleStorage {
         let bucket = req.input.bucket;
         let _store = self.bucket(&bucket)?;
         Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        let _timer = DurationRecorder::new("S3", "GetBucketLocation");
+        // Existence check so clients that probe GetBucketLocation first
+        // (warp, restic) get a proper NoSuchBucket instead of an empty 200.
+        let _store = self.bucket(&req.input.bucket)?;
+        // simple3 is a single-region service — report the empty-string
+        // constraint that AWS uses for `us-east-1`.
+        Ok(S3Response::new(GetBucketLocationOutput {
+            location_constraint: None,
+        }))
     }
 
     async fn create_bucket(

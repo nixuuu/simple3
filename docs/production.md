@@ -183,7 +183,7 @@ groups:
 
 ### Grafana
 
-A minimal dashboard JSON is not bundled yet. The metrics map cleanly onto stock Prometheus dashboards: pick a request-rate panel, a latency-quantile panel keyed by `op`, and a capacity panel using `simple3_total_*`.
+A starter dashboard is bundled at [`docs/grafana-dashboard.json`](grafana-dashboard.json) — import via *Dashboards → New → Import* and point it at your Prometheus datasource. It includes the panels the alert rules above depend on (request rate, p50/p99 latency, ingress/egress, active connections, dead-space ratio per bucket, compaction frequency, rate-limit drops, segments per bucket).
 
 ## Backups
 
@@ -215,7 +215,9 @@ systemctl start simple3
 
 ## Resource sizing
 
-Measured on a Hetzner EX130-R (single NVMe, ext4); use these as a starting point and verify against your workload.
+Order-of-magnitude guidance derived from the benchmark methodology in
+[`docs/benchmark-minio.md`](benchmark-minio.md). Treat them as a starting
+point and validate against your workload before committing capacity.
 
 ### Disk
 
@@ -233,11 +235,24 @@ Measured on a Hetzner EX130-R (single NVMe, ext4); use these as a starting point
 - PUT/GET hot paths are streaming + MD5 + CRC32C. Per-core throughput approaches the disk bandwidth for sequential I/O.
 - Multipart assembly and compaction are CPU-bound during the rewrite phase; expect short spikes on busy buckets.
 
-## Tested on
+## Validated locally
 
-The above configuration has been deployed on the following:
+The pieces in this guide were exercised in isolation on a development machine
+(macOS, Darwin 25, OrbStack-managed Docker):
 
-- Hetzner EX130-R (Intel Xeon Gold 5412U, 256 GB RAM, NVMe) — ext4, Caddy in front, journald logging, Prometheus on a separate host.
-- Debian 12 KVM guest (4 vCPU, 8 GB RAM) — same config minus the rate limiter, for staging.
+- The TOML config is parsed by `simple3 serve` and merges with CLI flags as
+  shown — covered by unit tests in `src/cli/config.rs`.
+- The systemd unit syntax was validated with `systemd-analyze verify`. It has
+  not been run under a live systemd instance; do so before relying on the
+  hardening directives in production.
+- Prometheus scrape works against `/metrics` — confirmed via `curl` and the
+  `tests/limits_test.rs` integration tests that drive the same code path.
+- TLS proxy termination via nginx was verified end-to-end —
+  see [`docs/tls-proxy.md`](tls-proxy.md).
+- The benchmark numbers in [`docs/benchmark-minio.md`](benchmark-minio.md) come
+  from a single-host loopback run, not the resource-sizing reference hardware.
 
-For embedded or edge deployments (single-binary, no proxy, no monitoring), the defaults from `simple3 serve` are enough — most of this guide is about operational fit, not features.
+For embedded or edge deployments (single-binary, no proxy, no monitoring), the
+defaults from `simple3 serve` are enough — most of this guide is about
+operational fit, not features. Before quoting the sizing numbers below for a
+specific deployment, re-measure on the target hardware.
