@@ -59,3 +59,13 @@ urlencoding = "2"
 [[bench]]
 name = "storage_bench"
 harness = false
+
+# Default release profile keeps incremental dev rebuilds fast.
+# Production Docker image switches to `release-prod` (LTO + 1 codegen unit + strip)
+# via `cargo build --profile release-prod` in the Dockerfile.
+[profile.release-prod]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

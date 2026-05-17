@@ -3,6 +3,13 @@ data/
 test-data/
 test-scripts/
 .git/
+.github/
+.claude/
 *.md
 benches/
 tests/
+bench/
+chaos/
+docker/
+docs/
+Makefile
